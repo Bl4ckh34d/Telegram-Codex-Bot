@@ -1,0 +1,9 @@
+{
+  "name": "aidolon",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal Telegram -> AIDOLON CLI bridge",
+  "scripts": {
+    "start": "node bot.js"
+  }
+}

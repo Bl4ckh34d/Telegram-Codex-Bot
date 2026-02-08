@@ -1,0 +1,25 @@
+# Secrets
+.env
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Python / Whisper venv
+.venv/
+__pycache__/
+*.py[cod]
+
+# Runtime artifacts (state, logs, outputs, temp files)
+runtime/
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
