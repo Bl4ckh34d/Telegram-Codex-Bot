@@ -1,6 +1,6 @@
-# AIDOLON
+# TELEGRAM-CODEX-BOT
 
-Minimal Telegram <-> AIDOLON CLI bridge with basic hardening and stability controls.
+Minimal Telegram <-> Codex CLI bridge with basic hardening and stability controls.
 
 ## Features
 - Long-polling Telegram bot listener
@@ -8,17 +8,17 @@ Minimal Telegram <-> AIDOLON CLI bridge with basic hardening and stability contr
 - Single-instance lock (`runtime/bot.lock`)
 - Startup stale-update skip (prevents old messages from being re-run)
 - FIFO queue with size limits
-- Short progress updates while AIDOLON is running (configurable interval)
+- Short progress updates while Codex is running (configurable interval)
 - Cancel active run (`/cancel` or `/stop`)
 - Restart bot process from Telegram (`/restart`)
-- Safe AIDOLON invocation via `spawn`; Windows `.cmd` shims use shell mode when required
+- Safe Codex invocation via `spawn`; Windows `.cmd` shims use shell mode when required
 - Default model/reasoning set to `gpt-5.3-codex` + `xhigh`
-- Full-access AIDOLON mode enabled by default (`--dangerously-bypass-approvals-and-sandbox`)
+- Full-access Codex mode enabled by default (`--dangerously-bypass-approvals-and-sandbox`)
 - Optional WSL fallback when `codex` is not on Windows PATH (`CODEX_USE_WSL=auto`, optional `CODEX_WSL_BIN`)
 - Voice note transcription via local Whisper venv (`setup-whisper-venv.cmd`)
 - Session resume workflow with Telegram prefill buttons (`/resume`)
 - Active-session mode (plain text continues in resumed session until `/new`)
-- AIDOLON command control menu (`/codex`) with staged command confirmation flow
+- Codex command control menu (`/codex`) with staged command confirmation flow
 
 ## Files
 - `bot.js` - main bridge process
@@ -49,17 +49,17 @@ setup-whisper-venv.cmd
 - `/help` - command help
 - `/status` - current worker and queue status
 - `/queue` - preview queued prompts
-- `/codex` or `/commands` - show AIDOLON command menu
-- `/cmd <args>` - stage raw AIDOLON CLI command
+- `/codex` or `/commands` - show command menu
+- `/cmd <args>` - stage raw Codex CLI command
 - `/confirm` - run staged `/cmd`
 - `/reject` - cancel staged `/cmd`
-- `/cancel` or `/stop` - stop the active AIDOLON run
+- `/cancel` or `/stop` - stop the active Codex run
 - `/clear` - clear queued prompts
 - `/screenshot` - capture and send the primary display as an image
-- `/resume` - list recent local AIDOLON sessions with prefill buttons
+- `/resume` - list recent local Codex sessions with prefill buttons
 - `/resume <session_id> [prompt]` - activate/resume a session
 - `/new` - clear active resumed session
-- `/compress [hint]` - ask AIDOLON to compress/summarize active session context
+- `/compress [hint]` - ask Codex to compress/summarize active session context
 - `/restart` - restart the bot process
 - Voice notes are transcribed and queued as prompts
 
@@ -71,5 +71,5 @@ setup-whisper-venv.cmd
 ## Security notes
 - By default, only `TELEGRAM_CHAT_ID` is accepted.
 - Group chats are blocked unless `ALLOW_GROUP_CHAT=1`.
-- Default AIDOLON policy is full-access (`CODEX_DANGEROUS_FULL_ACCESS=1`).
+- Default Codex policy is full-access (`CODEX_DANGEROUS_FULL_ACCESS=1`).
 - If token/chat ID were exposed, rotate token in `@BotFather` and update `.env`.
