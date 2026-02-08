@@ -10,6 +10,7 @@ pnpm-debug.log*
 
 # Python / Whisper venv
 .venv/
+.tts-venv/
 __pycache__/
 *.py[cod]
 

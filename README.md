@@ -35,6 +35,7 @@ Minimal Telegram <-> AIDOLON (Codex CLI) bridge with basic hardening and stabili
 - `aidolon_whisper_worker.py` - optional persistent Whisper worker process
 - `setup-tts.cmd` - installs bot-local TTS deps (auto-run by `start.cmd` when `TTS_ENABLED=1`)
 - `codex_prompt.txt` - base (system) prompt preamble
+- `codex_prompt_voice.txt` - voice/TTS-friendly prompt preamble used for voice-note transcripts
 - `runtime/` - state, lock, and output files
 
 ## Run
@@ -51,6 +52,8 @@ Whisper setup (one-time):
 cd C:\Users\ROG\Desktop\AIDOLON
 setup-whisper-venv.cmd
 ```
+
+Optional (faster installs): if `uv` is on PATH, the setup scripts will prefer it automatically. Control with `UV_ENABLED=auto|1|0` in `.env`.
 
 ## Telegram commands
 - `/help` - command help
@@ -91,17 +94,17 @@ Config (in `.env`):
 The bot can synthesize text into a Telegram voice message using MiraTTS:
 - Enable: `TTS_ENABLED=1`
 - Configure: `TTS_MODEL` (path to the local MiraTTS model directory)
-- If `TTS_MODEL` is empty, `setup-tts.cmd` will download `TTS_MODEL_ID` into `TTS_MODEL_DIR` and write `TTS_MODEL` into `.env`.
 - Optional: `TTS_REFERENCE_AUDIO` (defaults to `assets\\reference.wav`, gitignored)
 - Optional: `TTS_SAMPLE_RATE` (defaults to `48000`)
-- Optional: `TTS_KEEP_LOADED=1` to keep MiraTTS loaded in a persistent Python worker (faster, uses RAM/VRAM).
 - Optional: `TTS_REPLY_TO_VOICE=1` to auto-reply to incoming voice notes with a voice message (otherwise replies are text).
 - Run: `/tts <text>`
 - Requires `ffmpeg` on PATH (or set `TTS_FFMPEG_BIN`).
-- `start.cmd` will automatically run `setup-tts.cmd` to create `.\\.venv` and install MiraTTS deps for this repo.
+- `start.cmd` will automatically run `setup-tts.cmd` to create `TTS_VENV_PATH` (default `.tts-venv`) and install MiraTTS deps for this repo.
 
 ## Base prompt (system prompt)
 The preamble sent to Codex before each user message is loaded from `codex_prompt.txt` (set `CODEX_PROMPT_FILE` to change the path).
+
+For voice-note transcripts (incoming Telegram voice messages), the bot can use a separate “spoken” prompt preamble from `codex_prompt_voice.txt` (set `CODEX_VOICE_PROMPT_FILE` to change the path). This is useful when `TTS_REPLY_TO_VOICE=1` so responses are TTS-friendly (no commands, paths, or other symbol-heavy text).
 
 ## Progress updates
 - `PROGRESS_UPDATES_ENABLED=1` enables short in-chat progress pings while a job is running

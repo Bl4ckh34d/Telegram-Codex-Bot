@@ -3,6 +3,11 @@ setlocal enabledelayedexpansion
 
 cd /d "%~dp0"
 
+if /i "%TTS_DEBUG%"=="1" (
+  echo on
+  echo [setup-tts] debug echo enabled
+)
+
 if not exist ".env" (
   if exist ".env.example" (
     copy /Y ".env.example" ".env" >nul
@@ -10,17 +15,21 @@ if not exist ".env" (
 )
 
 set "TTS_ENABLED="
-set "TTS_AIDOLON_SERVER_DIR="
+set "TTS_VENV_PATH="
+set "TTS_MODEL="
 set "TTS_REFERENCE_AUDIO="
 set "TTS_FFMPEG_BIN="
+set "UV_ENABLED="
 
 for /f "usebackq eol=# tokens=1* delims==" %%A in (".env") do (
   set "K=%%A"
   set "V=%%B"
   if /i "!K!"=="TTS_ENABLED" set "TTS_ENABLED=!V!"
-  if /i "!K!"=="TTS_AIDOLON_SERVER_DIR" set "TTS_AIDOLON_SERVER_DIR=!V!"
+  if /i "!K!"=="TTS_VENV_PATH" set "TTS_VENV_PATH=!V!"
+  if /i "!K!"=="TTS_MODEL" set "TTS_MODEL=!V!"
   if /i "!K!"=="TTS_REFERENCE_AUDIO" set "TTS_REFERENCE_AUDIO=!V!"
   if /i "!K!"=="TTS_FFMPEG_BIN" set "TTS_FFMPEG_BIN=!V!"
+  if /i "!K!"=="UV_ENABLED" set "UV_ENABLED=!V!"
 )
 
 set "DO_TTS="
@@ -30,53 +39,123 @@ if /i "%TTS_ENABLED%"=="yes" set "DO_TTS=1"
 if /i "%TTS_ENABLED%"=="on" set "DO_TTS=1"
 if not defined DO_TTS exit /b 0
 
-if not defined TTS_AIDOLON_SERVER_DIR set "TTS_AIDOLON_SERVER_DIR=..\\aidolon_server"
-for %%I in ("%TTS_AIDOLON_SERVER_DIR%") do set "SERVER_DIR=%%~fI"
+if not defined TTS_VENV_PATH set "TTS_VENV_PATH=.tts-venv"
+for %%I in ("%TTS_VENV_PATH%") do set "VENV_DIR=%%~fI"
+
+if not defined TTS_MODEL (
+  echo TTS setup failed: TTS_MODEL is not set in .env.
+  exit /b 1
+)
 
 if not defined TTS_REFERENCE_AUDIO set "TTS_REFERENCE_AUDIO=assets\\reference.wav"
 for %%I in ("%TTS_REFERENCE_AUDIO%") do set "REF_DST=%%~fI"
 
-set "REF_SRC=%SERVER_DIR%\\data\\reference_audio\\reference.wav"
+if not defined TTS_FFMPEG_BIN set "TTS_FFMPEG_BIN=ffmpeg"
+if exist "%TTS_FFMPEG_BIN%" goto :ffmpeg_ok
+where /q "%TTS_FFMPEG_BIN%"
+if not errorlevel 1 goto :ffmpeg_ok
+echo TTS setup failed: ffmpeg not found ("%TTS_FFMPEG_BIN%").
+echo Install ffmpeg or set TTS_FFMPEG_BIN in .env.
+exit /b 1
 
-if not exist "%SERVER_DIR%\\start_server.bat" (
-  echo TTS setup failed: Aidolon Server not found at "%SERVER_DIR%".
-  echo Set TTS_AIDOLON_SERVER_DIR in .env.
+:ffmpeg_ok
+
+if not exist "%REF_DST%" (
+  echo WARNING: Reference audio not found at "%REF_DST%".
+  echo WARNING: Set TTS_REFERENCE_AUDIO to an existing WAV file.
+)
+
+set "PYTHON_CMD="
+set "PYTHON_ARGS="
+
+rem NOTE: Avoid FOR /F with inline python snippets containing parentheses; cmd parsing is fragile there.
+py -3.12 -V >nul 2>&1
+if not errorlevel 1 (
+  set "PYTHON_CMD=py"
+  set "PYTHON_ARGS=-3.12"
+  goto :found_python
+)
+
+where python >nul 2>&1
+if not errorlevel 1 (
+  set "PYTHON_CMD=python"
+  set "PYTHON_ARGS="
+  goto :found_python
+)
+
+where py >nul 2>&1
+if not errorlevel 1 (
+  set "PYTHON_CMD=py"
+  set "PYTHON_ARGS=-3"
+  goto :found_python
+)
+
+:found_python
+if not defined PYTHON_CMD (
+  echo TTS setup failed: Python 3.10+ not found in PATH. Install Python and retry.
   exit /b 1
 )
 
-if not defined TTS_FFMPEG_BIN set "TTS_FFMPEG_BIN=ffmpeg"
-if exist "%TTS_FFMPEG_BIN%" (
-  rem ok
-) else (
-  where "%TTS_FFMPEG_BIN%" >nul 2>&1
-  if errorlevel 1 (
-    echo TTS setup failed: ffmpeg not found ("%TTS_FFMPEG_BIN%").
-    echo Install ffmpeg or set TTS_FFMPEG_BIN in .env.
-    exit /b 1
-  )
-)
+set "HAS_UV="
+if not defined UV_ENABLED set "UV_ENABLED=auto"
+where /q uv
+if not errorlevel 1 set "HAS_UV=1"
+if /i "%UV_ENABLED%"=="0" set "HAS_UV="
+if /i "%UV_ENABLED%"=="1" if not defined HAS_UV goto :uv_missing
 
-if not exist "%REF_DST%" (
-  if exist "%REF_SRC%" (
-    for %%D in ("%REF_DST%") do set "REF_DIR=%%~dpD"
-    if not exist "%REF_DIR%" mkdir "%REF_DIR%" >nul 2>&1
-    copy /Y "%REF_SRC%" "%REF_DST%" >nul
-    if errorlevel 1 (
-      echo WARNING: Failed to copy reference audio to "%REF_DST%".
-    )
+if not exist "%VENV_DIR%\\Scripts\\python.exe" (
+  echo Creating TTS virtual environment at "%VENV_DIR%"...
+  if defined HAS_UV (
+    uv venv --python 3.12 "%VENV_DIR%" 2>nul
+    if errorlevel 1 uv venv "%VENV_DIR%"
   ) else (
-    echo WARNING: Reference audio not found at "%REF_SRC%".
+    "%PYTHON_CMD%" %PYTHON_ARGS% -m venv "%VENV_DIR%"
   )
+  if errorlevel 1 exit /b 1
 )
 
-echo Ensuring Aidolon Server TTS dependencies...
-set "AIDOLON_SETUP_ONLY=1"
-set "AIDOLON_SKIP_PREFETCH=1"
-set "AIDOLON_SKIP_LLAMA_WAIT=1"
-call "%SERVER_DIR%\\start_server.bat"
+echo Installing MiraTTS dependencies into "%VENV_DIR%"...
+set "VENV_PY=%VENV_DIR%\\Scripts\\python.exe"
+
+if defined HAS_UV (
+  uv pip install --python "%VENV_PY%" torch torchvision torchaudio
+  if errorlevel 1 (
+    echo WARNING: torch install failed. MiraTTS will likely not work without torch.
+  )
+  uv pip install --python "%VENV_PY%" "numpy<2" soundfile omegaconf
+  if errorlevel 1 exit /b 1
+) else (
+  "%VENV_PY%" -m pip install torch torchvision torchaudio
+  if errorlevel 1 (
+    echo WARNING: torch install failed. MiraTTS will likely not work without torch.
+  )
+  "%VENV_PY%" -m pip install "numpy<2" soundfile omegaconf
+  if errorlevel 1 exit /b 1
+)
+
+where git >nul 2>&1
 if errorlevel 1 (
-  echo TTS dependency setup failed.
+  echo TTS setup failed: git not found in PATH.
+  echo Install Git for Windows or add git.exe to PATH, then retry.
+  exit /b 1
+)
+if defined HAS_UV (
+  uv pip install --python "%VENV_PY%" "git+https://github.com/ysharma3501/MiraTTS.git"
+  if errorlevel 1 exit /b 1
+) else (
+  "%VENV_PY%" -m pip install "git+https://github.com/ysharma3501/MiraTTS.git"
+  if errorlevel 1 exit /b 1
+)
+if errorlevel 1 exit /b 1
+
+"%VENV_PY%" -c "from mira.model import MiraTTS; print('MiraTTS import ok')"
+if errorlevel 1 (
+  echo TTS setup failed: MiraTTS import failed.
   exit /b 1
 )
 
 exit /b 0
+
+:uv_missing
+echo UV is required because UV_ENABLED is 1, but uv was not found on PATH.
+exit /b 1

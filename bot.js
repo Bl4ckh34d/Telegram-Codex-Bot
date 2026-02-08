@@ -439,17 +439,22 @@ const VISION_AUTO_FOLLOWUP_SEC = toInt(process.env.VISION_AUTO_FOLLOWUP_SEC, 900
 const TTS_ENABLED = toBool(process.env.TTS_ENABLED, false);
 const TTS_MAX_TEXT_CHARS = toInt(process.env.TTS_MAX_TEXT_CHARS, 1200, 50, 20000);
 const TTS_TIMEOUT_MS = toInt(process.env.TTS_TIMEOUT_MS, 10 * 60 * 1000, 30_000, 60 * 60 * 1000);
-const TTS_AIDOLON_SERVER_DIR = resolveMaybeRelativePath(
-  process.env.TTS_AIDOLON_SERVER_DIR || path.join(ROOT, "..", "aidolon_server"),
-);
-const TTS_AIDOLON_ENV_PATH = resolveMaybeRelativePath(
-  process.env.TTS_AIDOLON_ENV_PATH || path.join(TTS_AIDOLON_SERVER_DIR, ".env"),
-);
+const TTS_VENV_PATH = resolveMaybeRelativePath(process.env.TTS_VENV_PATH || path.join(ROOT, ".tts-venv"));
+const TTS_MODEL = String(process.env.TTS_MODEL || "").trim();
 const TTS_REFERENCE_AUDIO = resolveMaybeRelativePath(process.env.TTS_REFERENCE_AUDIO || "");
+const TTS_SAMPLE_RATE = toInt(process.env.TTS_SAMPLE_RATE, 48000, 8000, 96000);
 const TTS_PYTHON = String(process.env.TTS_PYTHON || "").trim();
 const TTS_FFMPEG_BIN = String(process.env.TTS_FFMPEG_BIN || "ffmpeg").trim();
 const TTS_OPUS_BITRATE_KBPS = toInt(process.env.TTS_OPUS_BITRATE_KBPS, 48, 8, 256);
 const TTS_SEND_TEXT = toBool(process.env.TTS_SEND_TEXT, false);
+const TTS_REPLY_TO_VOICE = toBool(process.env.TTS_REPLY_TO_VOICE, false);
+
+const CODEX_PROMPT_FILE = resolveMaybeRelativePath(
+  process.env.CODEX_PROMPT_FILE || path.join(ROOT, "codex_prompt.txt"),
+);
+const CODEX_VOICE_PROMPT_FILE = resolveMaybeRelativePath(
+  process.env.CODEX_VOICE_PROMPT_FILE || path.join(ROOT, "codex_prompt_voice.txt"),
+);
 
 const MAX_PROMPT_CHARS = toInt(process.env.MAX_PROMPT_CHARS, 4000, 64, 20000);
 // MAX_RESPONSE_CHARS=0 disables bot-side truncation (Telegram still limits each message).
@@ -635,13 +640,63 @@ function normalizeResponse(text) {
   return `${cleaned.slice(0, MAX_RESPONSE_CHARS)}\n\n[truncated by bot]`;
 }
 
-function formatCodexPrompt(userText, options = {}) {
-  const hasImages = options && options.hasImages === true;
-  const lines = [
+const PROMPT_FILE_CACHE = new Map();
+
+function readTextFileCached(filePath) {
+  const key = String(filePath || "").trim();
+  if (!key) return "";
+  try {
+    const st = fs.statSync(key);
+    const prev = PROMPT_FILE_CACHE.get(key);
+    if (prev && prev.mtimeMs === st.mtimeMs && typeof prev.text === "string") {
+      return prev.text;
+    }
+    const text = fs.readFileSync(key, "utf8");
+    PROMPT_FILE_CACHE.set(key, { mtimeMs: st.mtimeMs, text });
+    return text;
+  } catch {
+    return "";
+  }
+}
+
+function defaultPromptPreamble() {
+  return [
     "You are AIDOLON CLI replying via Telegram.",
     "Keep it concise and practical.",
     "If ambiguous, ask one clear follow-up question.",
-  ];
+  ].join("\n");
+}
+
+function defaultVoicePromptPreamble() {
+  return [
+    "You are AIDOLON speaking to the user via a Telegram voice message.",
+    "Reply in natural conversational language suitable for text-to-speech.",
+    "Do not output code blocks, markdown, commands, stack traces, JSON, URLs, or file paths.",
+    "Avoid weird symbols and formatting; use plain words and short sentences.",
+    "",
+    "Output format:",
+    "SPOKEN:",
+    "<what you want spoken aloud>",
+    "",
+    "TEXT_ONLY:",
+    "<optional: links, commands, paths, code, or any details that should be sent as text>",
+    "Keep it concise. If ambiguous, ask one clear follow-up question.",
+  ].join("\n");
+}
+
+function getPromptPreamble(replyStyle) {
+  const style = String(replyStyle || "").trim().toLowerCase();
+  const isVoice = style === "voice" || style === "tts" || style === "spoken";
+  const filePath = isVoice ? CODEX_VOICE_PROMPT_FILE : CODEX_PROMPT_FILE;
+  const fallback = isVoice ? defaultVoicePromptPreamble() : defaultPromptPreamble();
+  const fromFile = readTextFileCached(filePath).trim();
+  return fromFile || fallback;
+}
+
+function formatCodexPrompt(userText, options = {}) {
+  const hasImages = options && options.hasImages === true;
+  const replyStyle = String(options?.replyStyle || "").trim();
+  const lines = [getPromptPreamble(replyStyle)];
   if (hasImages) {
     lines.push("One or more images are attached. Use them to answer the user.");
   }
@@ -999,7 +1054,10 @@ function buildCodexExecSpec(job) {
   const rawImagePaths = Array.isArray(job?.imagePaths)
     ? job.imagePaths.map((p) => String(p || "").trim()).filter(Boolean)
     : [];
-  const promptText = formatCodexPrompt(job.text, { hasImages: rawImagePaths.length > 0 });
+  const promptText = formatCodexPrompt(job.text, {
+    hasImages: rawImagePaths.length > 0,
+    replyStyle: String(job?.replyStyle || ""),
+  });
   const outputFile = String(job?.outputFile || "");
   const outputPath = codexMode.mode === "wsl" ? toWslPath(outputFile) : outputFile;
   const args = ["exec"];
@@ -1932,6 +1990,7 @@ async function enqueuePrompt(chatId, inputText, source, options = {}) {
     chatId,
     text,
     source,
+    replyStyle: String(options.replyStyle || "").trim(),
     resumeSessionId: String(options.resumeSessionId || "").trim(),
     imagePaths: Array.isArray(options.imagePaths)
       ? options.imagePaths.map((p) => String(p || "").trim()).filter(Boolean)
@@ -1957,15 +2016,131 @@ function normalizeTtsText(text) {
   return squashed.slice(0, TTS_MAX_TEXT_CHARS);
 }
 
-async function enqueueTts(chatId, inputText, source) {
+function splitVoiceReplyParts(text) {
+  const src = String(text || "").trim();
+  if (!src) return { spoken: "", textOnly: "" };
+
+  // Preferred format (case-insensitive):
+  // SPOKEN:
+  // ...
+  //
+  // TEXT_ONLY:
+  // ...
+  //
+  // If the markers are missing, treat everything as spoken and leave textOnly empty.
+  const spokenRe = /(^|\n)\s*SPOKEN\s*:\s*\n/i;
+  const textRe = /(^|\n)\s*TEXT[_ ]?ONLY\s*:\s*\n/i;
+
+  const spokenMatch = spokenRe.exec(src);
+  const textMatch = textRe.exec(src);
+
+  if (!spokenMatch && !textMatch) {
+    return { spoken: src, textOnly: "" };
+  }
+
+  const spokenStart = spokenMatch ? spokenMatch.index + spokenMatch[0].length : 0;
+  const textStart = textMatch ? textMatch.index + textMatch[0].length : -1;
+
+  if (textStart >= 0) {
+    const spoken = src.slice(spokenStart, textMatch ? textMatch.index : src.length).trim();
+    const textOnly = src.slice(textStart).trim();
+    return { spoken, textOnly };
+  }
+
+  // Only SPOKEN marker present.
+  return { spoken: src.slice(spokenStart).trim(), textOnly: "" };
+}
+
+function extractNonSpeakableInfo(text) {
+  const src = String(text || "");
+  const pieces = [];
+
+  // Fenced code blocks.
+  const fenceRe = /```[\s\S]*?```/g;
+  const fences = src.match(fenceRe) || [];
+  if (fences.length > 0) {
+    pieces.push("Code/log snippets:");
+    pieces.push(fences.join("\n\n"));
+  }
+
+  // Inline code.
+  const inlineRe = /`([^`\n]{1,200})`/g;
+  const inline = [];
+  let m;
+  while ((m = inlineRe.exec(src)) !== null) {
+    inline.push(m[1]);
+    if (inline.length >= 12) break;
+  }
+  if (inline.length > 0) {
+    pieces.push("Inline terms:");
+    pieces.push(inline.map((s) => `- ${s}`).join("\n"));
+  }
+
+  // URLs.
+  const urlRe = /\bhttps?:\/\/\S+\b/gi;
+  const urls = (src.match(urlRe) || []).slice(0, 10);
+  if (urls.length > 0) {
+    pieces.push("Links:");
+    pieces.push(urls.map((u) => `- ${u}`).join("\n"));
+  }
+
+  // File paths (best-effort).
+  const pathOut = new Set();
+  const winPathRe = /\b[a-zA-Z]:\\[^\s"'`<>|]+/g;
+  for (const p of src.match(winPathRe) || []) pathOut.add(p);
+  const nixPathRe = /(?:^|\s)(~?\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)+)/g;
+  while ((m = nixPathRe.exec(src)) !== null) {
+    pathOut.add(m[1]);
+    if (pathOut.size >= 12) break;
+  }
+  const paths = [...pathOut].slice(0, 12);
+  if (paths.length > 0) {
+    pieces.push("Paths:");
+    pieces.push(paths.map((p) => `- ${p}`).join("\n"));
+  }
+
+  return pieces.join("\n");
+}
+
+function makeSpeakableTextForTts(text) {
+  // Prefer the model following the voice prompt, but strip common formatting just in case.
+  let out = String(text || "").trim();
+  if (!out) return "";
+
+  // Remove fenced code blocks.
+  out = out.replace(/```[\s\S]*?```/g, " ");
+
+  // Strip inline backticks.
+  out = out.replace(/`+/g, "");
+
+  // Markdown links: keep label.
+  out = out.replace(/!?\[([^\]]+?)\]\([^\)]+\)/g, "$1");
+
+  // Bare URLs.
+  out = out.replace(/\bhttps?:\/\/\S+\b/gi, "a link");
+
+  // Windows and Unix-like file paths (best-effort; avoid over-matching normal text like "and/or").
+  out = out.replace(/\b[a-zA-Z]:\\[^\s]+/g, "a file path");
+  out = out.replace(/(?:^|\s)~?\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)+/g, " a file path");
+
+  // Headings / bullets.
+  out = out.replace(/^\s{0,3}#{1,6}\s+/gm, "");
+  out = out.replace(/^\s{0,3}[-*+]\s+/gm, "");
+
+  // Collapse whitespace.
+  out = out.replace(/\s+/g, " ").trim();
+  return out;
+}
+
+async function enqueueTts(chatId, inputText, source, options = {}) {
   const text = normalizeTtsText(inputText);
   if (!text) {
     await sendMessage(chatId, "Empty TTS text ignored.");
-    return;
+    return false;
   }
   if (queue.length >= MAX_QUEUE_SIZE) {
     await sendMessage(chatId, `Queue is full (${MAX_QUEUE_SIZE}). Use /queue or /clear.`);
-    return;
+    return false;
   }
 
   const job = {
@@ -1974,6 +2149,8 @@ async function enqueueTts(chatId, inputText, source) {
     text,
     source,
     kind: "tts",
+    afterText: String(options.afterText || "").trim(),
+    skipResultText: options.skipResultText === true,
     startedAt: 0,
     cancelRequested: false,
     timedOut: false,
@@ -1984,21 +2161,22 @@ async function enqueueTts(chatId, inputText, source) {
 
   queue.push(job);
   void processQueue();
+  return true;
 }
 
-function resolveTtsPythonBin(serverDir) {
+function resolveTtsPythonBin() {
   const override = String(TTS_PYTHON || "").trim();
   if (override) return override;
 
   const candidates = [];
-  const base = String(serverDir || "").trim();
+  const base = String(TTS_VENV_PATH || "").trim();
   if (base) {
     if (process.platform === "win32") {
-      candidates.push(path.join(base, ".venv", "Scripts", "python.exe"));
-      candidates.push(path.join(base, ".venv", "Scripts", "python"));
+      candidates.push(path.join(base, "Scripts", "python.exe"));
+      candidates.push(path.join(base, "Scripts", "python"));
     } else {
-      candidates.push(path.join(base, ".venv", "bin", "python"));
-      candidates.push(path.join(base, ".venv", "bin", "python3"));
+      candidates.push(path.join(base, "bin", "python"));
+      candidates.push(path.join(base, "bin", "python3"));
     }
   }
 
@@ -2043,19 +2221,18 @@ async function runTtsJob(job) {
     };
   }
 
-  const serverDir = String(TTS_AIDOLON_SERVER_DIR || "").trim();
-  if (!serverDir || !fs.existsSync(serverDir)) {
-    return {
-      ok: false,
-      text: `AIDOLON server dir not found: ${serverDir || "(empty)"}\nSet TTS_AIDOLON_SERVER_DIR.`,
-    };
+  if (!TTS_MODEL) {
+    return { ok: false, text: "TTS model is not configured. Set TTS_MODEL in .env." };
+  }
+  if (!TTS_REFERENCE_AUDIO) {
+    return { ok: false, text: "TTS reference audio is not configured. Set TTS_REFERENCE_AUDIO in .env." };
   }
 
-  const pyBin = resolveTtsPythonBin(serverDir);
+  const pyBin = resolveTtsPythonBin();
   if (!pyBin) {
     return {
       ok: false,
-      text: "Python not found for TTS. Set TTS_PYTHON or ensure aidolon_server/.venv exists.",
+      text: "Python not found for TTS. Set TTS_PYTHON or create a venv at TTS_VENV_PATH (default .tts-venv).",
     };
   }
 
@@ -2076,17 +2253,15 @@ async function runTtsJob(job) {
 
   const synthArgs = [
     AIDOLON_TTS_SCRIPT_PATH,
-    "--server-dir",
-    serverDir,
     "--out-wav",
     wavPath,
+    "--model",
+    TTS_MODEL,
+    "--reference-audio",
+    TTS_REFERENCE_AUDIO,
+    "--sample-rate",
+    String(TTS_SAMPLE_RATE || 48000),
   ];
-  if (TTS_AIDOLON_ENV_PATH && fs.existsSync(TTS_AIDOLON_ENV_PATH)) {
-    synthArgs.push("--env-file", TTS_AIDOLON_ENV_PATH);
-  }
-  if (TTS_REFERENCE_AUDIO) {
-    synthArgs.push("--reference-audio", TTS_REFERENCE_AUDIO);
-  }
 
   const synthOk = await new Promise((resolve) => {
     let done = false;
@@ -2310,6 +2485,19 @@ async function runTtsJob(job) {
     } catch {
       // best effort
     }
+  }
+
+  const afterText = String(job?.afterText || "").trim();
+  if (afterText) {
+    try {
+      await sendMessage(job.chatId, afterText);
+    } catch (err) {
+      log(`sendMessage(tts-afterText) failed: ${redactError(err?.message || err)}`);
+    }
+  }
+
+  if (job?.skipResultText === true) {
+    return { ok: true, text: "", skipSendMessage: true };
   }
 
   if (TTS_SEND_TEXT) {
@@ -2592,7 +2780,42 @@ async function processQueue() {
       }
     }
 
-    if (!result || result.skipSendMessage !== true) {
+    const shouldVoiceReply = Boolean(
+      result?.ok &&
+        job?.kind !== "tts" &&
+        String(job?.source || "") === "voice" &&
+        TTS_REPLY_TO_VOICE &&
+        TTS_ENABLED &&
+        String(result?.text || "").trim(),
+    );
+
+    let voiceQueued = false;
+    if (shouldVoiceReply) {
+      try {
+        const parts = splitVoiceReplyParts(String(result.text || ""));
+        const spoken = makeSpeakableTextForTts(parts.spoken || String(result.text || ""));
+        const modelTextOnly = String(parts.textOnly || "").trim();
+        const extracted = modelTextOnly ? "" : extractNonSpeakableInfo(String(result.text || ""));
+        const afterText = modelTextOnly || (extracted ? `Text-only details:\n${extracted}` : "");
+
+        voiceQueued = await enqueueTts(
+          job.chatId,
+          spoken,
+          "voice-reply",
+          {
+            afterText,
+            // Even if TTS_SEND_TEXT=1 globally, don't duplicate the spoken content for voice replies.
+            skipResultText: true,
+          },
+        );
+      } catch (err) {
+        // If voice enqueue fails, fall back to sending text so the user still gets an answer.
+        log(`enqueueTts(voice-reply) failed: ${redactError(err?.message || err)}`);
+        voiceQueued = false;
+      }
+    }
+
+    if (!result || (result.skipSendMessage !== true && !(shouldVoiceReply && voiceQueued))) {
       try {
         await sendMessage(job.chatId, normalizeResponse(result?.text));
       } catch (err) {
@@ -2731,6 +2954,7 @@ async function handleVoiceMessage(msg) {
     const activeSession = getActiveSessionForChat(chatId);
     await enqueuePrompt(chatId, transcript, "voice", {
       resumeSessionId: activeSession || "",
+      replyStyle: TTS_REPLY_TO_VOICE && TTS_ENABLED ? "voice" : "",
     });
   } catch (err) {
     await sendMessage(chatId, `Voice transcription failed: ${err.message || err}`);
