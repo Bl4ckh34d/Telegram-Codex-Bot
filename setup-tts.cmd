@@ -117,18 +117,41 @@ if not exist "%VENV_DIR%\\Scripts\\python.exe" (
 echo Installing MiraTTS dependencies into "%VENV_DIR%"...
 set "VENV_PY=%VENV_DIR%\\Scripts\\python.exe"
 
-if defined HAS_UV (
-  uv pip install --python "%VENV_PY%" torch torchvision torchaudio
-  if errorlevel 1 (
-    echo WARNING: torch install failed. MiraTTS will likely not work without torch.
+set "TORCH_CUDA_PACKAGES=torch==2.8.0+cu128 torchvision==0.23.0+cu128 torchaudio==2.8.0+cu128"
+set "TORCH_CPU_PACKAGES=torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0"
+
+where nvidia-smi >nul 2>&1
+if errorlevel 1 (
+  echo NVIDIA GPU not detected. Falling back to CPU-only torch...
+  if defined HAS_UV (
+    uv pip install --python "%VENV_PY%" %TORCH_CPU_PACKAGES%
+    if errorlevel 1 exit /b 1
+  ) else (
+    "%VENV_PY%" -m pip install %TORCH_CPU_PACKAGES%
+    if errorlevel 1 exit /b 1
   )
+) else (
+  "%VENV_PY%" -c "import torch,sys; v=torch.__version__.split('+')[0].split('.'); sys.exit(0 if torch.cuda.is_available() and (int(v[0]),int(v[1])) >= (2,8) else 1)" >nul 2>&1
+  if errorlevel 1 (
+    echo Installing CUDA-enabled torch stack...
+    if defined HAS_UV (
+      uv pip install --python "%VENV_PY%" --upgrade --force-reinstall %TORCH_CUDA_PACKAGES% --index-url https://download.pytorch.org/whl/cu128
+      if errorlevel 1 exit /b 1
+    ) else (
+      "%VENV_PY%" -m pip install --upgrade --force-reinstall %TORCH_CUDA_PACKAGES% --index-url https://download.pytorch.org/whl/cu128
+      if errorlevel 1 exit /b 1
+    )
+    "%VENV_PY%" -c "import torch,sys; v=torch.__version__.split('+')[0].split('.'); sys.exit(0 if torch.cuda.is_available() and (int(v[0]),int(v[1])) >= (2,8) else 1)" >nul 2>&1
+    if errorlevel 1 exit /b 1
+  )
+  "%VENV_PY%" -c "import torch,torchaudio; assert torch.cuda.is_available()" >nul 2>&1
+  if errorlevel 1 exit /b 1
+)
+
+if defined HAS_UV (
   uv pip install --python "%VENV_PY%" "numpy<2" soundfile omegaconf
   if errorlevel 1 exit /b 1
 ) else (
-  "%VENV_PY%" -m pip install torch torchvision torchaudio
-  if errorlevel 1 (
-    echo WARNING: torch install failed. MiraTTS will likely not work without torch.
-  )
   "%VENV_PY%" -m pip install "numpy<2" soundfile omegaconf
   if errorlevel 1 exit /b 1
 )
