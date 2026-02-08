@@ -15,7 +15,6 @@ Minimal Telegram <-> AIDOLON (Codex CLI) bridge with basic hardening and stabili
 - Default model/reasoning set to `gpt-5.3-codex` + `xhigh`
 - Full-access Codex mode enabled by default (`--dangerously-bypass-approvals-and-sandbox`)
 - Optional WSL fallback when `codex` is not on Windows PATH (`CODEX_USE_WSL=auto`, optional `CODEX_WSL_BIN`)
-- MCP servers disabled by default for bot runs (`CODEX_DISABLE_MCP=1`)
 - Voice note transcription via local Whisper venv (`setup-whisper-venv.cmd`)
 - Optional persistent Whisper worker (`WHISPER_KEEP_LOADED=1`) to keep the model loaded between voice notes
 - Session resume workflow with Telegram prefill buttons (`/resume`)
@@ -107,7 +106,7 @@ The preamble sent to Codex before each user message is loaded from `codex_prompt
 For voice-note transcripts (incoming Telegram voice messages), the bot can use a separate “spoken” prompt preamble from `codex_prompt_voice.txt` (set `CODEX_VOICE_PROMPT_FILE` to change the path). This is useful when `TTS_REPLY_TO_VOICE=1` so responses are TTS-friendly (no commands, paths, or other symbol-heavy text).
 
 ## Progress updates
-- `PROGRESS_UPDATES_ENABLED=1` enables short in-chat progress pings while a job is running
+- `PROGRESS_UPDATES_ENABLED=1` enables short in-chat progress pings while a job is running (default is off)
 - `PROGRESS_FIRST_UPDATE_SEC=0` minimum runtime before sending progress messages (set >0 to suppress updates for short runs)
 - `PROGRESS_UPDATE_INTERVAL_SEC=30` minimum seconds between progress messages (updates are output-driven, not a fixed timer)
 

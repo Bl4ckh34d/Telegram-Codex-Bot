@@ -404,7 +404,6 @@ const CODEX_MODEL = String(process.env.CODEX_MODEL || "gpt-5.3-codex").trim();
 const CODEX_REASONING_EFFORT = String(process.env.CODEX_REASONING_EFFORT || "xhigh").trim();
 const CODEX_PROFILE = String(process.env.CODEX_PROFILE || "").trim();
 const CODEX_DANGEROUS_FULL_ACCESS = toBool(process.env.CODEX_DANGEROUS_FULL_ACCESS, true);
-const CODEX_DISABLE_MCP = toBool(process.env.CODEX_DISABLE_MCP, true);
 const CODEX_SANDBOX_RAW = String(process.env.CODEX_SANDBOX || "workspace-write").trim();
 const CODEX_SANDBOX = ["read-only", "workspace-write", "danger-full-access"].includes(
   CODEX_SANDBOX_RAW,
@@ -460,7 +459,9 @@ const MAX_PROMPT_CHARS = toInt(process.env.MAX_PROMPT_CHARS, 4000, 64, 20000);
 // MAX_RESPONSE_CHARS=0 disables bot-side truncation (Telegram still limits each message).
 const MAX_RESPONSE_CHARS = toInt(process.env.MAX_RESPONSE_CHARS, 30000, 0, 5_000_000);
 const MAX_QUEUE_SIZE = toInt(process.env.MAX_QUEUE_SIZE, 10, 1, 100);
-const PROGRESS_UPDATES_ENABLED = toBool(process.env.PROGRESS_UPDATES_ENABLED, true);
+const PROGRESS_UPDATES_ENABLED = toBool(process.env.PROGRESS_UPDATES_ENABLED, false);
+// When true, progress updates may include stderr. This is usually noisy (logs), so default is false.
+const PROGRESS_INCLUDE_STDERR = toBool(process.env.PROGRESS_INCLUDE_STDERR, false);
 const PROGRESS_FIRST_UPDATE_SEC = toInt(process.env.PROGRESS_FIRST_UPDATE_SEC, 0, 0, 300);
 const PROGRESS_UPDATE_INTERVAL_SEC = toInt(process.env.PROGRESS_UPDATE_INTERVAL_SEC, 30, 10, 600);
 
@@ -1003,7 +1004,7 @@ function getCodexTopCommands() {
 
   let commands = parseCodexCommandsFromHelpText(`${stdout}\n${stderr}`);
   if (commands.length === 0) {
-    commands = ["exec", "review", "resume", "mcp", "cloud", "features", "login", "logout", "debug"];
+    commands = ["exec", "review", "resume", "cloud", "features", "login", "logout", "debug"];
   }
 
   codexTopCommandsCache = {
@@ -1081,10 +1082,8 @@ function buildCodexExecSpec(job) {
   if (CODEX_REASONING_EFFORT) {
     args.push("-c", `model_reasoning_effort=\"${CODEX_REASONING_EFFORT}\"`);
   }
-  if (CODEX_DISABLE_MCP) {
-    // Codex auto-starts enabled MCP servers from global config.toml; force-disable here.
-    args.push("-c", "mcp_servers={}");
-  }
+  // This project does not use MCP servers. Force-disable MCP even if globally configured.
+  args.push("-c", "mcp_servers={}");
   if (!isResume && CODEX_PROFILE) args.push("-p", CODEX_PROFILE);
   if (CODEX_EXTRA_ARGS.length > 0) args.push(...CODEX_EXTRA_ARGS);
 
@@ -2518,12 +2517,16 @@ function isProgressNoiseLine(line) {
   if (!s) return true;
   if (s === "--------" || /^-+$/.test(s)) return true;
   if (/^(user|assistant)$/i.test(s)) return true;
+  // Suppress internal TTS progress lines if they ever leak into progress updates.
+  if (/^tts:\s*/i.test(s)) return true;
+  // Suppress typical structured log lines (Rust/Go style) that are noisy in Telegram chats.
+  if (/^\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?z\s+(error|warn|info|debug)\b/i.test(s)) {
+    return true;
+  }
+  if (/^(error|warn|info|debug)\s+\S+(?:::\S+)+:/i.test(s)) return true;
   if (/^OpenAI\s+/i.test(s)) return true;
   if (/^Progress\s*\(/i.test(s)) return true;
   if (/^Still working\s*\(/i.test(s)) return true;
-  // MCP startup "ready" lines are common and not useful as progress updates.
-  if (/^mcp startup:\s*ready:/i.test(s)) return true;
-  if (/^mcp:\s*\S+.*\bready\b/i.test(s)) return true;
   if (/^(workdir|model|provider|approval|sandbox|reasoning|reasoning effort|reasoning summaries|session id):/i.test(s)) {
     return true;
   }
@@ -2536,6 +2539,10 @@ function isProgressNoiseLine(line) {
 
 function startJobProgressUpdates(job) {
   if (!PROGRESS_UPDATES_ENABLED) {
+    return () => {};
+  }
+  // TTS jobs are intentionally noisy (model load, encode, ffmpeg). Don't stream that into Telegram.
+  if (String(job?.kind || "") === "tts") {
     return () => {};
   }
 
@@ -2590,6 +2597,8 @@ function startJobProgressUpdates(job) {
 
   const ingest = (chunkText, streamName) => {
     if (stopped || shuttingDown || currentJob !== job) return;
+    // Forwarding stderr into Telegram tends to produce spammy log lines. Keep it opt-in.
+    if (String(streamName || "") === "stderr" && !PROGRESS_INCLUDE_STDERR) return;
     const chunk = String(chunkText || "");
     if (!chunk) return;
 
@@ -3290,7 +3299,7 @@ process.on("unhandledRejection", (err) => {
       }
     }
     log(
-      `Progress updates: enabled=${PROGRESS_UPDATES_ENABLED} first=${PROGRESS_FIRST_UPDATE_SEC}s interval=${PROGRESS_UPDATE_INTERVAL_SEC}s`,
+      `Progress updates: enabled=${PROGRESS_UPDATES_ENABLED} include_stderr=${PROGRESS_INCLUDE_STDERR} first=${PROGRESS_FIRST_UPDATE_SEC}s interval=${PROGRESS_UPDATE_INTERVAL_SEC}s`,
     );
     log(
       `Chat logging: terminal=${CHAT_LOG_TO_TERMINAL} file=${CHAT_LOG_TO_FILE} max_chars=${CHAT_LOG_MAX_CHARS} file_path=${CHAT_LOG_PATH}`,
