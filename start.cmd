@@ -31,6 +31,15 @@ if errorlevel 1 (
   )
 )
 
+if exist "%~dp0setup-tts.cmd" (
+  call "%~dp0setup-tts.cmd"
+  if errorlevel 1 (
+    echo.
+    echo TTS setup failed. Fix the errors above, or set TTS_ENABLED=0 in .env to skip TTS.
+    exit /b 1
+  )
+)
+
 :run
 node bot.js
 set "EXITCODE=%ERRORLEVEL%"

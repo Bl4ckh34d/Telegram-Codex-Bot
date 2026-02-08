@@ -11,10 +11,13 @@ const ENV_PATH = path.join(ROOT, ".env");
 const RUNTIME_DIR = path.join(ROOT, "runtime");
 const OUT_DIR = path.join(RUNTIME_DIR, "out");
 const VOICE_DIR = path.join(RUNTIME_DIR, "voice");
+const IMAGE_DIR = path.join(RUNTIME_DIR, "images");
+const TTS_DIR = path.join(RUNTIME_DIR, "tts");
 const STATE_PATH = path.join(RUNTIME_DIR, "state.json");
 const LOCK_PATH = path.join(RUNTIME_DIR, "bot.lock");
 const CHAT_LOG_PATH = path.join(RUNTIME_DIR, "chat.log");
 const WHISPER_SCRIPT_PATH = path.join(ROOT, "whisper_transcribe.py");
+const AIDOLON_TTS_SCRIPT_PATH = path.join(ROOT, "aidolon_tts_synthesize.py");
 const RESTART_EXIT_CODE = 75;
 
 function ensureDir(dirPath) {
@@ -314,6 +317,50 @@ function redactError(text) {
   return String(text || "").replace(/bot\d+:[A-Za-z0-9_-]+/g, "bot<redacted>");
 }
 
+function terminateChildTree(child, { forceAfterMs = 2000 } = {}) {
+  const pid = Number(child?.pid || 0);
+  if (!Number.isFinite(pid) || pid <= 0) return;
+
+  if (process.platform === "win32") {
+    // On Windows, killing a shell-wrapped process often leaves the actual worker alive.
+    // taskkill /T terminates the whole process tree.
+    try {
+      spawn("taskkill.exe", ["/PID", String(pid), "/T"], {
+        windowsHide: true,
+        stdio: "ignore",
+      });
+    } catch {
+      // best effort
+    }
+
+    setTimeout(() => {
+      try {
+        spawn("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+          windowsHide: true,
+          stdio: "ignore",
+        });
+      } catch {
+        // best effort
+      }
+    }, Math.max(0, Number(forceAfterMs) || 0));
+    return;
+  }
+
+  try {
+    child.kill("SIGTERM");
+  } catch {
+    // best effort
+  }
+
+  setTimeout(() => {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // best effort
+    }
+  }, Math.max(0, Number(forceAfterMs) || 0));
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -326,6 +373,8 @@ loadEnv(ENV_PATH);
 ensureDir(RUNTIME_DIR);
 ensureDir(OUT_DIR);
 ensureDir(VOICE_DIR);
+ensureDir(IMAGE_DIR);
+ensureDir(TTS_DIR);
 
 const TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || "").trim();
 const PRIMARY_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || "").trim();
@@ -335,6 +384,9 @@ const ALLOW_GROUP_CHAT = toBool(process.env.ALLOW_GROUP_CHAT, false);
 const POLL_TIMEOUT_SEC = toInt(process.env.TELEGRAM_POLL_TIMEOUT_SEC, 20, 5, 50);
 const STARTUP_MESSAGE = toBool(process.env.STARTUP_MESSAGE, true);
 const SKIP_STALE_UPDATES = toBool(process.env.SKIP_STALE_UPDATES, true);
+const TELEGRAM_SET_COMMANDS = toBool(process.env.TELEGRAM_SET_COMMANDS, true);
+const TELEGRAM_COMMAND_SCOPE = String(process.env.TELEGRAM_COMMAND_SCOPE || "all_private_chats").trim().toLowerCase();
+const TELEGRAM_FORMAT_BOLD = toBool(process.env.TELEGRAM_FORMAT_BOLD, true);
 const CHAT_LOG_TO_TERMINAL = toBool(process.env.CHAT_LOG_TO_TERMINAL, true);
 const CHAT_LOG_TO_FILE = toBool(process.env.CHAT_LOG_TO_FILE, true);
 const CHAT_LOG_MAX_CHARS = toInt(process.env.CHAT_LOG_MAX_CHARS, 700, 80, 8000);
@@ -352,6 +404,7 @@ const CODEX_MODEL = String(process.env.CODEX_MODEL || "gpt-5.3-codex").trim();
 const CODEX_REASONING_EFFORT = String(process.env.CODEX_REASONING_EFFORT || "xhigh").trim();
 const CODEX_PROFILE = String(process.env.CODEX_PROFILE || "").trim();
 const CODEX_DANGEROUS_FULL_ACCESS = toBool(process.env.CODEX_DANGEROUS_FULL_ACCESS, true);
+const CODEX_DISABLE_MCP = toBool(process.env.CODEX_DISABLE_MCP, true);
 const CODEX_SANDBOX_RAW = String(process.env.CODEX_SANDBOX || "workspace-write").trim();
 const CODEX_SANDBOX = ["read-only", "workspace-write", "danger-full-access"].includes(
   CODEX_SANDBOX_RAW,
@@ -379,11 +432,31 @@ const WHISPER_MODEL = String(process.env.WHISPER_MODEL || "base").trim();
 const WHISPER_LANGUAGE = String(process.env.WHISPER_LANGUAGE || "auto").trim();
 const WHISPER_MAX_FILE_MB = toInt(process.env.WHISPER_MAX_FILE_MB, 20, 1, 100);
 
+const VISION_ENABLED = toBool(process.env.VISION_ENABLED, false);
+const VISION_MAX_FILE_MB = toInt(process.env.VISION_MAX_FILE_MB, 12, 1, 50);
+const VISION_AUTO_FOLLOWUP_SEC = toInt(process.env.VISION_AUTO_FOLLOWUP_SEC, 900, 0, 86400);
+
+const TTS_ENABLED = toBool(process.env.TTS_ENABLED, false);
+const TTS_MAX_TEXT_CHARS = toInt(process.env.TTS_MAX_TEXT_CHARS, 1200, 50, 20000);
+const TTS_TIMEOUT_MS = toInt(process.env.TTS_TIMEOUT_MS, 10 * 60 * 1000, 30_000, 60 * 60 * 1000);
+const TTS_AIDOLON_SERVER_DIR = resolveMaybeRelativePath(
+  process.env.TTS_AIDOLON_SERVER_DIR || path.join(ROOT, "..", "aidolon_server"),
+);
+const TTS_AIDOLON_ENV_PATH = resolveMaybeRelativePath(
+  process.env.TTS_AIDOLON_ENV_PATH || path.join(TTS_AIDOLON_SERVER_DIR, ".env"),
+);
+const TTS_REFERENCE_AUDIO = resolveMaybeRelativePath(process.env.TTS_REFERENCE_AUDIO || "");
+const TTS_PYTHON = String(process.env.TTS_PYTHON || "").trim();
+const TTS_FFMPEG_BIN = String(process.env.TTS_FFMPEG_BIN || "ffmpeg").trim();
+const TTS_OPUS_BITRATE_KBPS = toInt(process.env.TTS_OPUS_BITRATE_KBPS, 48, 8, 256);
+const TTS_SEND_TEXT = toBool(process.env.TTS_SEND_TEXT, false);
+
 const MAX_PROMPT_CHARS = toInt(process.env.MAX_PROMPT_CHARS, 4000, 64, 20000);
-const MAX_RESPONSE_CHARS = toInt(process.env.MAX_RESPONSE_CHARS, 30000, 512, 200000);
+// MAX_RESPONSE_CHARS=0 disables bot-side truncation (Telegram still limits each message).
+const MAX_RESPONSE_CHARS = toInt(process.env.MAX_RESPONSE_CHARS, 30000, 0, 5_000_000);
 const MAX_QUEUE_SIZE = toInt(process.env.MAX_QUEUE_SIZE, 10, 1, 100);
 const PROGRESS_UPDATES_ENABLED = toBool(process.env.PROGRESS_UPDATES_ENABLED, true);
-const PROGRESS_FIRST_UPDATE_SEC = toInt(process.env.PROGRESS_FIRST_UPDATE_SEC, 8, 0, 300);
+const PROGRESS_FIRST_UPDATE_SEC = toInt(process.env.PROGRESS_FIRST_UPDATE_SEC, 0, 0, 300);
 const PROGRESS_UPDATE_INTERVAL_SEC = toInt(process.env.PROGRESS_UPDATE_INTERVAL_SEC, 30, 10, 600);
 
 if (!TOKEN || !PRIMARY_CHAT_ID) {
@@ -460,10 +533,13 @@ try {
   process.exit(1);
 }
 
-const state = readJson(STATE_PATH, { lastUpdateId: 0, chatSessions: {} });
+const state = readJson(STATE_PATH, { lastUpdateId: 0, chatSessions: {}, lastImages: {} });
 let lastUpdateId = Number(state.lastUpdateId || 0);
 const chatSessions = state && typeof state.chatSessions === "object" && state.chatSessions
   ? { ...state.chatSessions }
+  : {};
+const lastImages = state && typeof state.lastImages === "object" && state.lastImages
+  ? { ...state.lastImages }
   : {};
 
 const queue = [];
@@ -480,7 +556,7 @@ let codexTopCommandsCache = {
 
 function persistState() {
   try {
-    writeJsonAtomic(STATE_PATH, { lastUpdateId, chatSessions });
+    writeJsonAtomic(STATE_PATH, { lastUpdateId, chatSessions, lastImages });
   } catch {
     // best effort
   }
@@ -491,6 +567,42 @@ function getActiveSessionForChat(chatId) {
   if (!key) return "";
   const sessionId = String(chatSessions[key] || "").trim();
   return sessionId;
+}
+
+function getLastImageForChat(chatId) {
+  const key = String(chatId || "").trim();
+  if (!key) return null;
+  const entry = lastImages[key] || null;
+  if (!entry || typeof entry !== "object") return null;
+  const filePath = String(entry.path || "").trim();
+  if (!filePath) return null;
+  if (!fs.existsSync(filePath)) return null;
+  return {
+    path: filePath,
+    mime: String(entry.mime || "").trim(),
+    name: String(entry.name || "").trim(),
+    at: Number(entry.at || 0),
+  };
+}
+
+function setLastImageForChat(chatId, info) {
+  const key = String(chatId || "").trim();
+  if (!key) return;
+  lastImages[key] = {
+    path: String(info?.path || "").trim(),
+    mime: String(info?.mime || "").trim(),
+    name: String(info?.name || "").trim(),
+    at: Date.now(),
+  };
+  persistState();
+}
+
+function clearLastImageForChat(chatId) {
+  const key = String(chatId || "").trim();
+  if (!key) return;
+  if (!(key in lastImages)) return;
+  delete lastImages[key];
+  persistState();
 }
 
 function setActiveSessionForChat(chatId, sessionId) {
@@ -518,19 +630,23 @@ function normalizePrompt(text) {
 
 function normalizeResponse(text) {
   const cleaned = String(text || "").trim() || "(empty response)";
+  if (MAX_RESPONSE_CHARS <= 0) return cleaned;
   if (cleaned.length <= MAX_RESPONSE_CHARS) return cleaned;
   return `${cleaned.slice(0, MAX_RESPONSE_CHARS)}\n\n[truncated by bot]`;
 }
 
-function formatCodexPrompt(userText) {
-  return [
+function formatCodexPrompt(userText, options = {}) {
+  const hasImages = options && options.hasImages === true;
+  const lines = [
     "You are AIDOLON CLI replying via Telegram.",
     "Keep it concise and practical.",
     "If ambiguous, ask one clear follow-up question.",
-    "",
-    "User message:",
-    userText,
-  ].join("\n");
+  ];
+  if (hasImages) {
+    lines.push("One or more images are attached. Use them to answer the user.");
+  }
+  lines.push("", "User message:", userText);
+  return lines.join("\n");
 }
 
 function isSessionId(value) {
@@ -880,7 +996,10 @@ function buildRawCodexSpec(args) {
 }
 
 function buildCodexExecSpec(job) {
-  const promptText = formatCodexPrompt(job.text);
+  const rawImagePaths = Array.isArray(job?.imagePaths)
+    ? job.imagePaths.map((p) => String(p || "").trim()).filter(Boolean)
+    : [];
+  const promptText = formatCodexPrompt(job.text, { hasImages: rawImagePaths.length > 0 });
   const outputFile = String(job?.outputFile || "");
   const outputPath = codexMode.mode === "wsl" ? toWslPath(outputFile) : outputFile;
   const args = ["exec"];
@@ -904,8 +1023,20 @@ function buildCodexExecSpec(job) {
   if (CODEX_REASONING_EFFORT) {
     args.push("-c", `model_reasoning_effort=\"${CODEX_REASONING_EFFORT}\"`);
   }
+  if (CODEX_DISABLE_MCP) {
+    // Codex auto-starts enabled MCP servers from global config.toml; force-disable here.
+    args.push("-c", "mcp_servers={}");
+  }
   if (!isResume && CODEX_PROFILE) args.push("-p", CODEX_PROFILE);
   if (CODEX_EXTRA_ARGS.length > 0) args.push(...CODEX_EXTRA_ARGS);
+
+  if (rawImagePaths.length > 0) {
+    for (const imgPath of rawImagePaths) {
+      const resolved = codexMode.mode === "wsl" ? toWslPath(imgPath) : imgPath;
+      args.push("-i", resolved);
+    }
+  }
+
   args.push("-");
   if (codexMode.mode === "wsl") {
     const shellCmd = [codexMode.codexPath || "codex", ...args].map(shQuote).join(" ");
@@ -971,29 +1102,133 @@ async function telegramApiMultipart(method, formData, timeoutMs = 30_000) {
   }
 }
 
+function renderTelegramEntities(text) {
+  if (!TELEGRAM_FORMAT_BOLD) {
+    return { text: String(text || ""), entities: null };
+  }
+
+  const src = String(text || "");
+  const out = [];
+  const entities = [];
+  let outLen = 0;
+  let boldStart = null;
+  let inInlineCode = false;
+  let inCodeFence = false;
+
+  for (let i = 0; i < src.length; ) {
+    if (!inInlineCode && src.startsWith("```", i)) {
+      inCodeFence = !inCodeFence;
+      out.push("```");
+      outLen += 3;
+      i += 3;
+      continue;
+    }
+
+    const ch = src[i];
+    if (!inCodeFence && ch === "`") {
+      inInlineCode = !inInlineCode;
+      out.push(ch);
+      outLen += 1;
+      i += 1;
+      continue;
+    }
+
+    if (!inInlineCode && !inCodeFence && src.startsWith("**", i)) {
+      if (boldStart === null) {
+        boldStart = outLen;
+        i += 2;
+        continue;
+      }
+      const len = outLen - boldStart;
+      if (len > 0) {
+        entities.push({ type: "bold", offset: boldStart, length: len });
+      } else {
+        // Empty "** **" sequence; keep literal markers.
+        out.push("**");
+        outLen += 2;
+      }
+      boldStart = null;
+      i += 2;
+      continue;
+    }
+
+    out.push(ch);
+    outLen += 1;
+    i += 1;
+  }
+
+  if (boldStart !== null) {
+    // Unclosed bold: keep the literal opening markers.
+    const joined = out.join("");
+    const restored = `${joined.slice(0, boldStart)}**${joined.slice(boldStart)}`;
+    return { text: restored, entities: entities.length > 0 ? entities : null };
+  }
+
+  return { text: out.join(""), entities: entities.length > 0 ? entities : null };
+}
+
+function getTelegramCommandList() {
+  return [
+    { command: "start", description: "start / help" },
+    { command: "help", description: "show help" },
+    { command: "status", description: "show worker status" },
+    { command: "queue", description: "show queued prompts" },
+    { command: "codex", description: "show codex command menu" },
+    { command: "commands", description: "show codex command menu" },
+    { command: "cmd", description: "stage a raw codex CLI command" },
+    { command: "confirm", description: "run staged /cmd" },
+    { command: "reject", description: "cancel staged /cmd" },
+    { command: "cancel", description: "cancel the active codex run" },
+    { command: "stop", description: "cancel the active codex run" },
+    { command: "clear", description: "clear queued prompts" },
+    { command: "screenshot", description: "send a screenshot image" },
+    { command: "resume", description: "resume a codex session" },
+    { command: "new", description: "clear active resumed session" },
+    { command: "compress", description: "compress active session context" },
+    { command: "ask", description: "ask about your last sent image" },
+    { command: "see", description: "take a screenshot and ask about it" },
+    { command: "imgclear", description: "clear last image context" },
+    { command: "tts", description: "speak text as a Telegram voice message" },
+    { command: "restart", description: "restart the bot process" },
+  ];
+}
+
+async function setTelegramCommands() {
+  const commands = getTelegramCommandList();
+  const body = { commands };
+  if (TELEGRAM_COMMAND_SCOPE && TELEGRAM_COMMAND_SCOPE !== "default") {
+    body.scope = { type: TELEGRAM_COMMAND_SCOPE };
+  }
+  await telegramApi("setMyCommands", { body, timeoutMs: 15_000 });
+}
+
 async function sendMessage(chatId, text, options = {}) {
   const silent = options.silent === true;
   const replyMarkup = options.replyMarkup || null;
   const chunks = chunkText(normalizeResponse(text));
   for (let idx = 0; idx < chunks.length; idx += 1) {
-    const chunk = chunks[idx];
+    const rawChunk = chunks[idx];
+    const formatted = renderTelegramEntities(rawChunk);
     let attempt = 0;
     for (;;) {
       attempt += 1;
       try {
         const body = {
           chat_id: chatId,
-          text: chunk,
+          text: formatted.text,
           disable_web_page_preview: true,
           disable_notification: silent,
         };
+        if (formatted.entities) {
+          body.entities = formatted.entities;
+        }
         if (idx === 0 && replyMarkup) {
           body.reply_markup = replyMarkup;
         }
         await telegramApi("sendMessage", {
           body,
         });
-        logChat("out", chatId, chunk, { source: "telegram-send" });
+        logChat("out", chatId, formatted.text, { source: "telegram-send" });
         break;
       } catch (err) {
         if (attempt >= 3) throw err;
@@ -1018,6 +1253,33 @@ async function sendPhoto(chatId, filePath, options = {}) {
       form.append("photo", new Blob([imageBytes], { type: "image/png" }), fileName);
       await telegramApiMultipart("sendPhoto", form, 45_000);
       logChat("out", chatId, caption || "[photo]", { source: "telegram-photo" });
+      return;
+    } catch (err) {
+      if (attempt >= 3) throw err;
+      await sleep(350 * attempt);
+    }
+  }
+}
+
+async function sendVoice(chatId, filePath, options = {}) {
+  const silent = options.silent === true;
+  const caption = String(options.caption || "").trim();
+  const duration = Number(options.duration || 0);
+  const fileName = path.basename(filePath) || "voice.ogg";
+  const voiceBytes = fs.readFileSync(filePath);
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const form = new FormData();
+      form.append("chat_id", String(chatId || ""));
+      form.append("disable_notification", silent ? "true" : "false");
+      if (caption) form.append("caption", caption);
+      if (Number.isFinite(duration) && duration > 0) {
+        form.append("duration", String(Math.round(duration)));
+      }
+      form.append("voice", new Blob([voiceBytes], { type: "audio/ogg" }), fileName);
+      await telegramApiMultipart("sendVoice", form, 90_000);
+      logChat("out", chatId, caption || "[voice]", { source: "telegram-voice" });
       return;
     } catch (err) {
       if (attempt >= 3) throw err;
@@ -1128,7 +1390,7 @@ async function sendHelp(chatId) {
   const lines = [
     "AIDOLON is online.",
     "",
-    "Send plain text (or a voice note) to prompt AIDOLON.",
+    "Send plain text (or a voice message) to prompt AIDOLON.",
     "Commands:",
     "/help - this help",
     "/codex or /commands - show AIDOLON command menu",
@@ -1144,6 +1406,10 @@ async function sendHelp(chatId) {
     "/resume <session_id> [text] - resume a session, optionally with text",
     "/new - clear active resumed session",
     "/compress [hint] - summarize/compress active session context",
+    "/ask <question> - analyze your last sent image",
+    "/see <question> - take a screenshot and analyze it",
+    "/imgclear - clear the last image context (so plain text goes back to AIDOLON)",
+    "/tts <text> - send a TTS voice message (requires TTS_ENABLED=1)",
     "/restart - restart the bot process",
   ];
   await sendMessage(chatId, lines.join("\n"));
@@ -1259,12 +1525,12 @@ async function cancelCurrent(chatId) {
     await sendMessage(chatId, "No active AIDOLON run to cancel.");
     return;
   }
-  currentJob.cancelRequested = true;
-  try {
-    currentJob.process.kill("SIGTERM");
-  } catch {
-    // best effort
+  if (String(currentJob.chatId || "") !== String(chatId || "")) {
+    await sendMessage(chatId, `AIDOLON is busy with another chat (job #${currentJob.id}).`);
+    return;
   }
+  currentJob.cancelRequested = true;
+  terminateChildTree(currentJob.process, { forceAfterMs: 2000 });
   await sendMessage(chatId, `Cancellation requested for job #${currentJob.id}.`);
 }
 
@@ -1347,27 +1613,18 @@ async function runRawCodexJob(job) {
 
     const timeout = setTimeout(() => {
       job.timedOut = true;
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        // best effort
-      }
-      setTimeout(() => {
-        if (!done) {
-          try {
-            child.kill("SIGKILL");
-          } catch {
-            // best effort
-          }
-        }
-      }, 3000);
+      terminateChildTree(child, { forceAfterMs: 3000 });
     }, CODEX_TIMEOUT_MS);
 
     child.stdout.on("data", (buf) => {
-      job.stdoutTail = appendTail(job.stdoutTail, String(buf || ""), 50000);
+      const chunk = String(buf || "");
+      job.stdoutTail = appendTail(job.stdoutTail, chunk, 50000);
+      if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
     });
     child.stderr.on("data", (buf) => {
-      job.stderrTail = appendTail(job.stderrTail, String(buf || ""), 50000);
+      const chunk = String(buf || "");
+      job.stderrTail = appendTail(job.stderrTail, chunk, 50000);
+      if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
     });
 
     child.on("error", (err) => {
@@ -1429,8 +1686,13 @@ async function handleCommand(chatId, text) {
   if (!parsed) return false;
 
   switch (parsed.cmd) {
-    case "/start":
     case "/help":
+      await sendHelp(chatId);
+      return true;
+    case "/start":
+      // Telegram's /start should behave like "new chat": clear any active resumed session.
+      clearActiveSessionForChat(chatId);
+      clearLastImageForChat(chatId);
       await sendHelp(chatId);
       return true;
     case "/codex":
@@ -1540,6 +1802,79 @@ async function handleCommand(chatId, text) {
       });
       return true;
     }
+    case "/ask": {
+      if (!VISION_ENABLED) {
+        await sendMessage(chatId, "Vision is disabled on this bot (VISION_ENABLED=0).");
+        return true;
+      }
+      const q = String(parsed.arg || "").trim();
+      if (!q) {
+        await sendMessage(chatId, "Usage: /ask <question> (analyzes your last sent image)");
+        return true;
+      }
+      const img = getLastImageForChat(chatId);
+      if (!img) {
+        await sendMessage(chatId, "No image found for this chat. Send an image first (optionally with a caption).");
+        return true;
+      }
+      const activeSession = getActiveSessionForChat(chatId);
+      await enqueuePrompt(chatId, q, "ask-image", {
+        resumeSessionId: activeSession || "",
+        imagePaths: [img.path],
+      });
+      return true;
+    }
+    case "/see": {
+      if (!VISION_ENABLED) {
+        await sendMessage(chatId, "Vision is disabled on this bot (VISION_ENABLED=0).");
+        return true;
+      }
+      const q = String(parsed.arg || "").trim();
+      if (!q) {
+        await sendMessage(chatId, "Usage: /see <question> (takes a screenshot, then analyzes it)");
+        return true;
+      }
+      if (process.platform !== "win32") {
+        await sendMessage(chatId, "Screenshot vision is only configured for Windows in this bot.");
+        return true;
+      }
+
+      const screenshotPath = path.join(
+        IMAGE_DIR,
+        `screenshot-${Date.now()}-${Math.random().toString(36).slice(2)}.png`,
+      );
+      try {
+        await sendMessage(chatId, "Taking screenshot...");
+        await capturePrimaryScreenshot(screenshotPath);
+        setLastImageForChat(chatId, { path: screenshotPath, mime: "image/png", name: path.basename(screenshotPath) });
+        const activeSession = getActiveSessionForChat(chatId);
+        await enqueuePrompt(chatId, q, "see-screenshot", {
+          resumeSessionId: activeSession || "",
+          imagePaths: [screenshotPath],
+        });
+      } catch (err) {
+        await sendMessage(chatId, `Screenshot vision failed: ${String(err?.message || err)}`);
+      }
+      return true;
+    }
+    case "/imgclear": {
+      clearLastImageForChat(chatId);
+      await sendMessage(chatId, "Cleared last image context.");
+      return true;
+    }
+    case "/tts": {
+      if (!TTS_ENABLED) {
+        await sendMessage(chatId, "TTS is disabled on this bot (TTS_ENABLED=0).");
+        return true;
+      }
+      const q = String(parsed.arg || "").trim();
+      if (!q) {
+        await sendMessage(chatId, "Usage: /tts <text>");
+        return true;
+      }
+      await enqueueTts(chatId, q, "tts-command");
+      return true;
+    }
     case "/compress": {
       const activeSession = getActiveSessionForChat(chatId);
       if (!activeSession) {
@@ -1598,6 +1933,9 @@ async function enqueuePrompt(chatId, inputText, source, options = {}) {
     text,
     source,
     resumeSessionId: String(options.resumeSessionId || "").trim(),
+    imagePaths: Array.isArray(options.imagePaths)
+      ? options.imagePaths.map((p) => String(p || "").trim()).filter(Boolean)
+      : [],
     startedAt: 0,
     cancelRequested: false,
     timedOut: false,
@@ -1611,13 +1949,374 @@ async function enqueuePrompt(chatId, inputText, source, options = {}) {
   void processQueue();
 }
 
-function formatElapsedSeconds(totalSeconds) {
-  const sec = Math.max(0, Number(totalSeconds) || 0);
-  if (sec < 60) return `${sec}s`;
-  const min = Math.floor(sec / 60);
-  const rem = sec % 60;
-  if (rem === 0) return `${min}m`;
-  return `${min}m ${rem}s`;
+function normalizeTtsText(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return "";
+  const squashed = trimmed.replace(/\s+/g, " ").trim();
+  if (squashed.length <= TTS_MAX_TEXT_CHARS) return squashed;
+  return squashed.slice(0, TTS_MAX_TEXT_CHARS);
+}
+
+async function enqueueTts(chatId, inputText, source) {
+  const text = normalizeTtsText(inputText);
+  if (!text) {
+    await sendMessage(chatId, "Empty TTS text ignored.");
+    return;
+  }
+  if (queue.length >= MAX_QUEUE_SIZE) {
+    await sendMessage(chatId, `Queue is full (${MAX_QUEUE_SIZE}). Use /queue or /clear.`);
+    return;
+  }
+
+  const job = {
+    id: nextJobId++,
+    chatId,
+    text,
+    source,
+    kind: "tts",
+    startedAt: 0,
+    cancelRequested: false,
+    timedOut: false,
+    process: null,
+    stdoutTail: "",
+    stderrTail: "",
+  };
+
+  queue.push(job);
+  void processQueue();
+}
+
+function resolveTtsPythonBin(serverDir) {
+  const override = String(TTS_PYTHON || "").trim();
+  if (override) return override;
+
+  const candidates = [];
+  const base = String(serverDir || "").trim();
+  if (base) {
+    if (process.platform === "win32") {
+      candidates.push(path.join(base, ".venv", "Scripts", "python.exe"));
+      candidates.push(path.join(base, ".venv", "Scripts", "python"));
+    } else {
+      candidates.push(path.join(base, ".venv", "bin", "python"));
+      candidates.push(path.join(base, ".venv", "bin", "python3"));
+    }
+  }
+
+  if (process.platform === "win32") {
+    candidates.push("python");
+    candidates.push("py");
+  } else {
+    candidates.push("python3");
+    candidates.push("python");
+  }
+
+  for (const item of candidates) {
+    const token = String(item || "").trim();
+    if (!token) continue;
+    if (token.includes("\\") || token.includes("/") || path.isAbsolute(token)) {
+      if (fs.existsSync(token)) return token;
+      continue;
+    }
+    if (commandExists(token)) return token;
+  }
+
+  return "";
+}
+
+function resolveTtsFfmpegBin() {
+  const override = String(TTS_FFMPEG_BIN || "").trim();
+  if (!override) return "";
+  if (override.includes("\\") || override.includes("/") || path.isAbsolute(override)) {
+    return fs.existsSync(override) ? override : "";
+  }
+  return commandExists(override) ? override : "";
+}
+
+async function runTtsJob(job) {
+  if (!TTS_ENABLED) {
+    return { ok: false, text: "TTS is disabled on this bot (TTS_ENABLED=0)." };
+  }
+  if (!fs.existsSync(AIDOLON_TTS_SCRIPT_PATH)) {
+    return {
+      ok: false,
+      text: `TTS helper script missing: ${AIDOLON_TTS_SCRIPT_PATH}`,
+    };
+  }
+
+  const serverDir = String(TTS_AIDOLON_SERVER_DIR || "").trim();
+  if (!serverDir || !fs.existsSync(serverDir)) {
+    return {
+      ok: false,
+      text: `AIDOLON server dir not found: ${serverDir || "(empty)"}\nSet TTS_AIDOLON_SERVER_DIR.`,
+    };
+  }
+
+  const pyBin = resolveTtsPythonBin(serverDir);
+  if (!pyBin) {
+    return {
+      ok: false,
+      text: "Python not found for TTS. Set TTS_PYTHON or ensure aidolon_server/.venv exists.",
+    };
+  }
+
+  const ffmpegBin = resolveTtsFfmpegBin();
+  if (!ffmpegBin) {
+    return {
+      ok: false,
+      text: `ffmpeg not found ('${TTS_FFMPEG_BIN}'). Install ffmpeg or set TTS_FFMPEG_BIN.`,
+    };
+  }
+
+  const text = normalizeTtsText(job.text);
+  if (!text) return { ok: false, text: "Empty TTS text." };
+
+  const base = `tts-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const wavPath = path.join(TTS_DIR, `${base}.wav`);
+  const oggPath = path.join(TTS_DIR, `${base}.ogg`);
+
+  const synthArgs = [
+    AIDOLON_TTS_SCRIPT_PATH,
+    "--server-dir",
+    serverDir,
+    "--out-wav",
+    wavPath,
+  ];
+  if (TTS_AIDOLON_ENV_PATH && fs.existsSync(TTS_AIDOLON_ENV_PATH)) {
+    synthArgs.push("--env-file", TTS_AIDOLON_ENV_PATH);
+  }
+  if (TTS_REFERENCE_AUDIO) {
+    synthArgs.push("--reference-audio", TTS_REFERENCE_AUDIO);
+  }
+
+  const synthOk = await new Promise((resolve) => {
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      resolve(result);
+    };
+
+    let child;
+    try {
+      child = spawn(pyBin, synthArgs, {
+        cwd: ROOT,
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch (err) {
+      finish({ ok: false, text: `Failed to start TTS python: ${err.message || err}` });
+      return;
+    }
+
+    job.process = child;
+
+    try {
+      child.stdin.end(text);
+    } catch {
+      // best effort
+    }
+
+    const timeout = setTimeout(() => {
+      job.timedOut = true;
+      terminateChildTree(child, { forceAfterMs: 3000 });
+    }, TTS_TIMEOUT_MS);
+
+    child.stdout.on("data", (buf) => {
+      const chunk = String(buf || "");
+      job.stdoutTail = appendTail(job.stdoutTail, chunk, 50000);
+      if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
+    });
+    child.stderr.on("data", (buf) => {
+      const chunk = String(buf || "");
+      job.stderrTail = appendTail(job.stderrTail, chunk, 50000);
+      if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
+    });
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      finish({ ok: false, text: `TTS python process error: ${err.message || err}` });
+    });
+    child.on("close", (code, signal) => {
+      clearTimeout(timeout);
+
+      if (job.cancelRequested) {
+        finish({ ok: false, text: "TTS canceled." });
+        return;
+      }
+      if (job.timedOut) {
+        const tail = job.stderrTail.trim() || job.stdoutTail.trim();
+        finish({
+          ok: false,
+          text: `TTS timed out after ${Math.round(TTS_TIMEOUT_MS / 1000)}s.${tail ? `\n\n${tail}` : ""}`,
+        });
+        return;
+      }
+      if (typeof code === "number" && code !== 0) {
+        const tail = job.stderrTail.trim() || job.stdoutTail.trim();
+        finish({
+          ok: false,
+          text: `TTS synthesis failed (exit ${code}${signal ? `, signal ${signal}` : ""}).${tail ? `\n\n${tail}` : ""}`,
+        });
+        return;
+      }
+
+      if (!fs.existsSync(wavPath)) {
+        finish({ ok: false, text: "TTS synthesis finished, but WAV output file is missing." });
+        return;
+      }
+
+      finish({ ok: true });
+    });
+  });
+
+  if (!synthOk.ok) {
+    try {
+      if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
+    } catch {
+      // best effort
+    }
+    return { ok: false, text: synthOk.text };
+  }
+
+  if (job.cancelRequested) {
+    try {
+      if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
+    } catch {
+      // best effort
+    }
+    return { ok: false, text: "TTS canceled." };
+  }
+
+  if (typeof job.onProgressChunk === "function") {
+    job.onProgressChunk("TTS: encoding voice message...\n", "stderr");
+  }
+
+  const ffArgs = [
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-i",
+    wavPath,
+    "-ac",
+    "1",
+    "-ar",
+    "48000",
+    "-c:a",
+    "libopus",
+    "-b:a",
+    `${TTS_OPUS_BITRATE_KBPS}k`,
+    "-vbr",
+    "on",
+    "-compression_level",
+    "10",
+    "-application",
+    "voip",
+    oggPath,
+  ];
+
+  const encodeOk = await new Promise((resolve) => {
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      resolve(result);
+    };
+
+    let child;
+    try {
+      child = spawn(ffmpegBin, ffArgs, {
+        cwd: ROOT,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (err) {
+      finish({ ok: false, text: `Failed to start ffmpeg: ${err.message || err}` });
+      return;
+    }
+
+    job.process = child;
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (buf) => {
+      const chunk = String(buf || "");
+      stdout = appendTail(stdout, chunk, 50000);
+      if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
+    });
+    child.stderr.on("data", (buf) => {
+      const chunk = String(buf || "");
+      stderr = appendTail(stderr, chunk, 50000);
+      if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
+    });
+    child.on("error", (err) => {
+      finish({ ok: false, text: `ffmpeg error: ${err.message || err}` });
+    });
+    child.on("close", (code, signal) => {
+      if (job.cancelRequested) {
+        finish({ ok: false, text: "TTS canceled." });
+        return;
+      }
+      if (typeof code === "number" && code !== 0) {
+        const tail = String(stderr || stdout || "").trim();
+        finish({
+          ok: false,
+          text: `ffmpeg failed (exit ${code}${signal ? `, signal ${signal}` : ""}).${tail ? `\n\n${tail}` : ""}`,
+        });
+        return;
+      }
+      if (!fs.existsSync(oggPath)) {
+        finish({ ok: false, text: "ffmpeg completed, but OGG output file is missing." });
+        return;
+      }
+      finish({ ok: true });
+    });
+  });
+
+  try {
+    if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
+  } catch {
+    // best effort
+  }
+
+  if (!encodeOk.ok) {
+    try {
+      if (fs.existsSync(oggPath)) fs.unlinkSync(oggPath);
+    } catch {
+      // best effort
+    }
+    return { ok: false, text: encodeOk.text };
+  }
+
+  if (job.cancelRequested) {
+    try {
+      if (fs.existsSync(oggPath)) fs.unlinkSync(oggPath);
+    } catch {
+      // best effort
+    }
+    return { ok: false, text: "TTS canceled." };
+  }
+
+  if (typeof job.onProgressChunk === "function") {
+    job.onProgressChunk("TTS: sending voice message...\n", "stderr");
+  }
+
+  try {
+    await sendVoice(job.chatId, oggPath);
+  } catch (err) {
+    return { ok: false, text: `Failed to send Telegram voice message: ${String(err?.message || err)}` };
+  } finally {
+    try {
+      if (fs.existsSync(oggPath)) fs.unlinkSync(oggPath);
+    } catch {
+      // best effort
+    }
+  }
+
+  if (TTS_SEND_TEXT) {
+    return { ok: true, text };
+  }
+
+  return { ok: true, text: "", skipSendMessage: true };
 }
 
 function truncateLine(text, maxChars = 220) {
@@ -1631,40 +2330,20 @@ function isProgressNoiseLine(line) {
   if (!s) return true;
   if (s === "--------" || /^-+$/.test(s)) return true;
   if (/^(user|assistant)$/i.test(s)) return true;
-  if (/^OpenAI\\s+/i.test(s)) return true;
+  if (/^OpenAI\s+/i.test(s)) return true;
+  if (/^Progress\s*\(/i.test(s)) return true;
+  if (/^Still working\s*\(/i.test(s)) return true;
+  // MCP startup "ready" lines are common and not useful as progress updates.
+  if (/^mcp startup:\s*ready:/i.test(s)) return true;
+  if (/^mcp:\s*\S+.*\bready\b/i.test(s)) return true;
   if (/^(workdir|model|provider|approval|sandbox|reasoning|reasoning effort|reasoning summaries|session id):/i.test(s)) {
     return true;
   }
-  if (/^You are AIDOLON CLI replying via Telegram\\.?$/i.test(s)) return true;
-  if (/^Keep it concise and practical\\.?$/i.test(s)) return true;
-  if (/^If ambiguous, ask one clear follow-up question\\.?$/i.test(s)) return true;
+  if (/^You are AIDOLON CLI replying via Telegram\.?$/i.test(s)) return true;
+  if (/^Keep it concise and practical\.?$/i.test(s)) return true;
+  if (/^If ambiguous, ask one clear follow-up question\.?$/i.test(s)) return true;
   if (/^User message:$/i.test(s)) return true;
   return false;
-}
-
-function extractProgressLinesFromJob(job, maxLines = 2) {
-  const combined = `${String(job?.stderrTail || "")}\\n${String(job?.stdoutTail || "")}`.replace(/\\r/g, "");
-  if (!combined.trim()) return [];
-
-  const all = combined
-    .split("\\n")
-    .map((l) => String(l || "").trim())
-    .filter(Boolean);
-
-  const tail = all.slice(-140);
-  const filtered = [];
-  for (const line of tail) {
-    if (isProgressNoiseLine(line)) continue;
-    if (filtered.length > 0 && filtered[filtered.length - 1] === line) continue;
-    filtered.push(line);
-  }
-  if (filtered.length === 0) return [];
-
-  const statusRe = /(reconnecting|running|execut|download|install|search|apply|review|tool|command|mcp|error|warning|warn)/i;
-  const status = filtered.filter((l) => statusRe.test(l));
-  const pickFrom = status.length > 0 ? status : filtered;
-  const picked = pickFrom.slice(-Math.max(1, maxLines)).map((l) => truncateLine(l, 260));
-  return picked;
 }
 
 function startJobProgressUpdates(job) {
@@ -1673,75 +2352,86 @@ function startJobProgressUpdates(job) {
   }
 
   let stopped = false;
-  let firstTimer = null;
-  let intervalTimer = null;
-  let lastProgressKey = "";
-  let lastAnyUpdateAt = 0;
+  let timer = null;
 
-  const notify = async (isFirst = false) => {
+  job.progressStdoutRemainder = "";
+  job.progressStderrRemainder = "";
+  job.progressPendingLine = "";
+  job.progressLastSentLine = "";
+  job.progressLastSentAt = 0;
+
+  const debounceMs = 250;
+
+  const flush = async () => {
     if (stopped || shuttingDown || currentJob !== job) return;
-    const elapsedSec = Math.max(0, Math.floor((Date.now() - job.startedAt) / 1000));
-    const progressLines = extractProgressLinesFromJob(job, 2);
-    const progressKey = progressLines.join("\\n");
+    const line = String(job.progressPendingLine || "").trim();
+    if (!line) return;
+    if (line === String(job.progressLastSentLine || "")) return;
 
-    // Prefer sending meaningful progress lines when available. Otherwise, keep a low-noise heartbeat.
-    let text = "";
-    if (progressLines.length > 0) {
-      if (progressKey !== lastProgressKey) {
-        lastProgressKey = progressKey;
-        text = `Progress (${formatElapsedSeconds(elapsedSec)}):\\n${progressLines.join("\\n")}`;
-      } else if (elapsedSec >= 60 && Date.now() - lastAnyUpdateAt >= Math.max(60_000, PROGRESS_UPDATE_INTERVAL_SEC * 2000)) {
-        text = `Still working (${formatElapsedSeconds(elapsedSec)}). Last:\\n${progressLines[progressLines.length - 1]}`;
-      } else if (isFirst) {
-        // If we have progress output but it doesn't look "new", still show it once.
-        text = `Progress (${formatElapsedSeconds(elapsedSec)}):\\n${progressLines.join("\\n")}`;
-      } else {
-        return;
-      }
-    } else if (isFirst) {
-      text = "Working on it...";
-    } else if (elapsedSec >= 60 && Date.now() - lastAnyUpdateAt >= Math.max(60_000, PROGRESS_UPDATE_INTERVAL_SEC * 2000)) {
-      text = `Still working (${formatElapsedSeconds(elapsedSec)}).`;
-    } else {
-      return;
-    }
+    job.progressPendingLine = "";
+    job.progressLastSentLine = line;
+    job.progressLastSentAt = Date.now();
 
     try {
-      await sendMessage(job.chatId, text, { silent: true });
-      lastAnyUpdateAt = Date.now();
+      await sendMessage(job.chatId, line, { silent: true });
     } catch (err) {
       log(`sendMessage(progress) failed: ${redactError(err.message || err)}`);
     }
+
+    if (job.progressPendingLine) {
+      schedule();
+    }
   };
 
-  const startInterval = () => {
-    if (stopped || intervalTimer) return;
-    intervalTimer = setInterval(() => {
-      void notify(false);
-    }, PROGRESS_UPDATE_INTERVAL_SEC * 1000);
+  const schedule = () => {
+    if (stopped || shuttingDown || currentJob !== job) return;
+    if (timer) return;
+    if (!job.progressPendingLine) return;
+
+    const now = Date.now();
+    const gateAt = job.startedAt + Math.max(0, PROGRESS_FIRST_UPDATE_SEC) * 1000;
+    const throttleAt = Number(job.progressLastSentAt || 0) + Math.max(0, PROGRESS_UPDATE_INTERVAL_SEC) * 1000;
+    const earliestAt = Math.max(gateAt, throttleAt, now + debounceMs);
+    const waitMs = Math.max(0, earliestAt - now);
+
+    timer = setTimeout(() => {
+      timer = null;
+      void flush();
+    }, waitMs);
   };
 
-  if (PROGRESS_FIRST_UPDATE_SEC <= 0) {
-    void notify(true);
-    startInterval();
-  } else {
-    firstTimer = setTimeout(() => {
-      firstTimer = null;
-      void notify(true);
-      startInterval();
-    }, PROGRESS_FIRST_UPDATE_SEC * 1000);
-  }
+  const ingest = (chunkText, streamName) => {
+    if (stopped || shuttingDown || currentJob !== job) return;
+    const chunk = String(chunkText || "");
+    if (!chunk) return;
+
+    const key = streamName === "stderr" ? "progressStderrRemainder" : "progressStdoutRemainder";
+    const prev = String(job[key] || "");
+    const combined = `${prev}${chunk}`.replace(/\r/g, "");
+    const parts = combined.split("\n");
+    let remainder = parts.pop() ?? "";
+    if (remainder.length > 10_000) remainder = remainder.slice(-10_000);
+    job[key] = remainder;
+
+    for (const rawLine of parts) {
+      const line = String(rawLine || "").trim();
+      if (!line) continue;
+      if (isProgressNoiseLine(line)) continue;
+      job.progressPendingLine = truncateLine(line, 3500);
+    }
+
+    schedule();
+  };
+
+  job.onProgressChunk = ingest;
 
   return () => {
     stopped = true;
-    if (firstTimer) {
-      clearTimeout(firstTimer);
-      firstTimer = null;
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
     }
-    if (intervalTimer) {
-      clearInterval(intervalTimer);
-      intervalTimer = null;
-    }
+    job.onProgressChunk = null;
   };
 }
 
@@ -1795,28 +2485,19 @@ async function runCodexJob(job) {
 
     const timeout = setTimeout(() => {
       job.timedOut = true;
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        // best effort
-      }
-      setTimeout(() => {
-        if (!done) {
-          try {
-            child.kill("SIGKILL");
-          } catch {
-            // best effort
-          }
-        }
-      }, 3000);
+      terminateChildTree(child, { forceAfterMs: 3000 });
     }, CODEX_TIMEOUT_MS);
 
     child.stdout.on("data", (buf) => {
-      job.stdoutTail = appendTail(job.stdoutTail, String(buf || ""));
+      const chunk = String(buf || "");
+      job.stdoutTail = appendTail(job.stdoutTail, chunk);
+      if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
     });
 
     child.stderr.on("data", (buf) => {
-      job.stderrTail = appendTail(job.stderrTail, String(buf || ""));
+      const chunk = String(buf || "");
+      job.stderrTail = appendTail(job.stderrTail, chunk);
+      if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
     });
 
     child.on("error", (err) => {
@@ -1897,7 +2578,9 @@ async function processQueue() {
     try {
       result = job.kind === "raw"
         ? await runRawCodexJob(job)
-        : await runCodexJob(job);
+        : job.kind === "tts"
+          ? await runTtsJob(job)
+          : await runCodexJob(job);
     } finally {
       stopProgressUpdates();
     }
@@ -1909,10 +2592,12 @@ async function processQueue() {
       }
     }
 
-    try {
-      await sendMessage(job.chatId, normalizeResponse(result.text));
-    } catch (err) {
-      log(`sendMessage(result) failed: ${redactError(err.message || err)}`);
+    if (!result || result.skipSendMessage !== true) {
+      try {
+        await sendMessage(job.chatId, normalizeResponse(result?.text));
+      } catch (err) {
+        log(`sendMessage(result) failed: ${redactError(err.message || err)}`);
+      }
     }
 
     currentJob = null;
@@ -2058,6 +2743,93 @@ async function handleVoiceMessage(msg) {
   }
 }
 
+async function handlePhotoOrImageDocument(msg) {
+  const chatId = String(msg?.chat?.id || "");
+  if (!chatId) return;
+  const user = senderLabel(msg);
+
+  if (!VISION_ENABLED) {
+    await sendMessage(chatId, "Image received, but vision is disabled on this bot (VISION_ENABLED=0).");
+    return;
+  }
+
+  let fileId = "";
+  let suggestedName = "";
+  let ext = "";
+  let declaredBytes = 0;
+
+  if (Array.isArray(msg.photo) && msg.photo.length > 0) {
+    // Telegram provides multiple sizes; take the biggest.
+    const best = msg.photo.reduce((a, b) => (Number(b?.file_size || 0) > Number(a?.file_size || 0) ? b : a), msg.photo[0]);
+    fileId = String(best?.file_id || "").trim();
+    declaredBytes = Number(best?.file_size || 0);
+    ext = ".jpg";
+    suggestedName = `photo-${Date.now()}.jpg`;
+  } else if (msg.document) {
+    const mime = String(msg.document.mime_type || "").toLowerCase();
+    if (!mime.startsWith("image/")) {
+      await sendMessage(chatId, "Document received, but it is not an image.");
+      return;
+    }
+    fileId = String(msg.document.file_id || "").trim();
+    declaredBytes = Number(msg.document.file_size || 0);
+    suggestedName = String(msg.document.file_name || "").trim() || `image-${Date.now()}`;
+    ext = path.extname(suggestedName) || "";
+  }
+
+  if (!fileId) {
+    await sendMessage(chatId, "Could not read image file id from message.");
+    return;
+  }
+
+  const maxBytes = VISION_MAX_FILE_MB * 1024 * 1024;
+  if (declaredBytes > 0 && declaredBytes > maxBytes) {
+    await sendMessage(chatId, `Image too large (${Math.round(declaredBytes / (1024 * 1024))}MB). Max is ${VISION_MAX_FILE_MB}MB.`);
+    return;
+  }
+
+  const fileMeta = await getTelegramFileMeta(fileId);
+  const remotePath = String(fileMeta?.file_path || "");
+  if (!remotePath) {
+    await sendMessage(chatId, "Could not resolve Telegram image file path.");
+    return;
+  }
+
+  const remoteExt = path.extname(remotePath) || ext || ".jpg";
+  const safeExt = remoteExt.toLowerCase().match(/^\\.(png|jpe?g|webp|gif)$/) ? remoteExt.toLowerCase() : ".img";
+  const localPath = path.join(
+    IMAGE_DIR,
+    `img-${Date.now()}-${Math.random().toString(36).slice(2)}${safeExt}`,
+  );
+
+  let downloadedBytes = 0;
+  try {
+    downloadedBytes = await downloadTelegramFile(remotePath, localPath);
+    if (downloadedBytes > maxBytes) {
+      await sendMessage(chatId, `Downloaded image too large (${Math.round(downloadedBytes / (1024 * 1024))}MB).`);
+      return;
+    }
+
+    setLastImageForChat(chatId, { path: localPath, name: suggestedName });
+
+    const caption = String(msg.caption || "").trim();
+    logChat("in", chatId, caption || "[image]", { source: "image", user });
+
+    if (!caption) {
+      await sendMessage(chatId, "Image saved. Send your question as a message, or use:\n/ask <question>");
+      return;
+    }
+
+    const activeSession = getActiveSessionForChat(chatId);
+    await enqueuePrompt(chatId, caption, "image-caption", {
+      resumeSessionId: activeSession || "",
+      imagePaths: [localPath],
+    });
+  } catch (err) {
+    await sendMessage(chatId, `Image handling failed: ${String(err?.message || err)}`);
+  }
+}
+
 function isAllowedMessage(msg) {
   const chatId = String(msg?.chat?.id || "");
   if (!chatId || !ALLOWED_CHAT_IDS.has(chatId)) return false;
@@ -2131,6 +2903,16 @@ async function handleIncomingMessage(msg) {
     return;
   }
 
+  if ((Array.isArray(msg.photo) && msg.photo.length > 0) || msg.document) {
+    const isPhoto = Array.isArray(msg.photo) && msg.photo.length > 0;
+    const isImageDoc = Boolean(msg.document && String(msg.document.mime_type || "").toLowerCase().startsWith("image/"));
+    if (isPhoto || isImageDoc) {
+      logChat("in", chatId, "[image-message]", { source: "image", user });
+      await handlePhotoOrImageDocument(msg);
+      return;
+    }
+  }
+
   const text = String(msg.text || "").trim();
   if (!text) {
     logChat("in", chatId, "[non-text-message]", { source: "non-text", user });
@@ -2141,6 +2923,21 @@ async function handleIncomingMessage(msg) {
 
   const handled = await handleCommand(chatId, text);
   if (handled) return;
+
+  // If vision is enabled and the user sends plain text while an image is "active",
+  // treat it as a question about the last image (unless they explicitly used a slash command).
+  if (VISION_ENABLED) {
+    const img = getLastImageForChat(chatId);
+    const freshEnough = img && (VISION_AUTO_FOLLOWUP_SEC <= 0 || (Date.now() - Number(img.at || 0)) <= VISION_AUTO_FOLLOWUP_SEC * 1000);
+    if (img && freshEnough) {
+      const activeSession = getActiveSessionForChat(chatId);
+      await enqueuePrompt(chatId, text, "image-followup", {
+        resumeSessionId: activeSession || "",
+        imagePaths: [img.path],
+      });
+      return;
+    }
+  }
 
   const activeSession = getActiveSessionForChat(chatId);
   await enqueuePrompt(chatId, text, activeSession ? "plain-resume" : "plain", {
@@ -2213,7 +3010,7 @@ async function shutdown(code = 0) {
   if (currentJob?.process) {
     try {
       currentJob.cancelRequested = true;
-      currentJob.process.kill("SIGTERM");
+      terminateChildTree(currentJob.process, { forceAfterMs: 2000 });
     } catch {
       // best effort
     }
@@ -2248,6 +3045,14 @@ process.on("unhandledRejection", (err) => {
     log(
       `AIDOLON execution mode: ${codexMode.mode} (${codexMode.mode === "wsl" ? `wsl.exe -e bash -lic <${codexMode.codexPath}>` : `${codexMode.bin}${codexMode.shell ? " via shell" : ""}`})`,
     );
+    if (TELEGRAM_SET_COMMANDS) {
+      try {
+        await setTelegramCommands();
+        log("Telegram bot commands updated (setMyCommands).");
+      } catch (err) {
+        log(`setMyCommands failed: ${redactError(err?.message || err)}`);
+      }
+    }
     if (CODEX_DROPPED_EXTRA_ARGS.length > 0) {
       log(`Ignored unsupported AIDOLON extra args: ${CODEX_DROPPED_EXTRA_ARGS.join(" ")}`);
     }
