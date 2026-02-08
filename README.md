@@ -46,14 +46,14 @@ cd C:\Users\ROG\Desktop\AIDOLON
 start.cmd
 ```
 
-Whisper setup (one-time):
+Whisper setup (optional one-time):
 
 ```bat
 cd C:\Users\ROG\Desktop\AIDOLON
 setup-whisper-venv.cmd
 ```
 
-Optional (faster installs): if `uv` is on PATH, the setup scripts will prefer it automatically. Control with `UV_ENABLED=auto|1|0` in `.env`.
+By default, `start.cmd` will try to bootstrap `uv` (unless `UV_ENABLED=0`) and will auto-run `setup-whisper-venv.cmd` when `WHISPER_ENABLED=1`. Control with `UV_ENABLED=auto|1|0` and `WHISPER_ENABLED=0|1` in `.env`.
 
 ## Telegram commands
 - `/help` - command help
