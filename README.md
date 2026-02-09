@@ -21,6 +21,7 @@ Minimal Telegram <-> AIDOLON (Codex CLI) bridge with basic hardening and stabili
 - Active-session mode (plain text continues in resumed session until `/new`)
 - Codex command control menu (`/codex`) with staged command confirmation flow
 - Per-chat model + reasoning picker (`/model`)
+- Stream Codex stdout/stderr into the bot terminal (`CODEX_STREAM_OUTPUT_TO_TERMINAL=1`)
 
 ## Files
 - `bot.js` - main bridge process
@@ -123,6 +124,10 @@ For voice-note transcripts (incoming Telegram voice messages), the bot can use a
 - `/model` shows buttons to pick a model and a reasoning effort for the current chat.
 - Configure the button list with `CODEX_MODEL_CHOICES` (comma-separated).
 - Optionally set `CODEX_REASONING_EFFORT_CHOICES` (comma-separated). Default is low, medium, high, xhigh.
+
+## Terminal output
+- `CODEX_STREAM_OUTPUT_TO_TERMINAL=1` streams Codex stdout/stderr into the terminal running the bot (default is on).
+- Set `CODEX_STREAM_OUTPUT_TO_TERMINAL=0` to disable if it's too noisy.
 
 ## Telegram formatting
 By default, the bot renders `**bold**` as Telegram bold. Disable with `TELEGRAM_FORMAT_BOLD=0`.

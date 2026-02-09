@@ -406,6 +406,7 @@ const CODEX_MODEL = String(process.env.CODEX_MODEL || "gpt-5.3-codex").trim();
 const CODEX_MODEL_CHOICES = parseList(process.env.CODEX_MODEL_CHOICES || "");
 const CODEX_REASONING_EFFORT = String(process.env.CODEX_REASONING_EFFORT || "xhigh").trim();
 const CODEX_REASONING_EFFORT_CHOICES = parseList(process.env.CODEX_REASONING_EFFORT_CHOICES || "");
+const CODEX_STREAM_OUTPUT_TO_TERMINAL = toBool(process.env.CODEX_STREAM_OUTPUT_TO_TERMINAL, true);
 const CODEX_PROFILE = String(process.env.CODEX_PROFILE || "").trim();
 const CODEX_DANGEROUS_FULL_ACCESS = toBool(process.env.CODEX_DANGEROUS_FULL_ACCESS, true);
 const CODEX_SANDBOX_RAW = String(process.env.CODEX_SANDBOX || "workspace-write").trim();
@@ -1848,11 +1849,13 @@ async function runRawCodexJob(job) {
     child.stdout.on("data", (buf) => {
       const chunk = String(buf || "");
       job.stdoutTail = appendTail(job.stdoutTail, chunk, 50000);
+      if (CODEX_STREAM_OUTPUT_TO_TERMINAL) process.stdout.write(chunk);
       if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
     });
     child.stderr.on("data", (buf) => {
       const chunk = String(buf || "");
       job.stderrTail = appendTail(job.stderrTail, chunk, 50000);
+      if (CODEX_STREAM_OUTPUT_TO_TERMINAL) process.stderr.write(chunk);
       if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
     });
 
@@ -2883,12 +2886,14 @@ async function runCodexJob(job) {
     child.stdout.on("data", (buf) => {
       const chunk = String(buf || "");
       job.stdoutTail = appendTail(job.stdoutTail, chunk);
+      if (CODEX_STREAM_OUTPUT_TO_TERMINAL) process.stdout.write(chunk);
       if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
     });
 
     child.stderr.on("data", (buf) => {
       const chunk = String(buf || "");
       job.stderrTail = appendTail(job.stderrTail, chunk);
+      if (CODEX_STREAM_OUTPUT_TO_TERMINAL) process.stderr.write(chunk);
       if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
     });
 
