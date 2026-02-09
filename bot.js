@@ -65,6 +65,20 @@ function toInt(value, fallback, min = null, max = null) {
   return out;
 }
 
+function toTimeoutMs(value, fallback, min = null, max = null) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  const out = Math.trunc(n);
+  // 0 or negative disables the timeout entirely.
+  if (out <= 0) return 0;
+  let clamped = out;
+  if (min !== null && clamped < min) clamped = min;
+  if (max !== null && clamped > max) clamped = max;
+  return clamped;
+}
+
 function parseList(value) {
   return String(value || "")
     .split(",")
@@ -436,7 +450,8 @@ const CODEX_APPROVAL_POLICY = ["untrusted", "on-failure", "on-request", "never"]
 )
   ? CODEX_APPROVAL_RAW
   : "on-request";
-const CODEX_TIMEOUT_MS = toInt(process.env.CODEX_TIMEOUT_MS, 10 * 60 * 1000, 30_000, 60 * 60 * 1000);
+const MAX_TIMEOUT_MS = 2_147_483_647; // Node timers clamp near this anyway (~24.8 days)
+const CODEX_TIMEOUT_MS = toTimeoutMs(process.env.CODEX_TIMEOUT_MS, 10 * 60 * 1000, 30_000, MAX_TIMEOUT_MS);
 const parsedExtraArgs = parseArgString(process.env.CODEX_EXTRA_ARGS || "");
 const { args: CODEX_EXTRA_ARGS, dropped: CODEX_DROPPED_EXTRA_ARGS } = sanitizeCodexExtraArgs(parsedExtraArgs);
 
@@ -457,7 +472,7 @@ const VISION_AUTO_FOLLOWUP_SEC = toInt(process.env.VISION_AUTO_FOLLOWUP_SEC, 900
 
 const TTS_ENABLED = toBool(process.env.TTS_ENABLED, false);
 const TTS_MAX_TEXT_CHARS = toInt(process.env.TTS_MAX_TEXT_CHARS, 1200, 50, 20000);
-const TTS_TIMEOUT_MS = toInt(process.env.TTS_TIMEOUT_MS, 10 * 60 * 1000, 30_000, 60 * 60 * 1000);
+const TTS_TIMEOUT_MS = toTimeoutMs(process.env.TTS_TIMEOUT_MS, 10 * 60 * 1000, 30_000, MAX_TIMEOUT_MS);
 const TTS_VENV_PATH = resolveMaybeRelativePath(process.env.TTS_VENV_PATH || path.join(ROOT, ".tts-venv"));
 const TTS_MODEL = String(process.env.TTS_MODEL || "").trim();
 const TTS_REFERENCE_AUDIO = resolveMaybeRelativePath(process.env.TTS_REFERENCE_AUDIO || "");
@@ -1852,10 +1867,12 @@ async function runRawCodexJob(job) {
       // best effort
     }
 
-    const timeout = setTimeout(() => {
-      job.timedOut = true;
-      terminateChildTree(child, { forceAfterMs: 3000 });
-    }, CODEX_TIMEOUT_MS);
+    const timeout = CODEX_TIMEOUT_MS > 0
+      ? setTimeout(() => {
+        job.timedOut = true;
+        terminateChildTree(child, { forceAfterMs: 3000 });
+      }, CODEX_TIMEOUT_MS)
+      : null;
 
     child.stdout.on("data", (buf) => {
       const chunk = String(buf || "");
@@ -2488,10 +2505,12 @@ async function runTtsJob(job) {
       // best effort
     }
 
-    const timeout = setTimeout(() => {
-      job.timedOut = true;
-      terminateChildTree(child, { forceAfterMs: 3000 });
-    }, TTS_TIMEOUT_MS);
+    const timeout = TTS_TIMEOUT_MS > 0
+      ? setTimeout(() => {
+        job.timedOut = true;
+        terminateChildTree(child, { forceAfterMs: 3000 });
+      }, TTS_TIMEOUT_MS)
+      : null;
 
     child.stdout.on("data", (buf) => {
       const chunk = String(buf || "");
@@ -2878,10 +2897,12 @@ async function runCodexJob(job) {
       }
     }
 
-    const timeout = setTimeout(() => {
-      job.timedOut = true;
-      terminateChildTree(child, { forceAfterMs: 3000 });
-    }, CODEX_TIMEOUT_MS);
+    const timeout = CODEX_TIMEOUT_MS > 0
+      ? setTimeout(() => {
+        job.timedOut = true;
+        terminateChildTree(child, { forceAfterMs: 3000 });
+      }, CODEX_TIMEOUT_MS)
+      : null;
 
     child.stdout.on("data", (buf) => {
       const chunk = String(buf || "");

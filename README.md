@@ -119,6 +119,10 @@ For voice-note transcripts (incoming Telegram voice messages), the bot can use a
 - `PROGRESS_FIRST_UPDATE_SEC=0` minimum runtime before sending progress messages (set >0 to suppress updates for short runs)
 - `PROGRESS_UPDATE_INTERVAL_SEC=30` minimum seconds between progress messages (updates are output-driven, not a fixed timer)
 
+## Timeouts
+- `CODEX_TIMEOUT_MS` sets a hard wall-clock timeout for Codex jobs (default `600000` = 10 minutes). Set to `0` to disable.
+- `TTS_TIMEOUT_MS` sets a hard wall-clock timeout for TTS synthesis (default `600000` = 10 minutes). Set to `0` to disable.
+
 ## Model picker
 - `/model` shows buttons to pick a model and a reasoning effort for the current chat.
 - Configure the button list with `CODEX_MODEL_CHOICES` (comma-separated).
