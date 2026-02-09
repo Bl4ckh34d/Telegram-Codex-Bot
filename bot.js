@@ -401,7 +401,9 @@ const CODEX_USE_WSL = String(process.env.CODEX_USE_WSL || "auto").trim().toLower
 const CODEX_WSL_BIN = String(process.env.CODEX_WSL_BIN || "").trim();
 const CODEX_WORKDIR = String(process.env.CODEX_WORKDIR || ROOT).trim();
 const CODEX_MODEL = String(process.env.CODEX_MODEL || "gpt-5.3-codex").trim();
+const CODEX_MODEL_CHOICES = parseList(process.env.CODEX_MODEL_CHOICES || "");
 const CODEX_REASONING_EFFORT = String(process.env.CODEX_REASONING_EFFORT || "xhigh").trim();
+const CODEX_REASONING_EFFORT_CHOICES = parseList(process.env.CODEX_REASONING_EFFORT_CHOICES || "");
 const CODEX_PROFILE = String(process.env.CODEX_PROFILE || "").trim();
 const CODEX_DANGEROUS_FULL_ACCESS = toBool(process.env.CODEX_DANGEROUS_FULL_ACCESS, true);
 const CODEX_SANDBOX_RAW = String(process.env.CODEX_SANDBOX || "workspace-write").trim();
@@ -547,6 +549,9 @@ const chatSessions = state && typeof state.chatSessions === "object" && state.ch
 const lastImages = state && typeof state.lastImages === "object" && state.lastImages
   ? { ...state.lastImages }
   : {};
+const chatPrefs = state && typeof state.chatPrefs === "object" && state.chatPrefs
+  ? { ...state.chatPrefs }
+  : {};
 
 const queue = [];
 let currentJob = null;
@@ -555,17 +560,79 @@ let shuttingDown = false;
 const pendingCommandsById = new Map();
 const pendingCommandIdByChat = new Map();
 let pendingSequence = 1;
+const prefButtonsById = new Map();
+let prefButtonSequence = 1;
 let codexTopCommandsCache = {
   loadedAt: 0,
   commands: [],
 };
 
+function registerPrefButton(chatId, kind, value) {
+  const id = `pref${prefButtonSequence++}`;
+  prefButtonsById.set(id, {
+    id,
+    chatId: String(chatId || "").trim(),
+    kind: String(kind || "").trim(),
+    value: String(value || "").trim(),
+    at: Date.now(),
+  });
+  // Best effort cleanup of old entries.
+  if (prefButtonsById.size > 500) {
+    const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+    for (const [k, v] of prefButtonsById.entries()) {
+      if (Number(v?.at || 0) < cutoff) prefButtonsById.delete(k);
+      if (prefButtonsById.size <= 400) break;
+    }
+  }
+  return id;
+}
+
+function consumePrefButton(chatId, id) {
+  const key = String(id || "").trim();
+  if (!key) return null;
+  const entry = prefButtonsById.get(key) || null;
+  if (!entry) return null;
+  prefButtonsById.delete(key);
+  if (String(entry.chatId || "") !== String(chatId || "").trim()) return null;
+  return entry;
+}
+
 function persistState() {
   try {
-    writeJsonAtomic(STATE_PATH, { lastUpdateId, chatSessions, lastImages });
+    writeJsonAtomic(STATE_PATH, { lastUpdateId, chatSessions, lastImages, chatPrefs });
   } catch {
     // best effort
   }
+}
+
+function getChatPrefs(chatId) {
+  const key = String(chatId || "").trim();
+  if (!key) return { model: "", reasoning: "" };
+  const entry = chatPrefs[key];
+  if (!entry || typeof entry !== "object") return { model: "", reasoning: "" };
+  return {
+    model: String(entry.model || "").trim(),
+    reasoning: String(entry.reasoning || "").trim(),
+  };
+}
+
+function setChatPrefs(chatId, patch) {
+  const key = String(chatId || "").trim();
+  if (!key) return;
+  const prev = getChatPrefs(key);
+  chatPrefs[key] = {
+    model: String(patch?.model ?? prev.model ?? "").trim(),
+    reasoning: String(patch?.reasoning ?? prev.reasoning ?? "").trim(),
+  };
+  persistState();
+}
+
+function clearChatPrefs(chatId) {
+  const key = String(chatId || "").trim();
+  if (!key) return;
+  if (!(key in chatPrefs)) return;
+  delete chatPrefs[key];
+  persistState();
 }
 
 function getActiveSessionForChat(chatId) {
@@ -1078,9 +1145,12 @@ function buildCodexExecSpec(job) {
   if (!isResume) {
     args.push("--color", "never", "-C", codexMode.workdir, "-o", outputPath);
   }
-  if (CODEX_MODEL) args.push("-m", CODEX_MODEL);
-  if (CODEX_REASONING_EFFORT) {
-    args.push("-c", `model_reasoning_effort=\"${CODEX_REASONING_EFFORT}\"`);
+  const prefs = getChatPrefs(job?.chatId);
+  const effectiveModel = String(job?.model || prefs.model || CODEX_MODEL || "").trim();
+  const effectiveReasoning = String(job?.reasoning || prefs.reasoning || CODEX_REASONING_EFFORT || "").trim();
+  if (effectiveModel) args.push("-m", effectiveModel);
+  if (effectiveReasoning) {
+    args.push("-c", `model_reasoning_effort=\"${effectiveReasoning}\"`);
   }
   // This project does not use MCP servers. Force-disable MCP even if globally configured.
   args.push("-c", "mcp_servers={}");
@@ -1245,6 +1315,7 @@ function getTelegramCommandList() {
     { command: "ask", description: "ask about your last sent image" },
     { command: "see", description: "take a screenshot and ask about it" },
     { command: "imgclear", description: "clear last image context" },
+    { command: "model", description: "pick model + reasoning effort" },
     { command: "tts", description: "speak text as a Telegram voice message" },
     { command: "restart", description: "restart the bot process" },
   ];
@@ -1466,6 +1537,7 @@ async function sendHelp(chatId) {
     "/ask <question> - analyze your last sent image",
     "/see <question> - take a screenshot and analyze it",
     "/imgclear - clear the last image context (so plain text goes back to AIDOLON)",
+    "/model - pick the model + reasoning effort for this chat",
     "/tts <text> - send a TTS voice message (requires TTS_ENABLED=1)",
     "/restart - restart the bot process",
   ];
@@ -1478,6 +1550,9 @@ async function sendStatus(chatId) {
     : "none";
   const queued = queue.length;
   const activeSession = getActiveSessionForChat(chatId);
+  const prefs = getChatPrefs(chatId);
+  const effectiveModel = String(prefs.model || CODEX_MODEL || "").trim() || "(default)";
+  const effectiveReasoning = String(prefs.reasoning || CODEX_REASONING_EFFORT || "").trim() || "(default)";
   const lines = [
     "Bot status",
     `- busy: ${Boolean(currentJob)}`,
@@ -1485,8 +1560,8 @@ async function sendStatus(chatId) {
     `- queue: ${queued}/${MAX_QUEUE_SIZE}`,
     `- active_session: ${activeSession ? shortSessionId(activeSession) : "(none)"}`,
     `- exec_mode: ${codexMode.mode}`,
-    `- model: ${CODEX_MODEL || "(default)"}`,
-    `- reasoning: ${CODEX_REASONING_EFFORT || "(default)"}`,
+    `- model: ${effectiveModel}${prefs.model ? " (chat override)" : ""}`,
+    `- reasoning: ${effectiveReasoning}${prefs.reasoning ? " (chat override)" : ""}`,
     `- full_access: ${CODEX_DANGEROUS_FULL_ACCESS}`,
     `- sandbox: ${CODEX_SANDBOX}`,
     `- approval: ${CODEX_APPROVAL_POLICY}`,
@@ -1495,6 +1570,83 @@ async function sendStatus(chatId) {
     `- time: ${nowIso()}`,
   ];
   await sendMessage(chatId, lines.join("\n"));
+}
+
+function getEffectiveModelChoices() {
+  const out = [];
+  const seen = new Set();
+  const add = (m) => {
+    const s = String(m || "").trim();
+    if (!s) return;
+    const key = s.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(s);
+  };
+  add(CODEX_MODEL);
+  for (const m of CODEX_MODEL_CHOICES) add(m);
+  return out.length > 0 ? out.slice(0, 12) : [];
+}
+
+function getEffectiveReasoningChoices() {
+  const out = [];
+  const seen = new Set();
+  const add = (v) => {
+    const s = String(v || "").trim().toLowerCase();
+    if (!s) return;
+    if (seen.has(s)) return;
+    seen.add(s);
+    out.push(s);
+  };
+  for (const v of CODEX_REASONING_EFFORT_CHOICES) add(v);
+  if (out.length === 0) {
+    for (const v of ["low", "medium", "high", "xhigh"]) add(v);
+  }
+  return out.slice(0, 8);
+}
+
+async function sendModelPicker(chatId) {
+  const prefs = getChatPrefs(chatId);
+  const effectiveModel = String(prefs.model || CODEX_MODEL || "").trim() || "(default)";
+  const effectiveReasoning = String(prefs.reasoning || CODEX_REASONING_EFFORT || "").trim() || "(default)";
+
+  const lines = [
+    "Model settings (this chat)",
+    `- model: ${effectiveModel}${prefs.model ? " (override)" : ""}`,
+    `- reasoning: ${effectiveReasoning}${prefs.reasoning ? " (override)" : ""}`,
+    "",
+    "Pick a model:",
+    "Pick a reasoning effort:",
+  ];
+
+  const keyboard = [];
+  const modelChoices = getEffectiveModelChoices();
+  for (let i = 0; i < modelChoices.length; i += 2) {
+    const row = [];
+    for (const m of modelChoices.slice(i, i + 2)) {
+      const id = registerPrefButton(chatId, "model", m);
+      row.push({ text: m === effectiveModel ? `* ${m}` : m, callback_data: `pref:${id}` });
+    }
+    keyboard.push(row);
+  }
+
+  const reasoningChoices = getEffectiveReasoningChoices();
+  for (let i = 0; i < reasoningChoices.length; i += 2) {
+    const row = [];
+    for (const r of reasoningChoices.slice(i, i + 2)) {
+      const label = r === effectiveReasoning ? `* ${r}` : r;
+      const id = registerPrefButton(chatId, "reasoning", r);
+      row.push({ text: label, callback_data: `pref:${id}` });
+    }
+    keyboard.push(row);
+  }
+
+  const resetId = registerPrefButton(chatId, "reset", "reset");
+  keyboard.push([{ text: "Reset to defaults", callback_data: `pref:${resetId}` }]);
+
+  await sendMessage(chatId, lines.join("\n"), {
+    replyMarkup: { inline_keyboard: keyboard },
+  });
 }
 
 async function sendQueue(chatId) {
@@ -1859,6 +2011,16 @@ async function handleCommand(chatId, text) {
       });
       return true;
     }
+    case "/model": {
+      const arg = String(parsed.arg || "").trim().toLowerCase();
+      if (["clear", "reset", "defaults", "default", "off", "none"].includes(arg)) {
+        clearChatPrefs(chatId);
+        await sendMessage(chatId, "Model preferences cleared for this chat (back to defaults).");
+        return true;
+      }
+      await sendModelPicker(chatId);
+      return true;
+    }
     case "/ask": {
       if (!VISION_ENABLED) {
         await sendMessage(chatId, "Vision is disabled on this bot (VISION_ENABLED=0).");
@@ -1991,6 +2153,8 @@ async function enqueuePrompt(chatId, inputText, source, options = {}) {
     source,
     replyStyle: String(options.replyStyle || "").trim(),
     resumeSessionId: String(options.resumeSessionId || "").trim(),
+    model: String(options.model || "").trim(),
+    reasoning: String(options.reasoning || "").trim(),
     imagePaths: Array.isArray(options.imagePaths)
       ? options.imagePaths.map((p) => String(p || "").trim()).filter(Boolean)
       : [],
@@ -3096,6 +3260,35 @@ async function handleCallbackQuery(cb) {
   const pseudoMsg = { chat: { id: chatId, type: chatType } };
   if (!isAllowedMessage(pseudoMsg)) {
     await answerCallbackQuery(id, "Not allowed");
+    return;
+  }
+
+  if (data.startsWith("pref:")) {
+    const prefId = data.slice("pref:".length).trim();
+    const entry = consumePrefButton(chatId, prefId);
+    if (!entry) {
+      await answerCallbackQuery(id, "Expired");
+      return;
+    }
+    if (entry.kind === "model") {
+      setChatPrefs(chatId, { model: entry.value });
+      await answerCallbackQuery(id, "Model set");
+      await sendMessage(chatId, `Model set for this chat: ${String(entry.value || "").trim() || "(default)"}`);
+      return;
+    }
+    if (entry.kind === "reasoning") {
+      setChatPrefs(chatId, { reasoning: entry.value });
+      await answerCallbackQuery(id, "Reasoning set");
+      await sendMessage(chatId, `Reasoning effort set for this chat: ${String(entry.value || "").trim() || "(default)"}`);
+      return;
+    }
+    if (entry.kind === "reset") {
+      clearChatPrefs(chatId);
+      await answerCallbackQuery(id, "Reset");
+      await sendMessage(chatId, "Model preferences reset to defaults for this chat.");
+      return;
+    }
+    await answerCallbackQuery(id, "OK");
     return;
   }
 

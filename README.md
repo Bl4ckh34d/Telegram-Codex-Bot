@@ -110,6 +110,11 @@ For voice-note transcripts (incoming Telegram voice messages), the bot can use a
 - `PROGRESS_FIRST_UPDATE_SEC=0` minimum runtime before sending progress messages (set >0 to suppress updates for short runs)
 - `PROGRESS_UPDATE_INTERVAL_SEC=30` minimum seconds between progress messages (updates are output-driven, not a fixed timer)
 
+## Model picker
+- `/model` shows buttons to pick a model and a reasoning effort for the current chat.
+- Configure the button list with `CODEX_MODEL_CHOICES` (comma-separated).
+- Optionally set `CODEX_REASONING_EFFORT_CHOICES` (comma-separated). Default is low, medium, high, xhigh.
+
 ## Telegram formatting
 By default, the bot renders `**bold**` as Telegram bold. Disable with `TELEGRAM_FORMAT_BOLD=0`.
 
