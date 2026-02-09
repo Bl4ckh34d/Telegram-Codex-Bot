@@ -20,6 +20,7 @@ Minimal Telegram <-> AIDOLON (Codex CLI) bridge with basic hardening and stabili
 - Session resume workflow with Telegram prefill buttons (`/resume`)
 - Active-session mode (plain text continues in resumed session until `/new`)
 - Codex command control menu (`/codex`) with staged command confirmation flow
+- Per-chat model + reasoning picker (`/model`)
 
 ## Files
 - `bot.js` - main bridge process
@@ -60,14 +61,16 @@ By default, `start.cmd` will try to bootstrap `uv` (unless `UV_ENABLED=0`) and w
 - `/queue` - preview queued prompts
 - `/codex` or `/commands` - show command menu
 - `/cmd <args>` - stage raw Codex CLI command
-- `/confirm` - run staged `/cmd`
-- `/reject` - cancel staged `/cmd`
+- `/confirm` (or `/run`) - run staged `/cmd`
+- `/reject` (or `/deny`) - cancel staged `/cmd`
 - `/cancel` or `/stop` - stop the active Codex run
 - `/clear` - clear queued prompts
 - `/screenshot` - capture and send the primary display as an image
 - `/ask <question>` - analyze the last image you sent (requires `VISION_ENABLED=1`)
 - `/see <question>` - take a screenshot and analyze it (requires `VISION_ENABLED=1`)
 - `/imgclear` - clear the last image context (so plain text goes back to Codex)
+- `/model` - pick the model + reasoning effort for this chat
+- `/synccommands` - refresh Telegram slash command suggestions (useful if new commands don't show up)
 - `/tts <text>` - synthesize TTS and send a Telegram voice message (requires `TTS_ENABLED=1`)
 - `/resume` - list recent local sessions with prefill buttons
 - `/resume <session_id> [prompt]` - activate/resume a session
@@ -75,6 +78,12 @@ By default, `start.cmd` will try to bootstrap `uv` (unless `UV_ENABLED=0`) and w
 - `/compress [hint]` - ask Codex to compress/summarize active session context
 - `/restart` - restart the bot process
 - Voice notes are transcribed and queued as prompts
+
+### Telegram slash suggestions
+Telegram's command autocomplete is driven by `setMyCommands`:
+- Make sure `TELEGRAM_SET_COMMANDS=1`
+- Configure `TELEGRAM_COMMAND_SCOPE` (supports comma-separated scopes like `default,all_private_chats,all_group_chats`)
+- If Telegram doesn't show newly added commands yet, run `/synccommands` or restart the bot
 
 ## Image analysis (vision)
 If enabled, the bot can answer questions about images you send in Telegram:

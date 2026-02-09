@@ -385,7 +385,9 @@ const POLL_TIMEOUT_SEC = toInt(process.env.TELEGRAM_POLL_TIMEOUT_SEC, 20, 5, 50)
 const STARTUP_MESSAGE = toBool(process.env.STARTUP_MESSAGE, true);
 const SKIP_STALE_UPDATES = toBool(process.env.SKIP_STALE_UPDATES, true);
 const TELEGRAM_SET_COMMANDS = toBool(process.env.TELEGRAM_SET_COMMANDS, true);
-const TELEGRAM_COMMAND_SCOPE = String(process.env.TELEGRAM_COMMAND_SCOPE || "all_private_chats").trim().toLowerCase();
+const TELEGRAM_COMMAND_SCOPES = parseList(process.env.TELEGRAM_COMMAND_SCOPE || "default")
+  .map((s) => String(s || "").trim().toLowerCase())
+  .filter(Boolean);
 const TELEGRAM_FORMAT_BOLD = toBool(process.env.TELEGRAM_FORMAT_BOLD, true);
 const CHAT_LOG_TO_TERMINAL = toBool(process.env.CHAT_LOG_TO_TERMINAL, true);
 const CHAT_LOG_TO_FILE = toBool(process.env.CHAT_LOG_TO_FILE, true);
@@ -1304,7 +1306,10 @@ function getTelegramCommandList() {
     { command: "commands", description: "show codex command menu" },
     { command: "cmd", description: "stage a raw codex CLI command" },
     { command: "confirm", description: "run staged /cmd" },
+    { command: "run", description: "run staged /cmd" },
     { command: "reject", description: "cancel staged /cmd" },
+    { command: "deny", description: "cancel staged /cmd" },
+    { command: "cancelcmd", description: "cancel staged /cmd" },
     { command: "cancel", description: "cancel the active codex run" },
     { command: "stop", description: "cancel the active codex run" },
     { command: "clear", description: "clear queued prompts" },
@@ -1316,6 +1321,9 @@ function getTelegramCommandList() {
     { command: "see", description: "take a screenshot and ask about it" },
     { command: "imgclear", description: "clear last image context" },
     { command: "model", description: "pick model + reasoning effort" },
+    { command: "synccommands", description: "refresh Telegram /commands list" },
+    { command: "setcommands", description: "refresh Telegram /commands list" },
+    { command: "refreshcommands", description: "refresh Telegram /commands list" },
     { command: "tts", description: "speak text as a Telegram voice message" },
     { command: "restart", description: "restart the bot process" },
   ];
@@ -1323,11 +1331,22 @@ function getTelegramCommandList() {
 
 async function setTelegramCommands() {
   const commands = getTelegramCommandList();
-  const body = { commands };
-  if (TELEGRAM_COMMAND_SCOPE && TELEGRAM_COMMAND_SCOPE !== "default") {
-    body.scope = { type: TELEGRAM_COMMAND_SCOPE };
+  const scopes = TELEGRAM_COMMAND_SCOPES.length > 0 ? TELEGRAM_COMMAND_SCOPES : ["default"];
+  const uniqueScopes = [];
+  for (const s of scopes) {
+    const key = String(s || "").trim().toLowerCase();
+    if (!key) continue;
+    if (!uniqueScopes.includes(key)) uniqueScopes.push(key);
   }
-  await telegramApi("setMyCommands", { body, timeoutMs: 15_000 });
+  if (uniqueScopes.length === 0) uniqueScopes.push("default");
+
+  for (const scope of uniqueScopes) {
+    const body = { commands };
+    if (scope && scope !== "default") {
+      body.scope = { type: scope };
+    }
+    await telegramApi("setMyCommands", { body, timeoutMs: 15_000 });
+  }
 }
 
 async function sendMessage(chatId, text, options = {}) {
@@ -1538,6 +1557,7 @@ async function sendHelp(chatId) {
     "/see <question> - take a screenshot and analyze it",
     "/imgclear - clear the last image context (so plain text goes back to AIDOLON)",
     "/model - pick the model + reasoning effort for this chat",
+    "/synccommands - refresh Telegram's slash command suggestions",
     "/tts <text> - send a TTS voice message (requires TTS_ENABLED=1)",
     "/restart - restart the bot process",
   ];
@@ -2019,6 +2039,17 @@ async function handleCommand(chatId, text) {
         return true;
       }
       await sendModelPicker(chatId);
+      return true;
+    }
+    case "/synccommands":
+    case "/setcommands":
+    case "/refreshcommands": {
+      try {
+        await setTelegramCommands();
+        await sendMessage(chatId, "Telegram slash commands refreshed.");
+      } catch (err) {
+        await sendMessage(chatId, `Failed to refresh commands: ${String(err?.message || err)}`);
+      }
       return true;
     }
     case "/ask": {
