@@ -127,6 +127,8 @@ For voice-note transcripts (incoming Telegram voice messages), the bot can use a
 ## Terminal output
 - `CODEX_STREAM_OUTPUT_TO_TERMINAL=1` streams Codex stdout/stderr into the terminal running the bot (default is on).
 - Set `CODEX_STREAM_OUTPUT_TO_TERMINAL=0` to disable if it's too noisy.
+- `TERMINAL_COLORS=1` and `CHAT_LOG_USE_COLORS=1` colorize chat logs in the terminal (your messages vs bot replies).
+- Set `NO_COLOR=1` to force-disable ANSI colors.
 
 ## Telegram formatting
 By default, the bot renders `**bold**` as Telegram bold. Disable with `TELEGRAM_FORMAT_BOLD=0`.

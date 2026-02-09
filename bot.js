@@ -173,7 +173,20 @@ function logChat(direction, chatId, text, meta = {}) {
   const preview = previewForLog(text, CHAT_LOG_MAX_CHARS);
 
   if (CHAT_LOG_TO_TERMINAL) {
-    log(`[chat:${direction}] chat=${chatId} user=${user} source=${source} text="${preview}"`);
+    const dir = String(direction || "").trim().toLowerCase();
+    const isIn = dir === "in";
+    const isOut = dir === "out";
+
+    const who = isIn && user && user !== "-" ? ` ${user}` : "";
+    const src = isIn && source && !["plain", "message"].includes(source) ? ` (${source})` : "";
+    const label = isIn ? "YOU" : isOut ? "BOT" : dir.toUpperCase() || "CHAT";
+    const line = `${label}${who}${src}: ${preview}`;
+
+    const noColor = Object.prototype.hasOwnProperty.call(process.env, "NO_COLOR");
+    const useColors = !noColor && TERMINAL_COLORS && CHAT_LOG_USE_COLORS && Boolean(process.stdout.isTTY);
+    const color = isIn ? "\x1b[36m" : isOut ? "\x1b[32m" : "\x1b[33m"; // cyan / green / yellow
+    const reset = "\x1b[0m";
+    log(useColors ? `${color}${line}${reset}` : line);
   }
 
   if (CHAT_LOG_TO_FILE) {
@@ -391,6 +404,8 @@ const TELEGRAM_COMMAND_SCOPES = parseList(process.env.TELEGRAM_COMMAND_SCOPE || 
 const TELEGRAM_FORMAT_BOLD = toBool(process.env.TELEGRAM_FORMAT_BOLD, true);
 const CHAT_LOG_TO_TERMINAL = toBool(process.env.CHAT_LOG_TO_TERMINAL, true);
 const CHAT_LOG_TO_FILE = toBool(process.env.CHAT_LOG_TO_FILE, true);
+const TERMINAL_COLORS = toBool(process.env.TERMINAL_COLORS, true);
+const CHAT_LOG_USE_COLORS = toBool(process.env.CHAT_LOG_USE_COLORS, true);
 const CHAT_LOG_MAX_CHARS = toInt(process.env.CHAT_LOG_MAX_CHARS, 700, 80, 8000);
 const CODEX_SESSIONS_DIR = resolveMaybeRelativePath(
   process.env.CODEX_SESSIONS_DIR || path.join(os.homedir(), ".codex", "sessions"),
