@@ -1322,9 +1322,6 @@ function getTelegramCommandList() {
     { command: "see", description: "take a screenshot and ask about it" },
     { command: "imgclear", description: "clear last image context" },
     { command: "model", description: "pick model + reasoning effort" },
-    { command: "synccommands", description: "refresh Telegram /commands list" },
-    { command: "setcommands", description: "refresh Telegram /commands list" },
-    { command: "refreshcommands", description: "refresh Telegram /commands list" },
     { command: "tts", description: "speak text as a Telegram voice message" },
     { command: "restart", description: "restart the bot process" },
   ];
@@ -1558,7 +1555,6 @@ async function sendHelp(chatId) {
     "/see <question> - take a screenshot and analyze it",
     "/imgclear - clear the last image context (so plain text goes back to AIDOLON)",
     "/model - pick the model + reasoning effort for this chat",
-    "/synccommands - refresh Telegram's slash command suggestions",
     "/tts <text> - send a TTS voice message (requires TTS_ENABLED=1)",
     "/restart - restart the bot process",
   ];
@@ -2042,17 +2038,6 @@ async function handleCommand(chatId, text) {
         return true;
       }
       await sendModelPicker(chatId);
-      return true;
-    }
-    case "/synccommands":
-    case "/setcommands":
-    case "/refreshcommands": {
-      try {
-        await setTelegramCommands();
-        await sendMessage(chatId, "Telegram slash commands refreshed.");
-      } catch (err) {
-        await sendMessage(chatId, `Failed to refresh commands: ${String(err?.message || err)}`);
-      }
       return true;
     }
     case "/ask": {

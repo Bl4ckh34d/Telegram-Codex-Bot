@@ -71,7 +71,6 @@ By default, `start.cmd` will try to bootstrap `uv` (unless `UV_ENABLED=0`) and w
 - `/see <question>` - take a screenshot and analyze it (requires `VISION_ENABLED=1`)
 - `/imgclear` - clear the last image context (so plain text goes back to Codex)
 - `/model` - pick the model + reasoning effort for this chat
-- `/synccommands` - refresh Telegram slash command suggestions (useful if new commands don't show up)
 - `/tts <text>` - synthesize TTS and send a Telegram voice message (requires `TTS_ENABLED=1`)
 - `/resume` - list recent local sessions with prefill buttons
 - `/resume <session_id> [prompt]` - activate/resume a session
@@ -84,7 +83,7 @@ By default, `start.cmd` will try to bootstrap `uv` (unless `UV_ENABLED=0`) and w
 Telegram's command autocomplete is driven by `setMyCommands`:
 - Make sure `TELEGRAM_SET_COMMANDS=1`
 - Configure `TELEGRAM_COMMAND_SCOPE` (supports comma-separated scopes like `default,all_private_chats,all_group_chats`)
-- If Telegram doesn't show newly added commands yet, run `/synccommands` or restart the bot
+- If Telegram doesn't show newly added commands yet, restart the bot
 
 ## Image analysis (vision)
 If enabled, the bot can answer questions about images you send in Telegram:
