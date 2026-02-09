@@ -5,6 +5,8 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
+const { Readable } = require("stream");
+const { pipeline } = require("stream/promises");
 
 const ROOT = __dirname;
 const ENV_PATH = path.join(ROOT, ".env");
@@ -141,9 +143,16 @@ function sleep(ms) {
 function chunkText(text, maxLen = 3800) {
   const chunks = [];
   let rest = String(text || "");
-  while (rest.length > maxLen) {
-    let idx = rest.lastIndexOf("\n", maxLen);
-    if (idx < 500) idx = maxLen;
+  const limitRaw = Number(maxLen);
+  // Non-positive disables chunking (may exceed Telegram's per-message limit).
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.trunc(limitRaw) : Infinity;
+  if (!Number.isFinite(limit)) {
+    chunks.push(rest || "(empty)");
+    return chunks;
+  }
+  while (rest.length > limit) {
+    let idx = rest.lastIndexOf("\n", limit);
+    if (idx < 500) idx = limit;
     chunks.push(rest.slice(0, idx));
     rest = rest.slice(idx);
   }
@@ -153,7 +162,10 @@ function chunkText(text, maxLen = 3800) {
 
 function appendTail(existing, chunk, limit = 6000) {
   const next = `${existing}${chunk}`;
-  return next.length > limit ? next.slice(-limit) : next;
+  const lim = Number(limit);
+  // Non-positive disables tail truncation (may use unbounded memory).
+  if (!Number.isFinite(lim) || lim <= 0) return next;
+  return next.length > lim ? next.slice(-lim) : next;
 }
 
 function oneLine(text) {
@@ -165,8 +177,11 @@ function oneLine(text) {
 
 function previewForLog(text, maxChars) {
   const normalized = oneLine(text);
-  if (normalized.length <= maxChars) return normalized;
-  return `${normalized.slice(0, maxChars)}...`;
+  const lim = Number(maxChars);
+  // Non-positive disables truncation.
+  if (!Number.isFinite(lim) || lim <= 0) return normalized;
+  if (normalized.length <= lim) return normalized;
+  return `${normalized.slice(0, lim)}...`;
 }
 
 function senderLabel(msg) {
@@ -408,7 +423,12 @@ const PRIMARY_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || "").trim();
 const EXTRA_ALLOWED = parseList(process.env.TELEGRAM_ALLOWED_CHAT_IDS);
 const ALLOWED_CHAT_IDS = new Set([PRIMARY_CHAT_ID, ...EXTRA_ALLOWED].filter(Boolean));
 const ALLOW_GROUP_CHAT = toBool(process.env.ALLOW_GROUP_CHAT, false);
-const POLL_TIMEOUT_SEC = toInt(process.env.TELEGRAM_POLL_TIMEOUT_SEC, 20, 5, 50);
+const POLL_TIMEOUT_SEC = toInt(process.env.TELEGRAM_POLL_TIMEOUT_SEC, 20);
+// Telegram API request timeouts: 0 disables abort-based timeouts entirely.
+const TELEGRAM_API_TIMEOUT_MS = toTimeoutMs(process.env.TELEGRAM_API_TIMEOUT_MS, 0);
+const TELEGRAM_UPLOAD_TIMEOUT_MS = toTimeoutMs(process.env.TELEGRAM_UPLOAD_TIMEOUT_MS, 0);
+// Per-message chunk size for Telegram sendMessage(). 0 disables chunking (not recommended).
+const TELEGRAM_MESSAGE_MAX_CHARS = toInt(process.env.TELEGRAM_MESSAGE_MAX_CHARS, 3800);
 const STARTUP_MESSAGE = toBool(process.env.STARTUP_MESSAGE, true);
 const SKIP_STALE_UPDATES = toBool(process.env.SKIP_STALE_UPDATES, true);
 const TELEGRAM_SET_COMMANDS = toBool(process.env.TELEGRAM_SET_COMMANDS, true);
@@ -420,12 +440,13 @@ const CHAT_LOG_TO_TERMINAL = toBool(process.env.CHAT_LOG_TO_TERMINAL, true);
 const CHAT_LOG_TO_FILE = toBool(process.env.CHAT_LOG_TO_FILE, true);
 const TERMINAL_COLORS = toBool(process.env.TERMINAL_COLORS, true);
 const CHAT_LOG_USE_COLORS = toBool(process.env.CHAT_LOG_USE_COLORS, true);
-const CHAT_LOG_MAX_CHARS = toInt(process.env.CHAT_LOG_MAX_CHARS, 700, 80, 8000);
+const CHAT_LOG_MAX_CHARS = toInt(process.env.CHAT_LOG_MAX_CHARS, 700);
 const CODEX_SESSIONS_DIR = resolveMaybeRelativePath(
   process.env.CODEX_SESSIONS_DIR || path.join(os.homedir(), ".codex", "sessions"),
 );
-const RESUME_LIST_LIMIT = toInt(process.env.RESUME_LIST_LIMIT, 8, 1, 20);
-const RESUME_SCAN_FILE_LIMIT = toInt(process.env.RESUME_SCAN_FILE_LIMIT, 240, 20, 3000);
+// 0 or negative disables the relevant cap.
+const RESUME_LIST_LIMIT = toInt(process.env.RESUME_LIST_LIMIT, 8);
+const RESUME_SCAN_FILE_LIMIT = toInt(process.env.RESUME_SCAN_FILE_LIMIT, 240);
 
 const CODEX_BIN = String(process.env.CODEX_BIN || "codex").trim();
 const CODEX_USE_WSL = String(process.env.CODEX_USE_WSL || "auto").trim().toLowerCase();
@@ -451,7 +472,8 @@ const CODEX_APPROVAL_POLICY = ["untrusted", "on-failure", "on-request", "never"]
   ? CODEX_APPROVAL_RAW
   : "on-request";
 const MAX_TIMEOUT_MS = 2_147_483_647; // Node timers clamp near this anyway (~24.8 days)
-const CODEX_TIMEOUT_MS = toTimeoutMs(process.env.CODEX_TIMEOUT_MS, 10 * 60 * 1000, 30_000, MAX_TIMEOUT_MS);
+// 0 disables the hard wall-clock timeout.
+const CODEX_TIMEOUT_MS = toTimeoutMs(process.env.CODEX_TIMEOUT_MS, 0, null, MAX_TIMEOUT_MS);
 const parsedExtraArgs = parseArgString(process.env.CODEX_EXTRA_ARGS || "");
 const { args: CODEX_EXTRA_ARGS, dropped: CODEX_DROPPED_EXTRA_ARGS } = sanitizeCodexExtraArgs(parsedExtraArgs);
 
@@ -464,24 +486,49 @@ const WHISPER_PYTHON = process.platform === "win32"
   : path.join(WHISPER_VENV_PATH, "bin", "python");
 const WHISPER_MODEL = String(process.env.WHISPER_MODEL || "base").trim();
 const WHISPER_LANGUAGE = String(process.env.WHISPER_LANGUAGE || "auto").trim();
-const WHISPER_MAX_FILE_MB = toInt(process.env.WHISPER_MAX_FILE_MB, 20, 1, 100);
 
 const VISION_ENABLED = toBool(process.env.VISION_ENABLED, false);
-const VISION_MAX_FILE_MB = toInt(process.env.VISION_MAX_FILE_MB, 12, 1, 50);
-const VISION_AUTO_FOLLOWUP_SEC = toInt(process.env.VISION_AUTO_FOLLOWUP_SEC, 900, 0, 86400);
+// 0 disables the size cap (Telegram still enforces its own limits).
+const VISION_MAX_FILE_MB = toInt(process.env.VISION_MAX_FILE_MB, 12);
+const VISION_AUTO_FOLLOWUP_SEC = toInt(process.env.VISION_AUTO_FOLLOWUP_SEC, 900);
 
 const TTS_ENABLED = toBool(process.env.TTS_ENABLED, false);
-const TTS_MAX_TEXT_CHARS = toInt(process.env.TTS_MAX_TEXT_CHARS, 1200, 50, 20000);
-const TTS_TIMEOUT_MS = toTimeoutMs(process.env.TTS_TIMEOUT_MS, 10 * 60 * 1000, 30_000, MAX_TIMEOUT_MS);
+// Max characters per synthesized chunk. This does not cap total TTS input length.
+// Set to 0 to disable chunk-size capping (not recommended; may be slow/unstable for very long inputs).
+const TTS_MAX_TEXT_CHARS = toInt(process.env.TTS_MAX_TEXT_CHARS, 1200);
+// Voice-note chunking for auto voice replies (SPOKEN -> multiple Telegram voice messages when long).
+// Set any of these to 0 to disable that specific chunking constraint.
+const TTS_VOICE_MAX_CHARS = toInt(process.env.TTS_VOICE_MAX_CHARS, 450);
+const TTS_VOICE_MAX_SENTENCES = toInt(process.env.TTS_VOICE_MAX_SENTENCES, 3);
+// 0 = unlimited chunks (no hard cap).
+const TTS_VOICE_MAX_CHUNKS = toInt(process.env.TTS_VOICE_MAX_CHUNKS, 0);
+// 0 disables the hard wall-clock timeout.
+const TTS_TIMEOUT_MS = toTimeoutMs(process.env.TTS_TIMEOUT_MS, 0, null, MAX_TIMEOUT_MS);
 const TTS_VENV_PATH = resolveMaybeRelativePath(process.env.TTS_VENV_PATH || path.join(ROOT, ".tts-venv"));
 const TTS_MODEL = String(process.env.TTS_MODEL || "").trim();
 const TTS_REFERENCE_AUDIO = resolveMaybeRelativePath(process.env.TTS_REFERENCE_AUDIO || "");
-const TTS_SAMPLE_RATE = toInt(process.env.TTS_SAMPLE_RATE, 48000, 8000, 96000);
+const TTS_SAMPLE_RATE = toInt(process.env.TTS_SAMPLE_RATE, 48000);
 const TTS_PYTHON = String(process.env.TTS_PYTHON || "").trim();
 const TTS_FFMPEG_BIN = String(process.env.TTS_FFMPEG_BIN || "ffmpeg").trim();
-const TTS_OPUS_BITRATE_KBPS = toInt(process.env.TTS_OPUS_BITRATE_KBPS, 48, 8, 256);
+const TTS_OPUS_BITRATE_KBPS = toInt(process.env.TTS_OPUS_BITRATE_KBPS, 48);
 const TTS_SEND_TEXT = toBool(process.env.TTS_SEND_TEXT, false);
 const TTS_REPLY_TO_VOICE = toBool(process.env.TTS_REPLY_TO_VOICE, false);
+
+const ATTACH_ENABLED = toBool(process.env.ATTACH_ENABLED, true);
+// Security: only allow attaching files from within this folder.
+// Use relative paths in ATTACH directives and /sendfile.
+const ATTACH_ROOT = resolveMaybeRelativePath(process.env.ATTACH_ROOT || OUT_DIR);
+// Telegram bot upload limits vary by account/API; keep a sane default and make it configurable.
+// 0 disables the size cap.
+const ATTACH_MAX_FILE_MB = toInt(process.env.ATTACH_MAX_FILE_MB, 45);
+const ATTACH_UPLOAD_TIMEOUT_MS = toTimeoutMs(
+  process.env.ATTACH_UPLOAD_TIMEOUT_MS,
+  0,
+  null,
+  MAX_TIMEOUT_MS,
+);
+
+ensureDir(ATTACH_ROOT);
 
 const CODEX_PROMPT_FILE = resolveMaybeRelativePath(
   process.env.CODEX_PROMPT_FILE || path.join(ROOT, "codex_prompt.txt"),
@@ -490,15 +537,17 @@ const CODEX_VOICE_PROMPT_FILE = resolveMaybeRelativePath(
   process.env.CODEX_VOICE_PROMPT_FILE || path.join(ROOT, "codex_prompt_voice.txt"),
 );
 
-const MAX_PROMPT_CHARS = toInt(process.env.MAX_PROMPT_CHARS, 4000, 64, 20000);
+// 0 disables bot-side prompt truncation.
+const MAX_PROMPT_CHARS = toInt(process.env.MAX_PROMPT_CHARS, 0);
 // MAX_RESPONSE_CHARS=0 disables bot-side truncation (Telegram still limits each message).
-const MAX_RESPONSE_CHARS = toInt(process.env.MAX_RESPONSE_CHARS, 30000, 0, 5_000_000);
-const MAX_QUEUE_SIZE = toInt(process.env.MAX_QUEUE_SIZE, 10, 1, 100);
+const MAX_RESPONSE_CHARS = toInt(process.env.MAX_RESPONSE_CHARS, 0);
+// 0 disables the queue cap.
+const MAX_QUEUE_SIZE = toInt(process.env.MAX_QUEUE_SIZE, 0);
 const PROGRESS_UPDATES_ENABLED = toBool(process.env.PROGRESS_UPDATES_ENABLED, false);
 // When true, progress updates may include stderr. This is usually noisy (logs), so default is false.
 const PROGRESS_INCLUDE_STDERR = toBool(process.env.PROGRESS_INCLUDE_STDERR, false);
-const PROGRESS_FIRST_UPDATE_SEC = toInt(process.env.PROGRESS_FIRST_UPDATE_SEC, 0, 0, 300);
-const PROGRESS_UPDATE_INTERVAL_SEC = toInt(process.env.PROGRESS_UPDATE_INTERVAL_SEC, 30, 10, 600);
+const PROGRESS_FIRST_UPDATE_SEC = toInt(process.env.PROGRESS_FIRST_UPDATE_SEC, 0);
+const PROGRESS_UPDATE_INTERVAL_SEC = toInt(process.env.PROGRESS_UPDATE_INTERVAL_SEC, 30);
 
 if (!TOKEN || !PRIMARY_CHAT_ID) {
   console.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in .env");
@@ -730,8 +779,10 @@ function clearActiveSessionForChat(chatId) {
 function normalizePrompt(text) {
   const trimmed = String(text || "").trim();
   if (!trimmed) return "";
-  if (trimmed.length <= MAX_PROMPT_CHARS) return trimmed;
-  return `${trimmed.slice(0, MAX_PROMPT_CHARS)}\n\n[truncated by bot]`;
+  const lim = Number(MAX_PROMPT_CHARS);
+  if (!Number.isFinite(lim) || lim <= 0) return trimmed;
+  if (trimmed.length <= lim) return trimmed;
+  return `${trimmed.slice(0, lim)}\n\n[truncated by bot]`;
 }
 
 function normalizeResponse(text) {
@@ -781,7 +832,7 @@ function defaultVoicePromptPreamble() {
     "",
     "TEXT_ONLY:",
     "<optional: links, commands, paths, code, or any details that should be sent as text>",
-    "Keep it concise. If ambiguous, ask one clear follow-up question.",
+    "If ambiguous, ask one clear follow-up question.",
   ].join("\n");
 }
 
@@ -902,12 +953,18 @@ function listRecentCodexSessions(limit = RESUME_LIST_LIMIT) {
   if (files.length === 0) return [];
 
   files.sort((a, b) => b.mtimeMs - a.mtimeMs);
-  const candidates = files.slice(0, RESUME_SCAN_FILE_LIMIT);
+  const scanLim = Number(RESUME_SCAN_FILE_LIMIT);
+  const candidates = Number.isFinite(scanLim) && scanLim > 0
+    ? files.slice(0, Math.floor(scanLim))
+    : files;
+
+  const listLim = Number(limit);
+  const maxOut = Number.isFinite(listLim) && listLim > 0 ? Math.floor(listLim) : Infinity;
 
   const out = [];
   const seen = new Set();
   for (const entry of candidates) {
-    if (out.length >= limit) break;
+    if (out.length >= maxOut) break;
     let lines = [];
     try {
       lines = fs.readFileSync(entry.path, "utf8").split(/\r?\n/);
@@ -1216,11 +1273,13 @@ function buildCodexExecSpec(job) {
   };
 }
 
-async function telegramApi(method, { query = "", body = null, timeoutMs = 30_000 } = {}) {
+async function telegramApi(method, { query = "", body = null, timeoutMs = TELEGRAM_API_TIMEOUT_MS } = {}) {
   const url = `https://api.telegram.org/bot${TOKEN}/${method}${query ? `?${query}` : ""}`;
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const ms = Number(timeoutMs);
+  const useTimeout = Number.isFinite(ms) && ms > 0;
+  const timer = useTimeout ? setTimeout(() => controller.abort(), ms) : null;
   try {
     const res = await fetch(url, {
       method: body ? "POST" : "GET",
@@ -1236,14 +1295,16 @@ async function telegramApi(method, { query = "", body = null, timeoutMs = 30_000
     }
     return data.result;
   } finally {
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
   }
 }
 
-async function telegramApiMultipart(method, formData, timeoutMs = 30_000) {
+async function telegramApiMultipart(method, formData, timeoutMs = TELEGRAM_UPLOAD_TIMEOUT_MS) {
   const url = `https://api.telegram.org/bot${TOKEN}/${method}`;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const ms = Number(timeoutMs);
+  const useTimeout = Number.isFinite(ms) && ms > 0;
+  const timer = useTimeout ? setTimeout(() => controller.abort(), ms) : null;
   try {
     const res = await fetch(url, {
       method: "POST",
@@ -1258,7 +1319,7 @@ async function telegramApiMultipart(method, formData, timeoutMs = 30_000) {
     }
     return data.result;
   } finally {
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -1345,6 +1406,7 @@ function getTelegramCommandList() {
     { command: "stop", description: "cancel the active codex run" },
     { command: "clear", description: "clear queued prompts" },
     { command: "screenshot", description: "send a screenshot image" },
+    { command: "sendfile", description: "send a file attachment" },
     { command: "resume", description: "resume a codex session" },
     { command: "new", description: "clear active resumed session" },
     { command: "compress", description: "compress active session context" },
@@ -1373,14 +1435,14 @@ async function setTelegramCommands() {
     if (scope && scope !== "default") {
       body.scope = { type: scope };
     }
-    await telegramApi("setMyCommands", { body, timeoutMs: 15_000 });
+    await telegramApi("setMyCommands", { body });
   }
 }
 
 async function sendMessage(chatId, text, options = {}) {
   const silent = options.silent === true;
   const replyMarkup = options.replyMarkup || null;
-  const chunks = chunkText(normalizeResponse(text));
+  const chunks = chunkText(normalizeResponse(text), TELEGRAM_MESSAGE_MAX_CHARS);
   for (let idx = 0; idx < chunks.length; idx += 1) {
     const rawChunk = chunks[idx];
     const formatted = renderTelegramEntities(rawChunk);
@@ -1416,8 +1478,17 @@ async function sendMessage(chatId, text, options = {}) {
 async function sendPhoto(chatId, filePath, options = {}) {
   const silent = options.silent === true;
   const caption = String(options.caption || "").trim();
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? Number(options.timeoutMs) : TELEGRAM_UPLOAD_TIMEOUT_MS;
   const fileName = path.basename(filePath) || "image.png";
-  const imageBytes = fs.readFileSync(filePath);
+  let blob;
+  try {
+    blob = await fs.openAsBlob(filePath);
+    // Ensure a stable content-type for Telegram uploads.
+    blob = new Blob([blob], { type: "image/png" });
+  } catch {
+    const imageBytes = fs.readFileSync(filePath);
+    blob = new Blob([imageBytes], { type: "image/png" });
+  }
 
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
@@ -1425,8 +1496,8 @@ async function sendPhoto(chatId, filePath, options = {}) {
       form.append("chat_id", String(chatId || ""));
       form.append("disable_notification", silent ? "true" : "false");
       if (caption) form.append("caption", caption);
-      form.append("photo", new Blob([imageBytes], { type: "image/png" }), fileName);
-      await telegramApiMultipart("sendPhoto", form, 45_000);
+      form.append("photo", blob, fileName);
+      await telegramApiMultipart("sendPhoto", form, timeoutMs);
       logChat("out", chatId, caption || "[photo]", { source: "telegram-photo" });
       return;
     } catch (err) {
@@ -1440,8 +1511,17 @@ async function sendVoice(chatId, filePath, options = {}) {
   const silent = options.silent === true;
   const caption = String(options.caption || "").trim();
   const duration = Number(options.duration || 0);
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? Number(options.timeoutMs) : TELEGRAM_UPLOAD_TIMEOUT_MS;
   const fileName = path.basename(filePath) || "voice.ogg";
-  const voiceBytes = fs.readFileSync(filePath);
+  let blob;
+  try {
+    blob = await fs.openAsBlob(filePath);
+    // Ensure a stable content-type for Telegram uploads.
+    blob = new Blob([blob], { type: "audio/ogg" });
+  } catch {
+    const voiceBytes = fs.readFileSync(filePath);
+    blob = new Blob([voiceBytes], { type: "audio/ogg" });
+  }
 
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
@@ -1452,9 +1532,44 @@ async function sendVoice(chatId, filePath, options = {}) {
       if (Number.isFinite(duration) && duration > 0) {
         form.append("duration", String(Math.round(duration)));
       }
-      form.append("voice", new Blob([voiceBytes], { type: "audio/ogg" }), fileName);
-      await telegramApiMultipart("sendVoice", form, 90_000);
+      form.append("voice", blob, fileName);
+      await telegramApiMultipart("sendVoice", form, timeoutMs);
       logChat("out", chatId, caption || "[voice]", { source: "telegram-voice" });
+      return;
+    } catch (err) {
+      if (attempt >= 3) throw err;
+      await sleep(350 * attempt);
+    }
+  }
+}
+
+async function sendDocument(chatId, filePath, options = {}) {
+  const silent = options.silent === true;
+  const caption = String(options.caption || "").trim();
+  const fileName = String(options.fileName || "").trim() || path.basename(filePath) || "file";
+  const timeoutMs = Number.isFinite(options.timeoutMs)
+    ? Number(options.timeoutMs)
+    : ATTACH_UPLOAD_TIMEOUT_MS;
+
+  let blob;
+  try {
+    blob = await fs.openAsBlob(filePath);
+    // Telegram infers type from file name; keep a stable binary content-type.
+    blob = new Blob([blob], { type: "application/octet-stream" });
+  } catch {
+    const bytes = fs.readFileSync(filePath);
+    blob = new Blob([bytes], { type: "application/octet-stream" });
+  }
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const form = new FormData();
+      form.append("chat_id", String(chatId || ""));
+      form.append("disable_notification", silent ? "true" : "false");
+      if (caption) form.append("caption", caption);
+      form.append("document", blob, fileName);
+      await telegramApiMultipart("sendDocument", form, timeoutMs);
+      logChat("out", chatId, caption || `[document] ${fileName}`, { source: "telegram-document" });
       return;
     } catch (err) {
       if (attempt >= 3) throw err;
@@ -1577,6 +1692,7 @@ async function sendHelp(chatId) {
     "/cancel - stop current AIDOLON run",
     "/clear - clear queued prompts",
     "/screenshot - capture and send primary screen",
+    "/sendfile <path> [caption] - send a file attachment (from ATTACH_ROOT)",
     "/resume - list recent AIDOLON sessions with prefill buttons",
     "/resume <session_id> [text] - resume a session, optionally with text",
     "/new - clear active resumed session",
@@ -1596,6 +1712,7 @@ async function sendStatus(chatId) {
     ? `#${currentJob.id} for ${Math.floor((Date.now() - currentJob.startedAt) / 1000)}s`
     : "none";
   const queued = queue.length;
+  const queueCap = MAX_QUEUE_SIZE > 0 ? String(MAX_QUEUE_SIZE) : "unlimited";
   const activeSession = getActiveSessionForChat(chatId);
   const prefs = getChatPrefs(chatId);
   const effectiveModel = String(prefs.model || CODEX_MODEL || "").trim() || "(default)";
@@ -1604,7 +1721,7 @@ async function sendStatus(chatId) {
     "Bot status",
     `- busy: ${Boolean(currentJob)}`,
     `- current: ${current}`,
-    `- queue: ${queued}/${MAX_QUEUE_SIZE}`,
+    `- queue: ${queued}/${queueCap}`,
     `- active_session: ${activeSession ? shortSessionId(activeSession) : "(none)"}`,
     `- exec_mode: ${codexMode.mode}`,
     `- model: ${effectiveModel}${prefs.model ? " (chat override)" : ""}`,
@@ -1703,7 +1820,20 @@ async function sendQueue(chatId) {
   }
   const lines = ["Queued prompts:"];
   for (const item of queue.slice(0, 10)) {
-    const preview = item.text.length > 90 ? `${item.text.slice(0, 90)}...` : item.text;
+    const kind = String(item?.kind || "codex");
+    let preview = "";
+    if (kind === "tts-batch") {
+      const texts = Array.isArray(item?.texts) ? item.texts : [];
+      const count = texts.length;
+      const first = String(texts[0] || "").trim();
+      const head = first.length > 70 ? `${first.slice(0, 70)}...` : first;
+      preview = `[tts-batch x${count || "?"}] ${head || "(empty)"}`;
+    } else {
+      const t = String(item?.text || "").trim();
+      preview = t.length > 90 ? `${t.slice(0, 90)}...` : t || "(empty)";
+      if (kind === "tts") preview = `[tts] ${preview}`;
+      if (kind === "raw") preview = `[raw] ${preview}`;
+    }
     lines.push(`- #${item.id}: ${preview}`);
   }
   if (queue.length > 10) {
@@ -1802,7 +1932,7 @@ async function enqueueRawCodexCommand(chatId, args, source = "cmd") {
     await sendMessage(chatId, "No AIDOLON command to run.");
     return;
   }
-  if (queue.length >= MAX_QUEUE_SIZE) {
+  if (MAX_QUEUE_SIZE > 0 && queue.length >= MAX_QUEUE_SIZE) {
     await sendMessage(chatId, `Queue is full (${MAX_QUEUE_SIZE}). Use /queue or /clear.`);
     return;
   }
@@ -1979,6 +2109,22 @@ async function handleCommand(chatId, text) {
         await sendMessage(chatId, `Screenshot failed: ${String(err?.message || err)}`);
       }
       return true;
+    case "/sendfile": {
+      const arg = String(parsed.arg || "").trim();
+      if (!arg) {
+        await sendMessage(chatId, "Usage: /sendfile <relative-path> [caption]");
+        return true;
+      }
+      const parts = parseArgString(arg);
+      const relPath = String(parts[0] || "").trim();
+      const caption = parts.length > 1 ? parts.slice(1).join(" ").trim() : "";
+      if (!relPath) {
+        await sendMessage(chatId, "Usage: /sendfile <relative-path> [caption]");
+        return true;
+      }
+      await sendAttachments(chatId, [{ path: relPath, caption }]);
+      return true;
+    }
     case "/cmd": {
       if (!parsed.arg) {
         await sendMessage(chatId, "Usage: /cmd <codex command and args>\nExample: /cmd exec review --uncommitted");
@@ -2142,7 +2288,15 @@ async function handleCommand(chatId, text) {
         await sendMessage(chatId, "Usage: /tts <text>");
         return true;
       }
-      await enqueueTts(chatId, q, "tts-command");
+      // Never truncate user input for TTS; split into as many voice notes as needed.
+      const { chunks, overflowText } = splitSpeakableTextIntoVoiceChunks(q);
+      const all = chunks.length > 0 ? chunks : [q];
+      if (overflowText) all.push(overflowText);
+      if (all.length > 1) {
+        await enqueueTtsBatch(chatId, all, "tts-command");
+      } else {
+        await enqueueTts(chatId, all[0], "tts-command");
+      }
       return true;
     }
     case "/compress": {
@@ -2192,7 +2346,7 @@ async function enqueuePrompt(chatId, inputText, source, options = {}) {
     return;
   }
 
-  if (queue.length >= MAX_QUEUE_SIZE) {
+  if (MAX_QUEUE_SIZE > 0 && queue.length >= MAX_QUEUE_SIZE) {
     await sendMessage(chatId, `Queue is full (${MAX_QUEUE_SIZE}). Use /queue or /clear.`);
     return;
   }
@@ -2226,8 +2380,7 @@ function normalizeTtsText(text) {
   const trimmed = String(text || "").trim();
   if (!trimmed) return "";
   const squashed = trimmed.replace(/\s+/g, " ").trim();
-  if (squashed.length <= TTS_MAX_TEXT_CHARS) return squashed;
-  return squashed.slice(0, TTS_MAX_TEXT_CHARS);
+  return squashed;
 }
 
 function splitVoiceReplyParts(text) {
@@ -2263,6 +2416,90 @@ function splitVoiceReplyParts(text) {
 
   // Only SPOKEN marker present.
   return { spoken: src.slice(spokenStart).trim(), textOnly: "" };
+}
+
+function _stripOptionalQuotes(value) {
+  const s = String(value || "").trim();
+  if (!s) return "";
+  const first = s[0];
+  const last = s[s.length - 1];
+  if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+    return s.slice(1, -1);
+  }
+  return s;
+}
+
+function _isPathInside(rootDir, candidatePath) {
+  const rel = path.relative(rootDir, candidatePath);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+function resolveAttachPath(inputPath) {
+  const raw = String(inputPath || "").trim();
+  if (!raw) throw new Error("empty path");
+
+  const resolved = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(ATTACH_ROOT, raw);
+  if (!_isPathInside(ATTACH_ROOT, resolved)) {
+    throw new Error("path is outside ATTACH_ROOT");
+  }
+  if (!fs.existsSync(resolved)) throw new Error("file does not exist");
+  const st = fs.statSync(resolved);
+  if (!st.isFile()) throw new Error("not a file");
+  const limMb = Number(ATTACH_MAX_FILE_MB);
+  const maxBytes = Number.isFinite(limMb) && limMb > 0 ? limMb * 1024 * 1024 : Infinity;
+  if (Number.isFinite(maxBytes) && st.size > maxBytes) {
+    throw new Error(`file too large (${Math.round(st.size / (1024 * 1024))}MB > ${ATTACH_MAX_FILE_MB}MB)`);
+  }
+  return resolved;
+}
+
+function extractAttachDirectives(text) {
+  const src = String(text || "");
+  if (!src) return { text: "", attachments: [] };
+
+  const attachments = [];
+  const kept = [];
+  const lines = src.split(/\r?\n/);
+  for (const line of lines) {
+    const m = /^\s*ATTACH(?:_FILE)?\s*:\s*(.+?)\s*$/i.exec(String(line || ""));
+    if (!m) {
+      kept.push(line);
+      continue;
+    }
+    const rest = String(m[1] || "").trim();
+    if (!rest) continue;
+    const parts = rest.split("|");
+    const p = _stripOptionalQuotes(String(parts[0] || "").trim());
+    const caption = parts.length > 1 ? parts.slice(1).join("|").trim() : "";
+    if (!p) continue;
+    attachments.push({ path: p, caption });
+  }
+
+  return { text: kept.join("\n").trim(), attachments };
+}
+
+async function sendAttachments(chatId, attachments) {
+  if (!ATTACH_ENABLED) return;
+  const list = Array.isArray(attachments) ? attachments : [];
+  for (const item of list) {
+    const rawPath = String(item?.path || "").trim();
+    if (!rawPath) continue;
+    let resolved;
+    try {
+      resolved = resolveAttachPath(rawPath);
+    } catch (err) {
+      await sendMessage(chatId, `Attachment skipped: ${rawPath} (${String(err?.message || err)})`);
+      continue;
+    }
+
+    const caption = String(item?.caption || "").trim();
+    const fileName = path.basename(resolved);
+    try {
+      await sendDocument(chatId, resolved, { caption, fileName, timeoutMs: ATTACH_UPLOAD_TIMEOUT_MS });
+    } catch (err) {
+      await sendMessage(chatId, `Failed to send attachment ${fileName}: ${String(err?.message || err)}`);
+    }
+  }
 }
 
 function extractNonSpeakableInfo(text) {
@@ -2346,13 +2583,160 @@ function makeSpeakableTextForTts(text) {
   return out;
 }
 
+function splitTextByMaxChars(text, maxChars) {
+  const src = String(text || "").trim();
+  if (!src) return [];
+  const limit = Number.isFinite(maxChars) && maxChars > 10 ? Math.floor(maxChars) : 200;
+  if (src.length <= limit) return [src];
+
+  const words = src.split(/\s+/).filter(Boolean);
+  const out = [];
+  let cur = "";
+  for (const word of words) {
+    const w = String(word || "");
+    if (!w) continue;
+    if (!cur) {
+      if (w.length <= limit) {
+        cur = w;
+        continue;
+      }
+      for (let i = 0; i < w.length; i += limit) {
+        out.push(w.slice(i, i + limit));
+      }
+      continue;
+    }
+    if (cur.length + 1 + w.length <= limit) {
+      cur = `${cur} ${w}`;
+    } else {
+      out.push(cur);
+      cur = "";
+      if (w.length <= limit) {
+        cur = w;
+      } else {
+        for (let i = 0; i < w.length; i += limit) {
+          out.push(w.slice(i, i + limit));
+        }
+      }
+    }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+function splitIntoSentencesBestEffort(text) {
+  const src = String(text || "").trim();
+  if (!src) return [];
+
+  // Prefer Intl.Segmenter when available (better multilingual handling).
+  try {
+    if (typeof Intl !== "undefined" && typeof Intl.Segmenter === "function") {
+      const seg = new Intl.Segmenter(undefined, { granularity: "sentence" });
+      const out = [];
+      for (const item of seg.segment(src)) {
+        const part = String(item?.segment || "").trim();
+        if (part) out.push(part);
+      }
+      if (out.length > 0) return out;
+    }
+  } catch {
+    // fall through
+  }
+
+  // Fallback: split on sentence punctuation when followed by whitespace/end.
+  const out = [];
+  let buf = "";
+  for (let i = 0; i < src.length; i += 1) {
+    const ch = src[i];
+    buf += ch;
+    if (ch === "." || ch === "!" || ch === "?") {
+      const next = src[i + 1] || "";
+      if (!next || /\s/.test(next)) {
+        const piece = buf.trim();
+        if (piece) out.push(piece);
+        buf = "";
+      }
+    }
+  }
+  const tail = buf.trim();
+  if (tail) out.push(tail);
+  return out.length > 0 ? out : [src];
+}
+
+function splitSpeakableTextIntoVoiceChunks(text) {
+  const src = String(text || "").trim();
+  if (!src) return { chunks: [], overflowText: "" };
+
+  // 0 disables the relevant cap.
+  const maxCharsCandidates = [];
+  if (Number.isFinite(TTS_MAX_TEXT_CHARS) && TTS_MAX_TEXT_CHARS > 0) maxCharsCandidates.push(TTS_MAX_TEXT_CHARS);
+  if (Number.isFinite(TTS_VOICE_MAX_CHARS) && TTS_VOICE_MAX_CHARS > 0) maxCharsCandidates.push(TTS_VOICE_MAX_CHARS);
+  let maxChars = maxCharsCandidates.length > 0 ? Math.min(...maxCharsCandidates) : Infinity;
+  if (Number.isFinite(maxChars)) {
+    // Extremely small values produce awkward chunks and can cause slow splitting.
+    maxChars = Math.max(20, Math.floor(maxChars));
+  }
+
+  const maxSentences = Number.isFinite(TTS_VOICE_MAX_SENTENCES) && TTS_VOICE_MAX_SENTENCES > 0
+    ? Math.floor(TTS_VOICE_MAX_SENTENCES)
+    : Infinity;
+
+  const maxChunks = Number.isFinite(TTS_VOICE_MAX_CHUNKS) && TTS_VOICE_MAX_CHUNKS > 0
+    ? Math.floor(TTS_VOICE_MAX_CHUNKS)
+    : Infinity;
+
+  const rawSentences = splitIntoSentencesBestEffort(src);
+  const units = [];
+  for (const s of rawSentences) {
+    const piece = String(s || "").trim();
+    if (!piece) continue;
+    if (piece.length <= maxChars) {
+      units.push(piece);
+    } else {
+      units.push(...splitTextByMaxChars(piece, maxChars));
+    }
+  }
+  if (units.length === 0) return { chunks: [], overflowText: "" };
+
+  const chunks = [];
+  let cur = "";
+  let curSentenceCount = 0;
+  for (const unit of units) {
+    const piece = String(unit || "").trim();
+    if (!piece) continue;
+    if (!cur) {
+      cur = piece;
+      curSentenceCount = 1;
+      continue;
+    }
+    const candidate = `${cur} ${piece}`;
+    if (candidate.length > maxChars || curSentenceCount >= maxSentences) {
+      chunks.push(cur.trim());
+      cur = piece;
+      curSentenceCount = 1;
+    } else {
+      cur = candidate;
+      curSentenceCount += 1;
+    }
+  }
+  if (cur.trim()) chunks.push(cur.trim());
+
+  if (!Number.isFinite(maxChunks) || chunks.length <= maxChunks) {
+    return { chunks, overflowText: "" };
+  }
+
+  // If a chunk cap is explicitly configured, keep the extras as overflow.
+  const kept = chunks.slice(0, maxChunks);
+  const overflowText = chunks.slice(maxChunks).join(" ").trim();
+  return { chunks: kept, overflowText };
+}
+
 async function enqueueTts(chatId, inputText, source, options = {}) {
   const text = normalizeTtsText(inputText);
   if (!text) {
     await sendMessage(chatId, "Empty TTS text ignored.");
     return false;
   }
-  if (queue.length >= MAX_QUEUE_SIZE) {
+  if (MAX_QUEUE_SIZE > 0 && queue.length >= MAX_QUEUE_SIZE) {
     await sendMessage(chatId, `Queue is full (${MAX_QUEUE_SIZE}). Use /queue or /clear.`);
     return false;
   }
@@ -2365,6 +2749,41 @@ async function enqueueTts(chatId, inputText, source, options = {}) {
     kind: "tts",
     afterText: String(options.afterText || "").trim(),
     skipResultText: options.skipResultText === true,
+    attachments: Array.isArray(options.attachments) ? options.attachments : [],
+    startedAt: 0,
+    cancelRequested: false,
+    timedOut: false,
+    process: null,
+    stdoutTail: "",
+    stderrTail: "",
+  };
+
+  queue.push(job);
+  void processQueue();
+  return true;
+}
+
+async function enqueueTtsBatch(chatId, inputTexts, source, options = {}) {
+  const raw = Array.isArray(inputTexts) ? inputTexts : [];
+  const texts = raw.map((t) => normalizeTtsText(t)).filter(Boolean);
+  if (texts.length === 0) {
+    await sendMessage(chatId, "Empty TTS text ignored.");
+    return false;
+  }
+  if (MAX_QUEUE_SIZE > 0 && queue.length >= MAX_QUEUE_SIZE) {
+    await sendMessage(chatId, `Queue is full (${MAX_QUEUE_SIZE}). Use /queue or /clear.`);
+    return false;
+  }
+
+  const job = {
+    id: nextJobId++,
+    chatId,
+    texts,
+    source,
+    kind: "tts-batch",
+    afterText: String(options.afterText || "").trim(),
+    skipResultText: options.skipResultText === true,
+    attachments: Array.isArray(options.attachments) ? options.attachments : [],
     startedAt: 0,
     cancelRequested: false,
     timedOut: false,
@@ -2712,12 +3131,345 @@ async function runTtsJob(job) {
     }
   }
 
+  const attachments = Array.isArray(job?.attachments) ? job.attachments : [];
+  if (attachments.length > 0) {
+    try {
+      await sendAttachments(job.chatId, attachments);
+    } catch (err) {
+      log(`sendAttachments(tts) failed: ${redactError(err?.message || err)}`);
+    }
+  }
+
   if (job?.skipResultText === true) {
     return { ok: true, text: "", skipSendMessage: true };
   }
 
   if (TTS_SEND_TEXT) {
     return { ok: true, text };
+  }
+
+  return { ok: true, text: "", skipSendMessage: true };
+}
+
+async function runTtsBatchJob(job) {
+  if (!TTS_ENABLED) {
+    return { ok: false, text: "TTS is disabled on this bot (TTS_ENABLED=0)." };
+  }
+  if (!fs.existsSync(AIDOLON_TTS_SCRIPT_PATH)) {
+    return {
+      ok: false,
+      text: `TTS helper script missing: ${AIDOLON_TTS_SCRIPT_PATH}`,
+    };
+  }
+
+  if (!TTS_MODEL) {
+    return { ok: false, text: "TTS model is not configured. Set TTS_MODEL in .env." };
+  }
+  if (!TTS_REFERENCE_AUDIO) {
+    return { ok: false, text: "TTS reference audio is not configured. Set TTS_REFERENCE_AUDIO in .env." };
+  }
+
+  const pyBin = resolveTtsPythonBin();
+  if (!pyBin) {
+    return {
+      ok: false,
+      text: "Python not found for TTS. Set TTS_PYTHON or create a venv at TTS_VENV_PATH (default .tts-venv).",
+    };
+  }
+
+  const ffmpegBin = resolveTtsFfmpegBin();
+  if (!ffmpegBin) {
+    return {
+      ok: false,
+      text: `ffmpeg not found ('${TTS_FFMPEG_BIN}'). Install ffmpeg or set TTS_FFMPEG_BIN.`,
+    };
+  }
+
+  const raw = Array.isArray(job?.texts) ? job.texts : [];
+  const texts = raw.map((t) => normalizeTtsText(t)).filter(Boolean);
+  if (texts.length === 0) return { ok: false, text: "Empty TTS text." };
+
+  const base = `tts-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const wavBase = path.join(TTS_DIR, base);
+  const pad3 = (n) => String(n).padStart(3, "0");
+  const wavPaths = texts.map((_, idx) => `${wavBase}-${pad3(idx)}.wav`);
+
+  const synthArgs = [
+    AIDOLON_TTS_SCRIPT_PATH,
+    "--batch-jsonl",
+    "--out-wav-base",
+    wavBase,
+    "--model",
+    TTS_MODEL,
+    "--reference-audio",
+    TTS_REFERENCE_AUDIO,
+    "--sample-rate",
+    String(TTS_SAMPLE_RATE || 48000),
+  ];
+
+  const payload = `${texts.map((t) => JSON.stringify({ text: t })).join("\n")}\n`;
+
+  const synthOk = await new Promise((resolve) => {
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      resolve(result);
+    };
+
+    let child;
+    try {
+      child = spawn(pyBin, synthArgs, {
+        cwd: ROOT,
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch (err) {
+      finish({ ok: false, text: `Failed to start TTS python: ${err.message || err}` });
+      return;
+    }
+
+    job.process = child;
+
+    try {
+      child.stdin.end(payload);
+    } catch {
+      // best effort
+    }
+
+    const timeout = TTS_TIMEOUT_MS > 0
+      ? setTimeout(() => {
+        job.timedOut = true;
+        terminateChildTree(child, { forceAfterMs: 3000 });
+      }, TTS_TIMEOUT_MS)
+      : null;
+
+    child.stdout.on("data", (buf) => {
+      const chunk = String(buf || "");
+      job.stdoutTail = appendTail(job.stdoutTail, chunk, 50000);
+      if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
+    });
+    child.stderr.on("data", (buf) => {
+      const chunk = String(buf || "");
+      job.stderrTail = appendTail(job.stderrTail, chunk, 50000);
+      if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
+    });
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      finish({ ok: false, text: `TTS python process error: ${err.message || err}` });
+    });
+    child.on("close", (code, signal) => {
+      clearTimeout(timeout);
+
+      if (job.cancelRequested) {
+        finish({ ok: false, text: "TTS canceled." });
+        return;
+      }
+      if (job.timedOut) {
+        const tail = job.stderrTail.trim() || job.stdoutTail.trim();
+        finish({
+          ok: false,
+          text: `TTS timed out after ${Math.round(TTS_TIMEOUT_MS / 1000)}s.${tail ? `\n\n${tail}` : ""}`,
+        });
+        return;
+      }
+      if (typeof code === "number" && code !== 0) {
+        const tail = job.stderrTail.trim() || job.stdoutTail.trim();
+        finish({
+          ok: false,
+          text: `TTS synthesis failed (exit ${code}${signal ? `, signal ${signal}` : ""}).${tail ? `\n\n${tail}` : ""}`,
+        });
+        return;
+      }
+
+      finish({ ok: true });
+    });
+  });
+
+  const cleanupWavs = () => {
+    for (const p of wavPaths) {
+      try {
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+      } catch {
+        // best effort
+      }
+    }
+  };
+
+  if (!synthOk.ok) {
+    cleanupWavs();
+    return { ok: false, text: synthOk.text };
+  }
+
+  if (job.cancelRequested) {
+    cleanupWavs();
+    return { ok: false, text: "TTS canceled." };
+  }
+
+  for (const p of wavPaths) {
+    if (!fs.existsSync(p)) {
+      cleanupWavs();
+      return { ok: false, text: "TTS synthesis finished, but one or more WAV output files are missing." };
+    }
+  }
+
+  if (typeof job.onProgressChunk === "function") {
+    job.onProgressChunk("TTS: encoding voice messages...\n", "stderr");
+  }
+
+  for (let idx = 0; idx < wavPaths.length; idx += 1) {
+    const wavPath = wavPaths[idx];
+    const oggPath = path.join(TTS_DIR, `${base}-${pad3(idx)}.ogg`);
+
+    if (job.cancelRequested) {
+      try {
+        cleanupWavs();
+        if (fs.existsSync(oggPath)) fs.unlinkSync(oggPath);
+      } catch {
+        // best effort
+      }
+      return { ok: false, text: "TTS canceled." };
+    }
+
+    const ffArgs = [
+      "-y",
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      wavPath,
+      "-ac",
+      "1",
+      "-ar",
+      "48000",
+      "-c:a",
+      "libopus",
+      "-b:a",
+      `${TTS_OPUS_BITRATE_KBPS}k`,
+      "-vbr",
+      "on",
+      "-compression_level",
+      "10",
+      "-application",
+      "voip",
+      oggPath,
+    ];
+
+    const encodeOk = await new Promise((resolve) => {
+      let done = false;
+      const finish = (result) => {
+        if (done) return;
+        done = true;
+        resolve(result);
+      };
+
+      let child;
+      try {
+        child = spawn(ffmpegBin, ffArgs, {
+          cwd: ROOT,
+          windowsHide: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch (err) {
+        finish({ ok: false, text: `Failed to start ffmpeg: ${err.message || err}` });
+        return;
+      }
+
+      job.process = child;
+
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (buf) => {
+        const chunk = String(buf || "");
+        stdout = appendTail(stdout, chunk, 50000);
+        if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
+      });
+      child.stderr.on("data", (buf) => {
+        const chunk = String(buf || "");
+        stderr = appendTail(stderr, chunk, 50000);
+        if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
+      });
+      child.on("error", (err) => {
+        finish({ ok: false, text: `ffmpeg error: ${err.message || err}` });
+      });
+      child.on("close", (code, signal) => {
+        if (job.cancelRequested) {
+          finish({ ok: false, text: "TTS canceled." });
+          return;
+        }
+        if (typeof code === "number" && code !== 0) {
+          const tail = String(stderr || stdout || "").trim();
+          finish({
+            ok: false,
+            text: `ffmpeg failed (exit ${code}${signal ? `, signal ${signal}` : ""}).${tail ? `\n\n${tail}` : ""}`,
+          });
+          return;
+        }
+        if (!fs.existsSync(oggPath)) {
+          finish({ ok: false, text: "ffmpeg completed, but OGG output file is missing." });
+          return;
+        }
+        finish({ ok: true });
+      });
+    });
+
+    try {
+      if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
+    } catch {
+      // best effort
+    }
+
+    if (!encodeOk.ok) {
+      try {
+        if (fs.existsSync(oggPath)) fs.unlinkSync(oggPath);
+      } catch {
+        // best effort
+      }
+      cleanupWavs();
+      return { ok: false, text: encodeOk.text };
+    }
+
+    if (typeof job.onProgressChunk === "function") {
+      job.onProgressChunk(`TTS: sending voice message ${idx + 1}/${wavPaths.length}...\n`, "stderr");
+    }
+
+    try {
+      await sendVoice(job.chatId, oggPath);
+    } catch (err) {
+      return { ok: false, text: `Failed to send Telegram voice message: ${String(err?.message || err)}` };
+    } finally {
+      try {
+        if (fs.existsSync(oggPath)) fs.unlinkSync(oggPath);
+      } catch {
+        // best effort
+      }
+    }
+  }
+
+  const afterText = String(job?.afterText || "").trim();
+  if (afterText) {
+    try {
+      await sendMessage(job.chatId, afterText);
+    } catch (err) {
+      log(`sendMessage(tts-afterText) failed: ${redactError(err?.message || err)}`);
+    }
+  }
+
+  const attachments = Array.isArray(job?.attachments) ? job.attachments : [];
+  if (attachments.length > 0) {
+    try {
+      await sendAttachments(job.chatId, attachments);
+    } catch (err) {
+      log(`sendAttachments(tts-batch) failed: ${redactError(err?.message || err)}`);
+    }
+  }
+
+  if (job?.skipResultText === true) {
+    return { ok: true, text: "", skipSendMessage: true };
+  }
+
+  if (TTS_SEND_TEXT) {
+    return { ok: true, text: texts.join(" ") };
   }
 
   return { ok: true, text: "", skipSendMessage: true };
@@ -2759,7 +3511,7 @@ function startJobProgressUpdates(job) {
     return () => {};
   }
   // TTS jobs are intentionally noisy (model load, encode, ffmpeg). Don't stream that into Telegram.
-  if (String(job?.kind || "") === "tts") {
+  if (String(job?.kind || "") === "tts" || String(job?.kind || "") === "tts-batch") {
     return () => {};
   }
 
@@ -2998,7 +3750,9 @@ async function processQueue() {
         ? await runRawCodexJob(job)
         : job.kind === "tts"
           ? await runTtsJob(job)
-          : await runCodexJob(job);
+          : job.kind === "tts-batch"
+            ? await runTtsBatchJob(job)
+            : await runCodexJob(job);
     } finally {
       stopProgressUpdates();
     }
@@ -3010,9 +3764,16 @@ async function processQueue() {
       }
     }
 
+    const attachParsed = extractAttachDirectives(String(result?.text || ""));
+    const attachments = Array.isArray(attachParsed.attachments) ? attachParsed.attachments : [];
+    if (result && typeof result === "object") {
+      result.text = attachParsed.text;
+    }
+
     const shouldVoiceReply = Boolean(
       result?.ok &&
         job?.kind !== "tts" &&
+        job?.kind !== "tts-batch" &&
         String(job?.source || "") === "voice" &&
         TTS_REPLY_TO_VOICE &&
         TTS_ENABLED &&
@@ -3024,20 +3785,29 @@ async function processQueue() {
       try {
         const parts = splitVoiceReplyParts(String(result.text || ""));
         const spoken = makeSpeakableTextForTts(parts.spoken || String(result.text || ""));
+        const { chunks: spokenChunks, overflowText } = splitSpeakableTextIntoVoiceChunks(spoken);
         const modelTextOnly = String(parts.textOnly || "").trim();
         const extracted = modelTextOnly ? "" : extractNonSpeakableInfo(String(result.text || ""));
-        const afterText = modelTextOnly || (extracted ? `Text-only details:\n${extracted}` : "");
+        let afterText = modelTextOnly || (extracted ? `Text-only details:\n${extracted}` : "");
+        if (overflowText) {
+          const moved = `Moved from SPOKEN (too long for voice notes):\n${overflowText}`;
+          afterText = afterText ? `${afterText}\n\n${moved}` : moved;
+        }
 
-        voiceQueued = await enqueueTts(
-          job.chatId,
-          spoken,
-          "voice-reply",
-          {
+        const chunks = spokenChunks.length > 0 ? spokenChunks : (spoken ? [spoken] : []);
+        voiceQueued = chunks.length > 1
+          ? await enqueueTtsBatch(job.chatId, chunks, "voice-reply", {
             afterText,
             // Even if TTS_SEND_TEXT=1 globally, don't duplicate the spoken content for voice replies.
             skipResultText: true,
-          },
-        );
+            attachments,
+          })
+          : await enqueueTts(job.chatId, chunks[0] || spoken, "voice-reply", {
+            afterText,
+            // Even if TTS_SEND_TEXT=1 globally, don't duplicate the spoken content for voice replies.
+            skipResultText: true,
+            attachments,
+          });
       } catch (err) {
         // If voice enqueue fails, fall back to sending text so the user still gets an answer.
         log(`enqueueTts(voice-reply) failed: ${redactError(err?.message || err)}`);
@@ -3053,6 +3823,15 @@ async function processQueue() {
       }
     }
 
+    // If we replied via voice, attachments will be sent by the TTS job(s) to keep ordering sane.
+    if (attachments.length > 0 && !(shouldVoiceReply && voiceQueued)) {
+      try {
+        await sendAttachments(job.chatId, attachments);
+      } catch (err) {
+        log(`sendAttachments(result) failed: ${redactError(err?.message || err)}`);
+      }
+    }
+
     currentJob = null;
   }
 }
@@ -3061,7 +3840,6 @@ async function getTelegramFileMeta(fileId) {
   const params = new URLSearchParams({ file_id: String(fileId || "") });
   return await telegramApi("getFile", {
     query: params.toString(),
-    timeoutMs: 15_000,
   });
 }
 
@@ -3071,9 +3849,12 @@ async function downloadTelegramFile(filePath, destinationPath) {
   if (!res.ok) {
     throw new Error(`File download failed: HTTP ${res.status}`);
   }
-  const data = Buffer.from(await res.arrayBuffer());
-  fs.writeFileSync(destinationPath, data);
-  return data.length;
+  if (!res.body) {
+    throw new Error("File download failed: empty body");
+  }
+
+  await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(destinationPath));
+  return fs.statSync(destinationPath).size;
 }
 
 async function transcribeAudioWithWhisper(audioPath) {
@@ -3135,18 +3916,9 @@ async function handleVoiceMessage(msg) {
 
   const voice = msg.voice || msg.audio || null;
   const fileId = String(voice?.file_id || "");
-  const declaredBytes = Number(voice?.file_size || 0);
-  const maxBytes = WHISPER_MAX_FILE_MB * 1024 * 1024;
 
   if (!fileId) {
     await sendMessage(chatId, "Voice message missing file id.");
-    return;
-  }
-  if (declaredBytes > 0 && declaredBytes > maxBytes) {
-    await sendMessage(
-      chatId,
-      `Voice file too large (${Math.round(declaredBytes / (1024 * 1024))}MB). Max is ${WHISPER_MAX_FILE_MB}MB.`,
-    );
     return;
   }
 
@@ -3163,16 +3935,8 @@ async function handleVoiceMessage(msg) {
     `voice-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`,
   );
 
-  let downloadedBytes = 0;
   try {
-    downloadedBytes = await downloadTelegramFile(remotePath, localPath);
-    if (downloadedBytes > maxBytes) {
-      await sendMessage(
-        chatId,
-        `Downloaded voice file too large (${Math.round(downloadedBytes / (1024 * 1024))}MB).`,
-      );
-      return;
-    }
+    await downloadTelegramFile(remotePath, localPath);
 
     const transcript = String(await transcribeAudioWithWhisper(localPath)).trim();
     if (!transcript) {
@@ -3236,8 +4000,9 @@ async function handlePhotoOrImageDocument(msg) {
     return;
   }
 
-  const maxBytes = VISION_MAX_FILE_MB * 1024 * 1024;
-  if (declaredBytes > 0 && declaredBytes > maxBytes) {
+  const limMb = Number(VISION_MAX_FILE_MB);
+  const maxBytes = Number.isFinite(limMb) && limMb > 0 ? limMb * 1024 * 1024 : Infinity;
+  if (Number.isFinite(maxBytes) && declaredBytes > 0 && declaredBytes > maxBytes) {
     await sendMessage(chatId, `Image too large (${Math.round(declaredBytes / (1024 * 1024))}MB). Max is ${VISION_MAX_FILE_MB}MB.`);
     return;
   }
@@ -3259,7 +4024,7 @@ async function handlePhotoOrImageDocument(msg) {
   let downloadedBytes = 0;
   try {
     downloadedBytes = await downloadTelegramFile(remotePath, localPath);
-    if (downloadedBytes > maxBytes) {
+    if (Number.isFinite(maxBytes) && downloadedBytes > maxBytes) {
       await sendMessage(chatId, `Downloaded image too large (${Math.round(downloadedBytes / (1024 * 1024))}MB).`);
       return;
     }
@@ -3436,7 +4201,6 @@ async function pollUpdates(timeoutSec) {
   });
   return await telegramApi("getUpdates", {
     query: params.toString(),
-    timeoutMs: Math.max(15_000, (timeoutSec + 10) * 1000),
   });
 }
 

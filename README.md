@@ -67,6 +67,7 @@ By default, `start.cmd` will try to bootstrap `uv` (unless `UV_ENABLED=0`) and w
 - `/cancel` or `/stop` - stop the active Codex run
 - `/clear` - clear queued prompts
 - `/screenshot` - capture and send the primary display as an image
+- `/sendfile <path> [caption]` - send a file attachment (from `ATTACH_ROOT`)
 - `/ask <question>` - analyze the last image you sent (requires `VISION_ENABLED=1`)
 - `/see <question>` - take a screenshot and analyze it (requires `VISION_ENABLED=1`)
 - `/imgclear` - clear the last image context (so plain text goes back to Codex)
@@ -105,6 +106,7 @@ The bot can synthesize text into a Telegram voice message using MiraTTS:
 - Optional: `TTS_REFERENCE_AUDIO` (defaults to `assets\\reference.wav`, gitignored)
 - Optional: `TTS_SAMPLE_RATE` (defaults to `48000`)
 - Optional: `TTS_REPLY_TO_VOICE=1` to auto-reply to incoming voice notes with a voice message (otherwise replies are text).
+- Optional (auto voice replies): split long `SPOKEN` into multiple voice notes with `TTS_VOICE_MAX_CHARS`, `TTS_VOICE_MAX_SENTENCES`, `TTS_VOICE_MAX_CHUNKS` (0 = unlimited; batch-synthesized for speed).
 - Run: `/tts <text>`
 - Requires `ffmpeg` on PATH (or set `TTS_FFMPEG_BIN`).
 - `start.cmd` will automatically run `setup-tts.cmd` to create `TTS_VENV_PATH` (default `.tts-venv`) and install MiraTTS deps for this repo.
@@ -114,14 +116,30 @@ The preamble sent to Codex before each user message is loaded from `codex_prompt
 
 For voice-note transcripts (incoming Telegram voice messages), the bot can use a separate “spoken” prompt preamble from `codex_prompt_voice.txt` (set `CODEX_VOICE_PROMPT_FILE` to change the path). This is useful when `TTS_REPLY_TO_VOICE=1` so responses are TTS-friendly (no commands, paths, or other symbol-heavy text).
 
+## File attachments
+The bot can send local files as Telegram document attachments.
+
+- Manual: `/sendfile <path> [caption]` (path is resolved relative to `ATTACH_ROOT`)
+- Assistant-driven: include one or more lines in a reply:
+  - `ATTACH: relative/path.ext | optional caption`
+  - The bot uploads the file(s) and removes these `ATTACH:` lines from the displayed message.
+
+Config (in `.env`):
+- `ATTACH_ENABLED=1`
+- `ATTACH_ROOT` (defaults to `runtime/out`)
+- `ATTACH_MAX_FILE_MB`
+- `ATTACH_UPLOAD_TIMEOUT_MS`
+
 ## Progress updates
 - `PROGRESS_UPDATES_ENABLED=1` enables short in-chat progress pings while a job is running (default is off)
 - `PROGRESS_FIRST_UPDATE_SEC=0` minimum runtime before sending progress messages (set >0 to suppress updates for short runs)
 - `PROGRESS_UPDATE_INTERVAL_SEC=30` minimum seconds between progress messages (updates are output-driven, not a fixed timer)
 
 ## Timeouts
-- `CODEX_TIMEOUT_MS` sets a hard wall-clock timeout for Codex jobs (default `600000` = 10 minutes). Set to `0` to disable.
-- `TTS_TIMEOUT_MS` sets a hard wall-clock timeout for TTS synthesis (default `600000` = 10 minutes). Set to `0` to disable.
+- `CODEX_TIMEOUT_MS` sets a hard wall-clock timeout for Codex jobs (default `0` = disabled).
+- `TTS_TIMEOUT_MS` sets a hard wall-clock timeout for TTS synthesis (default `0` = disabled).
+- `TELEGRAM_API_TIMEOUT_MS` sets a timeout for Telegram API JSON requests (default `0` = disabled).
+- `TELEGRAM_UPLOAD_TIMEOUT_MS` sets a timeout for Telegram API multipart uploads (default `0` = disabled).
 
 ## Model picker
 - `/model` shows buttons to pick a model and a reasoning effort for the current chat.
