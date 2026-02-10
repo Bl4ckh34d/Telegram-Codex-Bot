@@ -643,6 +643,18 @@ const PROGRESS_INCLUDE_STDERR = toBool(process.env.PROGRESS_INCLUDE_STDERR, fals
 const PROGRESS_FIRST_UPDATE_SEC = toInt(process.env.PROGRESS_FIRST_UPDATE_SEC, 0);
 const PROGRESS_UPDATE_INTERVAL_SEC = toInt(process.env.PROGRESS_UPDATE_INTERVAL_SEC, 30);
 
+// Orchestration: route messages across multiple Codex "workers" (per-repo workdirs) to avoid head-of-line blocking.
+// This is a local in-process scheduler (not MCP); each worker runs at most one Codex job at a time, but workers run in parallel.
+const ORCH_MAX_CODEX_WORKERS = toInt(process.env.ORCH_MAX_CODEX_WORKERS, 5, 1, 20);
+const ORCH_ROUTER_ENABLED = toBool(process.env.ORCH_ROUTER_ENABLED, true);
+const ORCH_ROUTER_MAX_CONCURRENCY = toInt(process.env.ORCH_ROUTER_MAX_CONCURRENCY, 2, 1, 10);
+const ORCH_ROUTER_TIMEOUT_MS = toTimeoutMs(process.env.ORCH_ROUTER_TIMEOUT_MS, 0, 0, MAX_TIMEOUT_MS);
+const ORCH_ROUTER_MODEL = String(process.env.ORCH_ROUTER_MODEL || "").trim();
+const ORCH_ROUTER_REASONING_EFFORT = String(process.env.ORCH_ROUTER_REASONING_EFFORT || "low").trim();
+const ORCH_ROUTER_PROMPT_FILE = resolveMaybeRelativePath(
+  process.env.ORCH_ROUTER_PROMPT_FILE || path.join(ROOT, "codex_prompt_router.txt"),
+);
+
 if (!TOKEN || !PRIMARY_CHAT_ID) {
   console.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in .env");
   process.exit(1);
@@ -717,11 +729,8 @@ try {
   process.exit(1);
 }
 
-const state = readJson(STATE_PATH, { lastUpdateId: 0, chatSessions: {}, lastImages: {} });
+const state = readJson(STATE_PATH, { lastUpdateId: 0, chatSessions: {}, lastImages: {}, chatPrefs: {}, orch: {} });
 let lastUpdateId = Number(state.lastUpdateId || 0);
-const chatSessions = state && typeof state.chatSessions === "object" && state.chatSessions
-  ? { ...state.chatSessions }
-  : {};
 const lastImages = state && typeof state.lastImages === "object" && state.lastImages
   ? { ...state.lastImages }
   : {};
@@ -729,10 +738,27 @@ const chatPrefs = state && typeof state.chatPrefs === "object" && state.chatPref
   ? { ...state.chatPrefs }
   : {};
 
-const queue = [];
-let currentJob = null;
+const ORCH_GENERAL_WORKER_ID = "general";
+const ORCH_TTS_LANE_ID = "tts";
+const ORCH_WHISPER_LANE_ID = "whisper";
+
+const orch = normalizeOrchState(state, {
+  legacyChatSessions: state && typeof state.chatSessions === "object" && state.chatSessions ? state.chatSessions : {},
+});
+const orchWorkers = orch.workers; // { [workerId]: { ... } }
+const orchActiveWorkerByChat = orch.activeWorkerByChat; // { [chatId]: workerId }
+const orchSessionByChatWorker = orch.sessionByChatWorker; // { [chatId]: { [workerId]: sessionId } }
+const orchReplyRouteByChat = orch.replyRouteByChat; // { [chatId]: { [messageId]: { workerId, at } } }
+let orchNextWorkerNum = Number(orch.nextWorkerNum || 1);
+
+const lanes = new Map();
+initOrchLanes();
 let nextJobId = 1;
 let shuttingDown = false;
+const orchPendingSpawnByChat = new Map(); // chatId -> { desiredWorkdir, title, promptText, source, options, createdAt }
+let routerSequence = 1;
+let routerInFlight = 0;
+const routerWaiters = [];
 const pendingCommandsById = new Map();
 const pendingCommandIdByChat = new Map();
 let pendingSequence = 1;
@@ -773,9 +799,86 @@ function consumePrefButton(chatId, id) {
   return entry;
 }
 
+function normalizeOrchState(stateObj, { legacyChatSessions = {} } = {}) {
+  const raw = stateObj && typeof stateObj.orch === "object" && stateObj.orch ? stateObj.orch : {};
+  const workers = raw && typeof raw.workers === "object" && raw.workers ? { ...raw.workers } : {};
+  const activeWorkerByChat = raw && typeof raw.activeWorkerByChat === "object" && raw.activeWorkerByChat
+    ? { ...raw.activeWorkerByChat }
+    : {};
+  const sessionByChatWorker = raw && typeof raw.sessionByChatWorker === "object" && raw.sessionByChatWorker
+    ? { ...raw.sessionByChatWorker }
+    : {};
+  const replyRouteByChat = raw && typeof raw.replyRouteByChat === "object" && raw.replyRouteByChat
+    ? { ...raw.replyRouteByChat }
+    : {};
+  let nextWorkerNum = Number(raw?.nextWorkerNum || 1);
+  if (!Number.isFinite(nextWorkerNum) || nextWorkerNum < 1) nextWorkerNum = 1;
+
+  const now = Date.now();
+  // Ensure a general worker always exists.
+  const general = workers[ORCH_GENERAL_WORKER_ID];
+  if (!general || typeof general !== "object") {
+    workers[ORCH_GENERAL_WORKER_ID] = {
+      id: ORCH_GENERAL_WORKER_ID,
+      kind: "general",
+      title: "General",
+      workdir: CODEX_WORKDIR,
+      createdAt: now,
+      lastUsedAt: now,
+    };
+  } else {
+    // Best-effort normalization.
+    workers[ORCH_GENERAL_WORKER_ID] = {
+      id: ORCH_GENERAL_WORKER_ID,
+      kind: "general",
+      title: String(general.title || "General").trim() || "General",
+      workdir: String(general.workdir || CODEX_WORKDIR).trim() || CODEX_WORKDIR,
+      createdAt: Number(general.createdAt || now) || now,
+      lastUsedAt: Number(general.lastUsedAt || now) || now,
+    };
+  }
+
+  // Migrate legacy per-chat session ids onto the general worker (first run after upgrade).
+  if (legacyChatSessions && typeof legacyChatSessions === "object") {
+    for (const [chatId, sid] of Object.entries(legacyChatSessions)) {
+      const key = String(chatId || "").trim();
+      const sessionId = String(sid || "").trim();
+      if (!key || !sessionId) continue;
+      const prev = sessionByChatWorker[key] && typeof sessionByChatWorker[key] === "object" ? sessionByChatWorker[key] : {};
+      if (!prev[ORCH_GENERAL_WORKER_ID]) {
+        sessionByChatWorker[key] = { ...prev, [ORCH_GENERAL_WORKER_ID]: sessionId };
+      }
+      if (!activeWorkerByChat[key]) {
+        activeWorkerByChat[key] = ORCH_GENERAL_WORKER_ID;
+      }
+    }
+  }
+
+  return {
+    version: 1,
+    workers,
+    activeWorkerByChat,
+    sessionByChatWorker,
+    replyRouteByChat,
+    nextWorkerNum,
+  };
+}
+
 function persistState() {
   try {
-    writeJsonAtomic(STATE_PATH, { lastUpdateId, chatSessions, lastImages, chatPrefs });
+    writeJsonAtomic(STATE_PATH, {
+      lastUpdateId,
+      lastImages,
+      chatPrefs,
+      orch: {
+        version: 1,
+        workers: orchWorkers,
+        activeWorkerByChat: orchActiveWorkerByChat,
+        sessionByChatWorker: orchSessionByChatWorker,
+        replyRouteByChat: orchReplyRouteByChat,
+        nextWorkerNum: orchNextWorkerNum,
+      },
+    });
   } catch {
     // best effort
   }
@@ -811,11 +914,715 @@ function clearChatPrefs(chatId) {
   persistState();
 }
 
-function getActiveSessionForChat(chatId) {
+function getActiveWorkerForChat(chatId) {
   const key = String(chatId || "").trim();
+  if (!key) return ORCH_GENERAL_WORKER_ID;
+  const raw = String(orchActiveWorkerByChat[key] || "").trim();
+  return raw && orchWorkers[raw] ? raw : ORCH_GENERAL_WORKER_ID;
+}
+
+function setActiveWorkerForChat(chatId, workerId) {
+  const key = String(chatId || "").trim();
+  const wid = String(workerId || "").trim();
+  if (!key || !wid) return;
+  if (!orchWorkers[wid]) return;
+  orchActiveWorkerByChat[key] = wid;
+  persistState();
+}
+
+function getSessionForChatWorker(chatId, workerId) {
+  const key = String(chatId || "").trim();
+  const wid = String(workerId || "").trim();
+  if (!key || !wid) return "";
+  const entry = orchSessionByChatWorker[key];
+  if (!entry || typeof entry !== "object") return "";
+  return String(entry[wid] || "").trim();
+}
+
+function setSessionForChatWorker(chatId, workerId, sessionId) {
+  const key = String(chatId || "").trim();
+  const wid = String(workerId || "").trim();
+  const sid = String(sessionId || "").trim();
+  if (!key || !wid || !sid) return;
+  const prev = orchSessionByChatWorker[key] && typeof orchSessionByChatWorker[key] === "object"
+    ? orchSessionByChatWorker[key]
+    : {};
+  orchSessionByChatWorker[key] = { ...prev, [wid]: sid };
+  persistState();
+}
+
+function clearSessionForChatWorker(chatId, workerId) {
+  const key = String(chatId || "").trim();
+  const wid = String(workerId || "").trim();
+  if (!key || !wid) return;
+  const prev = orchSessionByChatWorker[key];
+  if (!prev || typeof prev !== "object") return;
+  if (!(wid in prev)) return;
+  const next = { ...prev };
+  delete next[wid];
+  orchSessionByChatWorker[key] = next;
+  persistState();
+}
+
+function clearAllSessionsForChat(chatId) {
+  const key = String(chatId || "").trim();
+  if (!key) return;
+  if (!(key in orchSessionByChatWorker)) return;
+  delete orchSessionByChatWorker[key];
+  persistState();
+}
+
+function getActiveSessionForChat(chatId, workerId = "") {
+  const wid = String(workerId || "").trim() || getActiveWorkerForChat(chatId);
+  return getSessionForChatWorker(chatId, wid);
+}
+
+function getLane(laneId) {
+  const key = String(laneId || "").trim();
+  if (!key) return null;
+  return lanes.get(key) || null;
+}
+
+function makeLane({ id, type, title, workdir, countTowardCap = false } = {}) {
+  const laneId = String(id || "").trim();
+  if (!laneId) throw new Error("lane id is required");
+  const lane = {
+    id: laneId,
+    type: String(type || "").trim() || "codex",
+    title: String(title || laneId).trim() || laneId,
+    workdir: String(workdir || "").trim(),
+    countTowardCap: Boolean(countTowardCap),
+    queue: [],
+    currentJob: null,
+  };
+  lanes.set(laneId, lane);
+  return lane;
+}
+
+function listCodexWorkers() {
+  const out = [];
+  for (const [id, w] of Object.entries(orchWorkers || {})) {
+    if (!w || typeof w !== "object") continue;
+    const wid = String(id || "").trim();
+    if (!wid) continue;
+    out.push({
+      id: wid,
+      kind: String(w.kind || "").trim() || "repo",
+      title: String(w.title || wid).trim() || wid,
+      workdir: String(w.workdir || "").trim(),
+      createdAt: Number(w.createdAt || 0) || 0,
+      lastUsedAt: Number(w.lastUsedAt || 0) || 0,
+    });
+  }
+  out.sort((a, b) => (b.lastUsedAt || 0) - (a.lastUsedAt || 0));
+  return out;
+}
+
+function getCodexWorker(workerId) {
+  const wid = String(workerId || "").trim();
+  if (!wid) return null;
+  const w = orchWorkers[wid];
+  if (!w || typeof w !== "object") return null;
+  return {
+    id: wid,
+    kind: String(w.kind || "").trim() || "repo",
+    title: String(w.title || wid).trim() || wid,
+    workdir: String(w.workdir || "").trim(),
+    createdAt: Number(w.createdAt || 0) || 0,
+    lastUsedAt: Number(w.lastUsedAt || 0) || 0,
+  };
+}
+
+function touchWorker(workerId) {
+  const wid = String(workerId || "").trim();
+  if (!wid) return;
+  const w = orchWorkers[wid];
+  if (!w || typeof w !== "object") return;
+  w.lastUsedAt = Date.now();
+  persistState();
+}
+
+function normalizePathKey(inputPath) {
+  const raw = String(inputPath || "").trim();
+  if (!raw) return "";
+  try {
+    // Use forward slashes + lowercase so Windows paths compare reliably.
+    return path.resolve(raw).replace(/\\/g, "/").toLowerCase();
+  } catch {
+    return raw.replace(/\\/g, "/").toLowerCase();
+  }
+}
+
+function resolveWorkdirInput(inputPath) {
+  const raw = String(inputPath || "").trim();
+  if (!raw) return "";
+  try {
+    return path.resolve(raw);
+  } catch {
+    return raw;
+  }
+}
+
+function findWorkerByWorkdir(workdir) {
+  const key = normalizePathKey(workdir);
   if (!key) return "";
-  const sessionId = String(chatSessions[key] || "").trim();
-  return sessionId;
+  for (const w of listCodexWorkers()) {
+    const wk = normalizePathKey(w.workdir);
+    if (wk && wk === key) return w.id;
+  }
+  return "";
+}
+
+function createRepoWorker(workdir, title = "") {
+  const resolved = resolveWorkdirInput(workdir);
+  if (!resolved) throw new Error("workdir is required");
+  if (!fs.existsSync(resolved)) throw new Error(`workdir does not exist: ${resolved}`);
+
+  const existing = findWorkerByWorkdir(resolved);
+  if (existing) return existing;
+
+  const now = Date.now();
+  const baseTitle = String(title || "").trim() || path.basename(resolved) || "Repo";
+
+  let id = "";
+  for (let attempt = 0; attempt < 2000; attempt += 1) {
+    const candidate = `w${orchNextWorkerNum++}`;
+    if (!orchWorkers[candidate]) {
+      id = candidate;
+      break;
+    }
+  }
+  if (!id) throw new Error("Failed to allocate worker id");
+
+  orchWorkers[id] = {
+    id,
+    kind: "repo",
+    title: baseTitle,
+    workdir: resolved,
+    createdAt: now,
+    lastUsedAt: now,
+  };
+  persistState();
+  ensureWorkerLane(id);
+  return id;
+}
+
+function retireWorker(workerId, { cancelActive = true } = {}) {
+  const wid = String(workerId || "").trim();
+  if (!wid) throw new Error("worker id is required");
+  if (wid === ORCH_GENERAL_WORKER_ID) throw new Error("Cannot retire the general worker");
+  if (!orchWorkers[wid]) throw new Error(`Unknown worker: ${wid}`);
+
+  const lane = getLane(wid);
+  if (lane) {
+    try {
+      if (cancelActive && lane.currentJob) {
+        const job = lane.currentJob;
+        job.cancelRequested = true;
+        try {
+          if (job.abortController instanceof AbortController) {
+            job.abortController.abort();
+          }
+        } catch {
+          // best effort
+        }
+        if (job.process) {
+          terminateChildTree(job.process, { forceAfterMs: 2000 });
+        }
+      }
+      if (Array.isArray(lane.queue)) lane.queue = [];
+    } catch {
+      // best effort
+    }
+    lanes.delete(wid);
+  }
+
+  delete orchWorkers[wid];
+
+  // If any chat had this as active worker, fall back to general.
+  for (const [chatKey, cur] of Object.entries(orchActiveWorkerByChat || {})) {
+    if (String(cur || "").trim() === wid) {
+      orchActiveWorkerByChat[chatKey] = ORCH_GENERAL_WORKER_ID;
+    }
+  }
+
+  // Drop sessions for this worker.
+  for (const [chatKey, entry] of Object.entries(orchSessionByChatWorker || {})) {
+    if (!entry || typeof entry !== "object") continue;
+    if (!(wid in entry)) continue;
+    const next = { ...entry };
+    delete next[wid];
+    orchSessionByChatWorker[chatKey] = next;
+  }
+
+  // Drop reply-route entries for this worker.
+  for (const [chatKey, entry] of Object.entries(orchReplyRouteByChat || {})) {
+    if (!entry || typeof entry !== "object") continue;
+    let changed = false;
+    const next = {};
+    for (const [msgId, v] of Object.entries(entry)) {
+      const vw = String(v?.workerId || "").trim();
+      if (vw && vw === wid) {
+        changed = true;
+        continue;
+      }
+      next[msgId] = v;
+    }
+    if (changed) {
+      orchReplyRouteByChat[chatKey] = next;
+    }
+  }
+
+  persistState();
+}
+
+function resolveWorkerIdFromUserInput(input) {
+  const raw = String(input || "").trim();
+  if (!raw) return "";
+  if (orchWorkers[raw]) return raw;
+
+  const lower = raw.toLowerCase();
+  const workers = listCodexWorkers();
+
+  // Exact title match.
+  for (const w of workers) {
+    if (String(w.title || "").trim().toLowerCase() === lower) return w.id;
+  }
+
+  // Basename match (repo folder name).
+  for (const w of workers) {
+    const base = String(path.basename(String(w.workdir || "")) || "").trim().toLowerCase();
+    if (base && base === lower) return w.id;
+  }
+
+  // Substring match (first).
+  for (const w of workers) {
+    const title = String(w.title || "").trim().toLowerCase();
+    const dir = String(w.workdir || "").trim().toLowerCase();
+    if ((title && title.includes(lower)) || (dir && dir.includes(lower))) return w.id;
+  }
+
+  return "";
+}
+
+function ensureTtsLane() {
+  let lane = getLane(ORCH_TTS_LANE_ID);
+  if (lane) return lane;
+  lane = makeLane({
+    id: ORCH_TTS_LANE_ID,
+    type: "tts",
+    title: "TTS",
+    workdir: ROOT,
+    countTowardCap: false,
+  });
+  return lane;
+}
+
+function ensureWhisperLane() {
+  let lane = getLane(ORCH_WHISPER_LANE_ID);
+  if (lane) return lane;
+  lane = makeLane({
+    id: ORCH_WHISPER_LANE_ID,
+    type: "whisper",
+    title: "Whisper",
+    workdir: ROOT,
+    countTowardCap: false,
+  });
+  return lane;
+}
+
+function ensureWorkerLane(workerId) {
+  const wid = String(workerId || "").trim();
+  if (!wid) return null;
+  const existing = getLane(wid);
+  if (existing) return existing;
+  const w = getCodexWorker(wid);
+  if (!w) return null;
+  const workdir = w.workdir && fs.existsSync(w.workdir) ? w.workdir : CODEX_WORKDIR;
+  return makeLane({
+    id: wid,
+    type: "codex",
+    title: w.title,
+    workdir,
+    countTowardCap: true,
+  });
+}
+
+function initOrchLanes() {
+  ensureTtsLane();
+  ensureWhisperLane();
+  // Convenience: ensure the bot's own repo has a dedicated worker when possible.
+  try {
+    const isRepo = fs.existsSync(path.join(ROOT, ".git"));
+    const hasWorker = Boolean(findWorkerByWorkdir(ROOT));
+    if (isRepo && !hasWorker && listCodexWorkers().length < ORCH_MAX_CODEX_WORKERS) {
+      createRepoWorker(ROOT, path.basename(ROOT) || "Bot Repo");
+    }
+  } catch {
+    // best effort
+  }
+  // Ensure lanes exist for all known workers (including the general worker).
+  for (const w of listCodexWorkers()) {
+    ensureWorkerLane(w.id);
+  }
+  // Enforce the cap at startup (best-effort): keep most recently used workers + general.
+  const all = listCodexWorkers();
+  const keep = [];
+  for (const w of all) {
+    if (w.id === ORCH_GENERAL_WORKER_ID) keep.push(w);
+  }
+  for (const w of all) {
+    if (w.id === ORCH_GENERAL_WORKER_ID) continue;
+    if (keep.length >= ORCH_MAX_CODEX_WORKERS) break;
+    keep.push(w);
+  }
+  const keepIds = new Set(keep.map((w) => w.id));
+  for (const w of all) {
+    if (keepIds.has(w.id)) continue;
+    delete orchWorkers[w.id];
+    lanes.delete(w.id);
+  }
+  if (all.length !== keep.length) {
+    persistState();
+  }
+}
+
+function totalQueuedJobs() {
+  let n = 0;
+  for (const lane of lanes.values()) {
+    n += Array.isArray(lane?.queue) ? lane.queue.length : 0;
+  }
+  return n;
+}
+
+function listActiveJobs() {
+  const out = [];
+  for (const lane of lanes.values()) {
+    if (lane && lane.currentJob) out.push({ laneId: lane.id, job: lane.currentJob });
+  }
+  return out;
+}
+
+function listActiveJobsForChat(chatId) {
+  const key = String(chatId || "").trim();
+  if (!key) return [];
+  return listActiveJobs().filter((x) => String(x?.job?.chatId || "") === key);
+}
+
+function listQueuedJobsForChat(chatId) {
+  const key = String(chatId || "").trim();
+  if (!key) return [];
+  const out = [];
+  for (const lane of lanes.values()) {
+    if (!lane || !Array.isArray(lane.queue) || lane.queue.length === 0) continue;
+    for (const job of lane.queue) {
+      if (String(job?.chatId || "") !== key) continue;
+      out.push({ laneId: lane.id, job });
+    }
+  }
+  out.sort((a, b) => Number(a.job?.id || 0) - Number(b.job?.id || 0));
+  return out;
+}
+
+function dropQueuedJobsForChat(chatId) {
+  const key = String(chatId || "").trim();
+  if (!key) return 0;
+  let removed = 0;
+  for (const lane of lanes.values()) {
+    if (!lane || !Array.isArray(lane.queue) || lane.queue.length === 0) continue;
+    const before = lane.queue.length;
+    lane.queue = lane.queue.filter((j) => String(j?.chatId || "") !== key);
+    removed += before - lane.queue.length;
+  }
+  return removed;
+}
+
+function recordReplyRoute(chatId, messageId, workerId) {
+  const chatKey = String(chatId || "").trim();
+  const msgKey = String(messageId || "").trim();
+  const wid = String(workerId || "").trim();
+  if (!chatKey || !msgKey || !wid) return;
+  if (!orchWorkers[wid]) return;
+
+  const prev = orchReplyRouteByChat[chatKey] && typeof orchReplyRouteByChat[chatKey] === "object"
+    ? orchReplyRouteByChat[chatKey]
+    : {};
+  prev[msgKey] = { workerId: wid, at: Date.now() };
+  orchReplyRouteByChat[chatKey] = prev;
+
+  // Best-effort cleanup: keep the most recent ~600 per chat and drop very old entries.
+  const entries = Object.entries(prev);
+  if (entries.length > 700) {
+    entries.sort((a, b) => Number(b[1]?.at || 0) - Number(a[1]?.at || 0));
+    const keep = new Set(entries.slice(0, 600).map((x) => x[0]));
+    const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000;
+    const next = {};
+    for (const [k, v] of entries) {
+      const at = Number(v?.at || 0);
+      if (!keep.has(k)) continue;
+      if (Number.isFinite(at) && at > 0 && at < cutoff) continue;
+      next[k] = v;
+    }
+    orchReplyRouteByChat[chatKey] = next;
+  }
+
+  persistState();
+}
+
+function lookupReplyRouteWorker(chatId, messageId) {
+  const chatKey = String(chatId || "").trim();
+  const msgKey = String(messageId || "").trim();
+  if (!chatKey || !msgKey) return "";
+  const entry = orchReplyRouteByChat[chatKey];
+  if (!entry || typeof entry !== "object") return "";
+  const hit = entry[msgKey];
+  if (!hit || typeof hit !== "object") return "";
+  const wid = String(hit.workerId || "").trim();
+  return wid && orchWorkers[wid] ? wid : "";
+}
+
+async function acquireRouterSlot() {
+  if (routerInFlight < ORCH_ROUTER_MAX_CONCURRENCY) {
+    routerInFlight += 1;
+    return;
+  }
+  await new Promise((resolve) => routerWaiters.push(resolve));
+  routerInFlight += 1;
+}
+
+function releaseRouterSlot() {
+  routerInFlight = Math.max(0, routerInFlight - 1);
+  const next = routerWaiters.shift();
+  if (typeof next === "function") next();
+}
+
+function buildRouterPrompt({ userText, activeWorkerId, replyHintWorkerId, workers, cap }) {
+  const safeUserText = String(userText || "").trim();
+  const lines = [
+    `Max workers: ${Number(cap) || ORCH_MAX_CODEX_WORKERS}`,
+    `Active worker: ${String(activeWorkerId || "").trim() || ORCH_GENERAL_WORKER_ID}`,
+    replyHintWorkerId ? `Reply hint worker (strong signal): ${String(replyHintWorkerId || "").trim()}` : "",
+    "",
+    "Workers:",
+  ].filter(Boolean);
+
+  for (const w of Array.isArray(workers) ? workers : []) {
+    const workdir = String(w?.workdir || "").replace(/\\/g, "/");
+    lines.push(`- ${w.id} | kind=${w.kind} | title=${w.title} | workdir=${workdir}`);
+  }
+
+  lines.push("", "User message:", safeUserText);
+  return lines.join("\n");
+}
+
+function parseRouterOutput(text) {
+  const src = String(text || "").trim();
+  if (!src) return null;
+
+  let routeLine = "";
+  const lines = src.split(/\r?\n/);
+  for (const raw of lines) {
+    const line = String(raw || "").trim();
+    if (!line) continue;
+    if (/^ROUTE\s*:/i.test(line)) {
+      routeLine = line;
+      break;
+    }
+  }
+  if (!routeLine) {
+    const idx = src.toUpperCase().lastIndexOf("ROUTE:");
+    if (idx >= 0) {
+      routeLine = String(src.slice(idx).split(/\r?\n/)[0] || "").trim();
+    }
+  }
+  if (!routeLine) return null;
+
+  const after = routeLine.replace(/^ROUTE\s*:\s*/i, "").trim();
+  const start = after.indexOf("{");
+  const end = after.lastIndexOf("}");
+  if (start < 0 || end < 0 || end <= start) return null;
+  const jsonText = after.slice(start, end + 1);
+
+  let obj;
+  try {
+    obj = JSON.parse(jsonText);
+  } catch {
+    return null;
+  }
+  if (!obj || typeof obj !== "object") return null;
+
+  const decision = String(obj.decision || "").trim();
+  const workerId = String(obj.worker_id || "").trim();
+  const workdir = String(obj.workdir || "").trim();
+  const title = String(obj.title || "").trim();
+  const question = String(obj.question || "").trim();
+  if (!decision) return null;
+
+  return { decision, workerId, workdir, title, question, raw: obj };
+}
+
+async function runRouterDecision(chatId, userText, { activeWorkerId = "", replyHintWorkerId = "" } = {}) {
+  if (!ORCH_ROUTER_ENABLED) return null;
+  const workers = listCodexWorkers();
+  if (workers.length <= 1) return { decision: "use", workerId: ORCH_GENERAL_WORKER_ID, workdir: "", title: "", question: "" };
+
+  const prompt = buildRouterPrompt({
+    userText,
+    activeWorkerId: String(activeWorkerId || "").trim() || getActiveWorkerForChat(chatId),
+    replyHintWorkerId: String(replyHintWorkerId || "").trim(),
+    workers,
+    cap: ORCH_MAX_CODEX_WORKERS,
+  });
+
+  const outputFile = path.join(OUT_DIR, `router-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
+  const job = {
+    id: routerSequence++,
+    chatId: "", // router should ignore per-chat model overrides
+    text: prompt,
+    source: "router",
+    kind: "codex",
+    workerId: ORCH_GENERAL_WORKER_ID,
+    replyStyle: "router",
+    resumeSessionId: "",
+    model: ORCH_ROUTER_MODEL,
+    reasoning: ORCH_ROUTER_REASONING_EFFORT,
+    imagePaths: [],
+    workdir: String(getCodexWorker(ORCH_GENERAL_WORKER_ID)?.workdir || CODEX_WORKDIR || ROOT).trim() || ROOT,
+    replyToMessageId: 0,
+    startedAt: Date.now(),
+    cancelRequested: false,
+    timedOut: false,
+    process: null,
+    stdoutTail: "",
+    stderrTail: "",
+    timeoutMs: ORCH_ROUTER_TIMEOUT_MS,
+    outputFile,
+  };
+
+  await acquireRouterSlot();
+  try {
+    const result = await runCodexJob(job);
+    if (!result || !result.ok) {
+      return null;
+    }
+    return parseRouterOutput(String(result.text || ""));
+  } finally {
+    releaseRouterSlot();
+    try {
+      if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile);
+    } catch {
+      // best effort
+    }
+  }
+}
+
+function buildWorkerRetireKeyboard() {
+  const candidates = listCodexWorkers().filter((w) => w.id !== ORCH_GENERAL_WORKER_ID);
+  const rows = [];
+  for (const w of candidates) {
+    rows.push([{ text: `Retire ${w.id}: ${w.title}`, callback_data: `orch_retire:${w.id}` }]);
+  }
+  rows.push([{ text: "Cancel", callback_data: "orch_retire_cancel" }]);
+  return { inline_keyboard: rows };
+}
+
+async function decideWorkerForPrompt(chatId, userText, { replyHintWorkerId = "" } = {}) {
+  const activeWorkerId = getActiveWorkerForChat(chatId);
+  const replyHint = String(replyHintWorkerId || "").trim();
+  const fallback = replyHint && orchWorkers[replyHint] ? replyHint : activeWorkerId || ORCH_GENERAL_WORKER_ID;
+
+  const route = await runRouterDecision(chatId, userText, { activeWorkerId, replyHintWorkerId: replyHint }).catch(() => null);
+  if (!route) {
+    return { decision: "use", workerId: fallback, question: "" };
+  }
+
+  const decision = String(route.decision || "").trim().toLowerCase();
+  if (decision === "ask") {
+    const q = String(route.question || "").trim();
+    return { decision: "ask", workerId: "", question: q || "Which workspace should I use for this?" };
+  }
+
+  if (decision === "use") {
+    const wid = String(route.workerId || "").trim();
+    if (wid && orchWorkers[wid]) {
+      return { decision: "use", workerId: wid, question: "" };
+    }
+    return { decision: "use", workerId: fallback, question: "" };
+  }
+
+  if (decision === "spawn_repo") {
+    const workdirRaw = String(route.workdir || "").trim();
+    const title = String(route.title || "").trim();
+    if (!workdirRaw) {
+      return { decision: "ask", workerId: "", question: "What is the local path to the repo/workspace?" };
+    }
+
+    const resolved = resolveWorkdirInput(workdirRaw);
+    if (!resolved || !fs.existsSync(resolved)) {
+      return { decision: "ask", workerId: "", question: `I could not find that path on disk. What is the correct local path?` };
+    }
+
+    const existing = findWorkerByWorkdir(resolved);
+    if (existing) {
+      return { decision: "use", workerId: existing, question: "" };
+    }
+
+    const workerCount = listCodexWorkers().length;
+    if (workerCount >= ORCH_MAX_CODEX_WORKERS) {
+      return { decision: "need_retire", workerId: "", workdir: resolved, title: title || path.basename(resolved) || "Repo" };
+    }
+
+    let newId = "";
+    try {
+      newId = createRepoWorker(resolved, title);
+    } catch {
+      return { decision: "ask", workerId: "", question: "I could not create a new workspace for that path. Can you confirm the path and try again?" };
+    }
+    return { decision: "use", workerId: newId, question: "" };
+  }
+
+  // Unknown router output; fall back.
+  return { decision: "use", workerId: fallback, question: "" };
+}
+
+async function routeAndEnqueuePrompt(chatId, userText, source, options = {}) {
+  const replyToMessageId = Number(options?.replyToMessageId || 0);
+  const replyHintWorkerId = String(options?.replyHintWorkerId || "").trim();
+  const decision = await decideWorkerForPrompt(chatId, userText, { replyHintWorkerId });
+
+  if (decision.decision === "ask") {
+    await sendMessage(chatId, decision.question || "Which workspace should I use?", {
+      replyToMessageId,
+    });
+    return false;
+  }
+
+  if (decision.decision === "need_retire") {
+    const workdir = String(decision.workdir || "").trim();
+    const title = String(decision.title || "").trim();
+    orchPendingSpawnByChat.set(String(chatId || "").trim(), {
+      desiredWorkdir: workdir,
+      title,
+      promptText: String(userText || ""),
+      source: String(source || "").trim(),
+      options: { ...options },
+      createdAt: Date.now(),
+    });
+
+    await sendMessage(
+      chatId,
+      `Worker limit reached (${ORCH_MAX_CODEX_WORKERS}). Pick a worker to retire so I can create a new workspace for:\n- title: ${title}\n- workdir: ${String(workdir || "").replace(/\\\\/g, "/")}`,
+      {
+        replyToMessageId,
+        replyMarkup: buildWorkerRetireKeyboard(),
+      },
+    );
+    return false;
+  }
+
+  const workerId = String(decision.workerId || "").trim() || getActiveWorkerForChat(chatId);
+  await enqueuePrompt(chatId, userText, source, { ...options, workerId, replyToMessageId });
+  return true;
 }
 
 function getLastImageForChat(chatId) {
@@ -854,20 +1661,14 @@ function clearLastImageForChat(chatId) {
   persistState();
 }
 
-function setActiveSessionForChat(chatId, sessionId) {
-  const key = String(chatId || "").trim();
-  const sid = String(sessionId || "").trim();
-  if (!key || !sid) return;
-  chatSessions[key] = sid;
-  persistState();
+function setActiveSessionForChat(chatId, sessionId, workerId = "") {
+  const wid = String(workerId || "").trim() || getActiveWorkerForChat(chatId);
+  setSessionForChatWorker(chatId, wid, sessionId);
 }
 
-function clearActiveSessionForChat(chatId) {
-  const key = String(chatId || "").trim();
-  if (!key) return;
-  if (!(key in chatSessions)) return;
-  delete chatSessions[key];
-  persistState();
+function clearActiveSessionForChat(chatId, workerId = "") {
+  const wid = String(workerId || "").trim() || getActiveWorkerForChat(chatId);
+  clearSessionForChatWorker(chatId, wid);
 }
 
 function normalizePrompt(text) {
@@ -930,11 +1731,32 @@ function defaultVoicePromptPreamble() {
   ].join("\n");
 }
 
+function defaultRouterPromptPreamble() {
+  return [
+    "You are the AIDOLON router.",
+    "Your job: pick which worker should handle the user's message.",
+    "Do not run tools or do the work. Only route.",
+    "",
+    "You will be given: the user message, the active worker, and a list of existing workers (some pinned to repos).",
+    "Choose an existing worker when possible.",
+    "If a new repo worker is needed, only propose one if the user message includes an explicit local path.",
+    "If routing is ambiguous, ask one clarifying question.",
+    "",
+    "Output exactly one line in this format:",
+    "ROUTE: {\"decision\":\"use|spawn_repo|ask\",\"worker_id\":\"...\",\"workdir\":\"...\",\"title\":\"...\",\"question\":\"...\"}",
+  ].join("\n");
+}
+
 function getPromptPreamble(replyStyle) {
   const style = String(replyStyle || "").trim().toLowerCase();
+  const isRouter = style === "router";
   const isVoice = style === "voice" || style === "tts" || style === "spoken";
-  const filePath = isVoice ? CODEX_VOICE_PROMPT_FILE : CODEX_PROMPT_FILE;
-  const fallback = isVoice ? defaultVoicePromptPreamble() : defaultPromptPreamble();
+  const filePath = isRouter
+    ? ORCH_ROUTER_PROMPT_FILE
+    : isVoice
+      ? CODEX_VOICE_PROMPT_FILE
+      : CODEX_PROMPT_FILE;
+  const fallback = isRouter ? defaultRouterPromptPreamble() : isVoice ? defaultVoicePromptPreamble() : defaultPromptPreamble();
   const fromFile = readTextFileCached(filePath).trim();
   return fromFile || fallback;
 }
@@ -942,7 +1764,16 @@ function getPromptPreamble(replyStyle) {
 function formatCodexPrompt(userText, options = {}) {
   const hasImages = options && options.hasImages === true;
   const replyStyle = String(options?.replyStyle || "").trim();
+  const workdir = String(options?.workdir || "").trim();
+  const workerId = String(options?.workerId || "").trim();
+  const worker = workerId ? getCodexWorker(workerId) : null;
+  const workspaceLabel = worker ? `${worker.title} (${worker.kind})` : workerId || "unknown";
+
   const lines = [getPromptPreamble(replyStyle)];
+  if (workdir) {
+    lines.push(`Workspace: ${workspaceLabel}`);
+    lines.push(`Working directory: ${workdir}`);
+  }
   if (hasImages) {
     lines.push("One or more images are attached. Use them to answer the user.");
   }
@@ -1284,8 +2115,9 @@ function sanitizeRawCodexArgs(rawLine) {
   return tokens;
 }
 
-function buildRawCodexSpec(args) {
-  const rawArgs = Array.isArray(args) ? [...args] : [];
+function buildRawCodexSpec(job) {
+  const rawArgs = Array.isArray(job?.rawArgs) ? [...job.rawArgs] : [];
+  const workdir = String(job?.workdir || CODEX_WORKDIR || ROOT).trim() || ROOT;
   if (codexMode.mode === "wsl") {
     const shellCmd = [codexMode.codexPath || "codex", ...rawArgs].map(shQuote).join(" ");
     return {
@@ -1298,7 +2130,7 @@ function buildRawCodexSpec(args) {
     bin: codexMode.bin,
     args: rawArgs,
     shell: Boolean(codexMode.shell),
-    cwd: CODEX_WORKDIR,
+    cwd: workdir,
   };
 }
 
@@ -1306,9 +2138,13 @@ function buildCodexExecSpec(job) {
   const rawImagePaths = Array.isArray(job?.imagePaths)
     ? job.imagePaths.map((p) => String(p || "").trim()).filter(Boolean)
     : [];
+  const workdir = String(job?.workdir || CODEX_WORKDIR || ROOT).trim() || ROOT;
+  const codexWorkdir = codexMode.mode === "wsl" ? toWslPath(workdir) : workdir;
   const promptText = formatCodexPrompt(job.text, {
     hasImages: rawImagePaths.length > 0,
     replyStyle: String(job?.replyStyle || ""),
+    workdir,
+    workerId: String(job?.workerId || "").trim(),
   });
   const outputFile = String(job?.outputFile || "");
   const outputPath = codexMode.mode === "wsl" ? toWslPath(outputFile) : outputFile;
@@ -1327,7 +2163,7 @@ function buildCodexExecSpec(job) {
   }
 
   if (!isResume) {
-    args.push("--color", "never", "-C", codexMode.workdir, "-o", outputPath);
+    args.push("--color", "never", "-C", codexWorkdir, "-o", outputPath);
   }
   const prefs = getChatPrefs(job?.chatId);
   const effectiveModel = String(job?.model || prefs.model || CODEX_MODEL || "").trim();
@@ -1363,7 +2199,7 @@ function buildCodexExecSpec(job) {
     args,
     shell: Boolean(codexMode.shell),
     stdinText: promptText,
-    cwd: CODEX_WORKDIR,
+    cwd: workdir,
   };
 }
 
@@ -1491,6 +2327,10 @@ function getTelegramCommandList() {
     { command: "start", description: "start / help" },
     { command: "help", description: "show help" },
     { command: "status", description: "show worker status" },
+    { command: "workers", description: "list workspaces/workers" },
+    { command: "use", description: "switch active workspace" },
+    { command: "spawn", description: "create a repo workspace" },
+    { command: "retire", description: "remove a workspace" },
     { command: "queue", description: "show queued prompts" },
     { command: "codex", description: "show codex command menu" },
     { command: "commands", description: "show codex command menu" },
@@ -1540,7 +2380,11 @@ async function setTelegramCommands() {
 async function sendMessage(chatId, text, options = {}) {
   const silent = options.silent === true;
   const replyMarkup = options.replyMarkup || null;
+  const replyToMessageId = Number(options.replyToMessageId || 0);
+  const allowSendingWithoutReply = options.allowSendingWithoutReply !== false;
+  const routeWorkerId = String(options.routeWorkerId || "").trim();
   const chunks = chunkText(normalizeResponse(text), TELEGRAM_MESSAGE_MAX_CHARS);
+  const sent = [];
   for (let idx = 0; idx < chunks.length; idx += 1) {
     const rawChunk = chunks[idx];
     const formatted = renderTelegramEntities(rawChunk);
@@ -1554,15 +2398,23 @@ async function sendMessage(chatId, text, options = {}) {
           disable_web_page_preview: true,
           disable_notification: silent,
         };
+        if (idx === 0 && Number.isFinite(replyToMessageId) && replyToMessageId > 0) {
+          body.reply_to_message_id = replyToMessageId;
+          body.allow_sending_without_reply = allowSendingWithoutReply;
+        }
         if (formatted.entities) {
           body.entities = formatted.entities;
         }
         if (idx === 0 && replyMarkup) {
           body.reply_markup = replyMarkup;
         }
-        await telegramApi("sendMessage", {
+        const msg = await telegramApi("sendMessage", {
           body,
         });
+        if (msg && typeof msg === "object") sent.push(msg);
+        if (routeWorkerId && msg && typeof msg === "object" && msg.message_id) {
+          recordReplyRoute(chatId, msg.message_id, routeWorkerId);
+        }
         logChat("out", chatId, formatted.text, { source: "telegram-send" });
         break;
       } catch (err) {
@@ -1571,11 +2423,15 @@ async function sendMessage(chatId, text, options = {}) {
       }
     }
   }
+  return sent;
 }
 
 async function sendPhoto(chatId, filePath, options = {}) {
   const silent = options.silent === true;
   const caption = String(options.caption || "").trim();
+  const replyToMessageId = Number(options.replyToMessageId || 0);
+  const allowSendingWithoutReply = options.allowSendingWithoutReply !== false;
+  const routeWorkerId = String(options.routeWorkerId || "").trim();
   const timeoutMs = Number.isFinite(options.timeoutMs) ? Number(options.timeoutMs) : TELEGRAM_UPLOAD_TIMEOUT_MS;
   const signal = options.signal;
   const fileName = path.basename(filePath) || "image.png";
@@ -1594,11 +2450,18 @@ async function sendPhoto(chatId, filePath, options = {}) {
       const form = new FormData();
       form.append("chat_id", String(chatId || ""));
       form.append("disable_notification", silent ? "true" : "false");
+      if (Number.isFinite(replyToMessageId) && replyToMessageId > 0) {
+        form.append("reply_to_message_id", String(replyToMessageId));
+        form.append("allow_sending_without_reply", allowSendingWithoutReply ? "true" : "false");
+      }
       if (caption) form.append("caption", caption);
       form.append("photo", blob, fileName);
-      await telegramApiMultipart("sendPhoto", form, timeoutMs, { signal });
+      const msg = await telegramApiMultipart("sendPhoto", form, timeoutMs, { signal });
+      if (routeWorkerId && msg && typeof msg === "object" && msg.message_id) {
+        recordReplyRoute(chatId, msg.message_id, routeWorkerId);
+      }
       logChat("out", chatId, caption || "[photo]", { source: "telegram-photo" });
-      return;
+      return msg;
     } catch (err) {
       if (attempt >= 3) throw err;
       await sleep(350 * attempt);
@@ -1610,6 +2473,9 @@ async function sendVoice(chatId, filePath, options = {}) {
   const silent = options.silent === true;
   const caption = String(options.caption || "").trim();
   const duration = Number(options.duration || 0);
+  const replyToMessageId = Number(options.replyToMessageId || 0);
+  const allowSendingWithoutReply = options.allowSendingWithoutReply !== false;
+  const routeWorkerId = String(options.routeWorkerId || "").trim();
   const timeoutMs = Number.isFinite(options.timeoutMs) ? Number(options.timeoutMs) : TELEGRAM_UPLOAD_TIMEOUT_MS;
   const signal = options.signal;
   const fileName = path.basename(filePath) || "voice.ogg";
@@ -1628,14 +2494,21 @@ async function sendVoice(chatId, filePath, options = {}) {
       const form = new FormData();
       form.append("chat_id", String(chatId || ""));
       form.append("disable_notification", silent ? "true" : "false");
+      if (Number.isFinite(replyToMessageId) && replyToMessageId > 0) {
+        form.append("reply_to_message_id", String(replyToMessageId));
+        form.append("allow_sending_without_reply", allowSendingWithoutReply ? "true" : "false");
+      }
       if (caption) form.append("caption", caption);
       if (Number.isFinite(duration) && duration > 0) {
         form.append("duration", String(Math.round(duration)));
       }
       form.append("voice", blob, fileName);
-      await telegramApiMultipart("sendVoice", form, timeoutMs, { signal });
+      const msg = await telegramApiMultipart("sendVoice", form, timeoutMs, { signal });
+      if (routeWorkerId && msg && typeof msg === "object" && msg.message_id) {
+        recordReplyRoute(chatId, msg.message_id, routeWorkerId);
+      }
       logChat("out", chatId, caption || "[voice]", { source: "telegram-voice" });
-      return;
+      return msg;
     } catch (err) {
       // If we hit our own abort timeout, don't retry multiple times; it'll just stall the bot.
       if (String(err?.name || "").trim() === "AbortError") throw err;
@@ -1649,6 +2522,9 @@ async function sendDocument(chatId, filePath, options = {}) {
   const silent = options.silent === true;
   const caption = String(options.caption || "").trim();
   const fileName = String(options.fileName || "").trim() || path.basename(filePath) || "file";
+  const replyToMessageId = Number(options.replyToMessageId || 0);
+  const allowSendingWithoutReply = options.allowSendingWithoutReply !== false;
+  const routeWorkerId = String(options.routeWorkerId || "").trim();
   const timeoutMs = Number.isFinite(options.timeoutMs)
     ? Number(options.timeoutMs)
     : ATTACH_UPLOAD_TIMEOUT_MS;
@@ -1669,11 +2545,18 @@ async function sendDocument(chatId, filePath, options = {}) {
       const form = new FormData();
       form.append("chat_id", String(chatId || ""));
       form.append("disable_notification", silent ? "true" : "false");
+      if (Number.isFinite(replyToMessageId) && replyToMessageId > 0) {
+        form.append("reply_to_message_id", String(replyToMessageId));
+        form.append("allow_sending_without_reply", allowSendingWithoutReply ? "true" : "false");
+      }
       if (caption) form.append("caption", caption);
       form.append("document", blob, fileName);
-      await telegramApiMultipart("sendDocument", form, timeoutMs, { signal });
+      const msg = await telegramApiMultipart("sendDocument", form, timeoutMs, { signal });
+      if (routeWorkerId && msg && typeof msg === "object" && msg.message_id) {
+        recordReplyRoute(chatId, msg.message_id, routeWorkerId);
+      }
       logChat("out", chatId, caption || `[document] ${fileName}`, { source: "telegram-document" });
-      return;
+      return msg;
     } catch (err) {
       if (attempt >= 3) throw err;
       await sleep(350 * attempt);
@@ -1791,6 +2674,10 @@ async function sendHelp(chatId) {
     "/confirm - run pending /cmd command",
     "/reject - cancel pending /cmd command",
     "/status - worker status",
+    "/workers - list workspaces/workers",
+    "/use <worker_id> - switch active workspace",
+    "/spawn <path> [title] - create a new repo workspace",
+    "/retire <worker_id> - remove a workspace",
     "/queue - show pending prompts",
     "/cancel - stop current AIDOLON run",
     "/clear - clear queued prompts",
@@ -1811,31 +2698,93 @@ async function sendHelp(chatId) {
 }
 
 async function sendStatus(chatId) {
-  const current = currentJob
-    ? `#${currentJob.id} for ${Math.floor((Date.now() - currentJob.startedAt) / 1000)}s`
-    : "none";
-  const queued = queue.length;
   const queueCap = MAX_QUEUE_SIZE > 0 ? String(MAX_QUEUE_SIZE) : "unlimited";
-  const activeSession = getActiveSessionForChat(chatId);
+  const queued = totalQueuedJobs();
+  const activeWorkerId = getActiveWorkerForChat(chatId);
+  const activeSession = getActiveSessionForChat(chatId, activeWorkerId);
   const prefs = getChatPrefs(chatId);
   const effectiveModel = String(prefs.model || CODEX_MODEL || "").trim() || "(default)";
   const effectiveReasoning = String(prefs.reasoning || CODEX_REASONING_EFFORT || "").trim() || "(default)";
+  const codexWorkers = listCodexWorkers();
+  const ttsLane = getLane(ORCH_TTS_LANE_ID);
+  const whisperLane = getLane(ORCH_WHISPER_LANE_ID);
+  const routerModel = String(ORCH_ROUTER_MODEL || CODEX_MODEL || "").trim() || "(default)";
+  const routerReasoning = String(ORCH_ROUTER_REASONING_EFFORT || "").trim() || "(default)";
+
   const lines = [
     "Bot status",
-    `- busy: ${Boolean(currentJob)}`,
-    `- current: ${current}`,
+    `- workers: ${codexWorkers.length}/${ORCH_MAX_CODEX_WORKERS}`,
+    `- active_worker: ${activeWorkerId}`,
     `- queue: ${queued}/${queueCap}`,
     `- active_session: ${activeSession ? shortSessionId(activeSession) : "(none)"}`,
     `- exec_mode: ${codexMode.mode}`,
+    `- router: ${ORCH_ROUTER_ENABLED ? "enabled" : "disabled"} (model=${routerModel}, reasoning=${routerReasoning})`,
     `- model: ${effectiveModel}${prefs.model ? " (chat override)" : ""}`,
     `- reasoning: ${effectiveReasoning}${prefs.reasoning ? " (chat override)" : ""}`,
     `- full_access: ${CODEX_DANGEROUS_FULL_ACCESS}`,
     `- sandbox: ${CODEX_SANDBOX}`,
     `- approval: ${CODEX_APPROVAL_POLICY}`,
     `- whisper: ${WHISPER_ENABLED ? "enabled" : "disabled"}`,
-    `- workdir: ${codexMode.workdir}`,
+    `- general_workdir: ${String(getCodexWorker(ORCH_GENERAL_WORKER_ID)?.workdir || CODEX_WORKDIR)}`,
+    `- tts: ${ttsLane?.currentJob ? "busy" : "idle"} (queued=${ttsLane?.queue?.length || 0})`,
+    `- whisper_lane: ${whisperLane?.currentJob ? "busy" : "idle"} (queued=${whisperLane?.queue?.length || 0})`,
     `- time: ${nowIso()}`,
   ];
+
+  if (codexWorkers.length > 0) {
+    lines.push("", "Workers:");
+    for (const w of codexWorkers) {
+      const lane = getLane(w.id);
+      const busy = Boolean(lane?.currentJob);
+      const queuedCount = lane?.queue?.length || 0;
+      const cur = busy && lane?.currentJob
+        ? `#${lane.currentJob.id} ${Math.floor((Date.now() - lane.currentJob.startedAt) / 1000)}s`
+        : "none";
+      const sessionId = getSessionForChatWorker(chatId, w.id);
+      const sessionShort = sessionId ? shortSessionId(sessionId) : "(none)";
+      lines.push(
+        `- ${w.id}: ${w.title} (${w.kind}) busy=${busy} current=${cur} queued=${queuedCount} session=${sessionShort}`,
+      );
+    }
+  }
+
+  await sendMessage(chatId, lines.join("\n"));
+}
+
+async function sendWorkers(chatId) {
+  const activeWorkerId = getActiveWorkerForChat(chatId);
+  const workers = listCodexWorkers();
+
+  const lines = [
+    `Workers (${workers.length}/${ORCH_MAX_CODEX_WORKERS})`,
+    `- active: ${activeWorkerId}`,
+  ];
+
+  if (workers.length === 0) {
+    lines.push("- (none)");
+    await sendMessage(chatId, lines.join("\n"));
+    return;
+  }
+
+  lines.push("", "List:");
+  for (const w of workers) {
+    const lane = getLane(w.id);
+    const busy = Boolean(lane?.currentJob);
+    const queued = lane?.queue?.length || 0;
+    const marker = w.id === activeWorkerId ? "*" : "-";
+    lines.push(
+      `${marker} ${w.id}: ${w.title} (${w.kind}) busy=${busy} queued=${queued} workdir=${String(w.workdir || "").replace(/\\/g, "/")}`,
+    );
+  }
+
+  lines.push(
+    "",
+    "Commands:",
+    "/use <worker_id or title> - switch active workspace",
+    "/spawn <local-path> [title] - create a new repo workspace",
+    "/retire <worker_id> - remove a workspace",
+  );
+
   await sendMessage(chatId, lines.join("\n"));
 }
 
@@ -1917,12 +2866,15 @@ async function sendModelPicker(chatId) {
 }
 
 async function sendQueue(chatId) {
-  if (queue.length === 0) {
+  const items = listQueuedJobsForChat(chatId);
+  if (items.length === 0) {
     await sendMessage(chatId, "Queue is empty.");
     return;
   }
   const lines = ["Queued prompts:"];
-  for (const item of queue.slice(0, 10)) {
+  for (const entry of items.slice(0, 10)) {
+    const item = entry.job;
+    const laneId = String(entry.laneId || "").trim();
     const kind = String(item?.kind || "codex");
     let preview = "";
     if (kind === "tts-batch") {
@@ -1937,10 +2889,13 @@ async function sendQueue(chatId) {
       if (kind === "tts") preview = `[tts] ${preview}`;
       if (kind === "raw") preview = `[raw] ${preview}`;
     }
-    lines.push(`- #${item.id}: ${preview}`);
+    const workerId = String(item?.workerId || "").trim();
+    const worker = workerId ? getCodexWorker(workerId) : null;
+    const label = worker ? `${worker.id}:${worker.title}` : laneId || "(unknown)";
+    lines.push(`- #${item.id} (${label}): ${preview}`);
   }
-  if (queue.length > 10) {
-    lines.push(`- ...and ${queue.length - 10} more`);
+  if (items.length > 10) {
+    lines.push(`- ...and ${items.length - 10} more`);
   }
   await sendMessage(chatId, lines.join("\n"));
 }
@@ -2010,51 +2965,73 @@ async function sendCodexCommandMenu(chatId) {
 }
 
 async function cancelCurrent(chatId) {
-  if (!currentJob || !currentJob.process) {
+  const jobs = listActiveJobsForChat(chatId);
+  if (jobs.length === 0) {
     await sendMessage(chatId, "No active AIDOLON run to cancel.");
     return;
   }
-  if (String(currentJob.chatId || "") !== String(chatId || "")) {
-    await sendMessage(chatId, `AIDOLON is busy with another chat (job #${currentJob.id}).`);
-    return;
-  }
-  currentJob.cancelRequested = true;
-  try {
-    if (currentJob.abortController instanceof AbortController) {
-      currentJob.abortController.abort();
+
+  for (const item of jobs) {
+    const job = item.job;
+    if (!job) continue;
+    job.cancelRequested = true;
+    try {
+      if (job.abortController instanceof AbortController) {
+        job.abortController.abort();
+      }
+    } catch {
+      // best effort
     }
-  } catch {
-    // best effort
+    if (job.process) {
+      terminateChildTree(job.process, { forceAfterMs: 2000 });
+    }
   }
-  terminateChildTree(currentJob.process, { forceAfterMs: 2000 });
-  await sendMessage(chatId, `Cancellation requested for job #${currentJob.id}.`);
+
+  const label = jobs.length === 1 ? `job #${jobs[0].job?.id}` : `${jobs.length} job(s)`;
+  await sendMessage(chatId, `Cancellation requested for ${label}.`);
 }
 
 async function clearQueue(chatId) {
-  const count = queue.length;
-  queue.length = 0;
-  await sendMessage(chatId, `Cleared ${count} queued prompt(s).`);
+  const removed = dropQueuedJobsForChat(chatId);
+  await sendMessage(chatId, `Cleared ${removed} queued prompt(s).`);
 }
 
-async function enqueueRawCodexCommand(chatId, args, source = "cmd") {
+async function enqueueRawCodexCommand(chatId, args, source = "cmd", options = {}) {
   const tokens = Array.isArray(args) ? [...args] : [];
   if (tokens.length === 0) {
     await sendMessage(chatId, "No AIDOLON command to run.");
     return;
   }
-  if (MAX_QUEUE_SIZE > 0 && queue.length >= MAX_QUEUE_SIZE) {
+
+  const requestedWorkerId = String(options?.workerId || "").trim();
+  const workerId = requestedWorkerId || getActiveWorkerForChat(chatId);
+  const lane = ensureWorkerLane(workerId) || ensureWorkerLane(ORCH_GENERAL_WORKER_ID);
+  if (!lane) {
+    await sendMessage(chatId, "No available worker to run this command.");
+    return;
+  }
+
+  if (MAX_QUEUE_SIZE > 0 && totalQueuedJobs() >= MAX_QUEUE_SIZE) {
     await sendMessage(chatId, `Queue is full (${MAX_QUEUE_SIZE}). Use /queue or /clear.`);
     return;
   }
+
+  if (options?.setActiveWorker !== false) {
+    setActiveWorkerForChat(chatId, lane.id);
+  }
+  touchWorker(lane.id);
 
   const job = {
     id: nextJobId++,
     chatId,
     source,
     kind: "raw",
+    workerId: lane.id,
     rawArgs: tokens,
     resumeSessionId: "",
     text: "",
+    workdir: lane.workdir,
+    replyToMessageId: Number(options?.replyToMessageId || 0),
     startedAt: 0,
     cancelRequested: false,
     timedOut: false,
@@ -2064,14 +3041,14 @@ async function enqueueRawCodexCommand(chatId, args, source = "cmd") {
     outputFile: "",
   };
 
-  queue.push(job);
-  void processQueue();
+  lane.queue.push(job);
+  void processLane(lane.id);
 }
 
 async function runRawCodexJob(job) {
   let spec;
   try {
-    spec = buildRawCodexSpec(job.rawArgs);
+    spec = buildRawCodexSpec(job);
   } catch (err) {
     return {
       ok: false,
@@ -2191,7 +3168,8 @@ async function handleCommand(chatId, text) {
       return true;
     case "/start":
       // Telegram's /start should behave like "new chat": clear any active resumed session.
-      clearActiveSessionForChat(chatId);
+      clearAllSessionsForChat(chatId);
+      setActiveWorkerForChat(chatId, ORCH_GENERAL_WORKER_ID);
       clearLastImageForChat(chatId);
       await sendHelp(chatId);
       return true;
@@ -2202,6 +3180,83 @@ async function handleCommand(chatId, text) {
     case "/status":
       await sendStatus(chatId);
       return true;
+    case "/workers":
+      await sendWorkers(chatId);
+      return true;
+    case "/use": {
+      const arg = String(parsed.arg || "").trim();
+      if (!arg) {
+        await sendMessage(chatId, "Usage: /use <worker_id or title>\nTip: use /workers to list workers.");
+        return true;
+      }
+      const wid = resolveWorkerIdFromUserInput(arg);
+      if (!wid) {
+        await sendMessage(chatId, `Unknown worker: ${arg}\nUse /workers to list workers.`);
+        return true;
+      }
+      setActiveWorkerForChat(chatId, wid);
+      touchWorker(wid);
+      await sendMessage(chatId, `Active workspace set to: ${wid}`);
+      return true;
+    }
+    case "/spawn": {
+      const arg = String(parsed.arg || "").trim();
+      if (!arg) {
+        await sendMessage(chatId, "Usage: /spawn <local-path> [title]\nExample: /spawn C:/path/to/repo MyRepo");
+        return true;
+      }
+      const parts = parseArgString(arg);
+      const rawPath = String(parts[0] || "").trim();
+      const title = parts.length > 1 ? parts.slice(1).join(" ").trim() : "";
+      const workdir = resolveWorkdirInput(rawPath);
+      if (!workdir || !fs.existsSync(workdir)) {
+        await sendMessage(chatId, "That path does not exist. Please send an existing local path.");
+        return true;
+      }
+      const existing = findWorkerByWorkdir(workdir);
+      if (existing) {
+        setActiveWorkerForChat(chatId, existing);
+        touchWorker(existing);
+        await sendMessage(chatId, `Using existing workspace ${existing} (${String(getCodexWorker(existing)?.title || existing)}).`);
+        return true;
+      }
+      const count = listCodexWorkers().length;
+      if (count >= ORCH_MAX_CODEX_WORKERS) {
+        await sendMessage(chatId, `Worker limit reached (${ORCH_MAX_CODEX_WORKERS}). Retire one with /retire <worker_id> first, or use an existing worker.`);
+        return true;
+      }
+      let wid = "";
+      try {
+        wid = createRepoWorker(workdir, title);
+      } catch (err) {
+        await sendMessage(chatId, `Failed to create workspace: ${String(err?.message || err)}`);
+        return true;
+      }
+      setActiveWorkerForChat(chatId, wid);
+      touchWorker(wid);
+      await sendMessage(chatId, `Created workspace ${wid} (${String(getCodexWorker(wid)?.title || wid)}).`);
+      return true;
+    }
+    case "/retire": {
+      const arg = String(parsed.arg || "").trim();
+      if (!arg) {
+        await sendMessage(chatId, "Usage: /retire <worker_id>\nTip: use /workers to list workers.");
+        return true;
+      }
+      const wid = resolveWorkerIdFromUserInput(arg);
+      if (!wid) {
+        await sendMessage(chatId, `Unknown worker: ${arg}\nUse /workers to list workers.`);
+        return true;
+      }
+      try {
+        retireWorker(wid);
+      } catch (err) {
+        await sendMessage(chatId, `Failed to retire worker: ${String(err?.message || err)}`);
+        return true;
+      }
+      await sendMessage(chatId, `Retired worker: ${wid}`);
+      return true;
+    }
     case "/queue":
       await sendQueue(chatId);
       return true;
@@ -2456,23 +3511,44 @@ async function enqueuePrompt(chatId, inputText, source, options = {}) {
     return;
   }
 
-  if (MAX_QUEUE_SIZE > 0 && queue.length >= MAX_QUEUE_SIZE) {
+  const requestedWorkerId = String(options?.workerId || "").trim();
+  const workerId = requestedWorkerId || getActiveWorkerForChat(chatId);
+  const lane = ensureWorkerLane(workerId) || ensureWorkerLane(ORCH_GENERAL_WORKER_ID);
+  if (!lane) {
+    await sendMessage(chatId, "No available worker to handle this prompt.");
+    return;
+  }
+
+  if (MAX_QUEUE_SIZE > 0 && totalQueuedJobs() >= MAX_QUEUE_SIZE) {
     await sendMessage(chatId, `Queue is full (${MAX_QUEUE_SIZE}). Use /queue or /clear.`);
     return;
   }
+
+  if (options?.setActiveWorker !== false) {
+    setActiveWorkerForChat(chatId, lane.id);
+  }
+  touchWorker(lane.id);
+
+  const resumeSessionId = Object.prototype.hasOwnProperty.call(options || {}, "resumeSessionId")
+    ? String(options.resumeSessionId || "").trim()
+    : getActiveSessionForChat(chatId, lane.id);
 
   const job = {
     id: nextJobId++,
     chatId,
     text,
     source,
+    kind: "codex",
+    workerId: lane.id,
     replyStyle: String(options.replyStyle || "").trim(),
-    resumeSessionId: String(options.resumeSessionId || "").trim(),
+    resumeSessionId,
     model: String(options.model || "").trim(),
     reasoning: String(options.reasoning || "").trim(),
     imagePaths: Array.isArray(options.imagePaths)
       ? options.imagePaths.map((p) => String(p || "").trim()).filter(Boolean)
       : [],
+    workdir: lane.workdir,
+    replyToMessageId: Number(options?.replyToMessageId || 0),
     startedAt: 0,
     cancelRequested: false,
     timedOut: false,
@@ -2482,8 +3558,8 @@ async function enqueuePrompt(chatId, inputText, source, options = {}) {
     outputFile: path.join(OUT_DIR, `codex-job-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`),
   };
 
-  queue.push(job);
-  void processQueue();
+  lane.queue.push(job);
+  void processLane(lane.id);
 }
 
 function normalizeTtsText(text) {
@@ -2613,9 +3689,11 @@ function extractAttachDirectives(text) {
   return { text: kept.join("\n").trim(), attachments };
 }
 
-async function sendAttachments(chatId, attachments) {
+async function sendAttachments(chatId, attachments, options = {}) {
   if (!ATTACH_ENABLED) return;
   const list = Array.isArray(attachments) ? attachments : [];
+  const replyToMessageId = Number(options.replyToMessageId || 0);
+  const routeWorkerId = String(options.routeWorkerId || "").trim();
   for (const item of list) {
     const rawPath = String(item?.path || "").trim();
     if (!rawPath) continue;
@@ -2630,7 +3708,13 @@ async function sendAttachments(chatId, attachments) {
     const caption = String(item?.caption || "").trim();
     const fileName = path.basename(resolved);
     try {
-      await sendDocument(chatId, resolved, { caption, fileName, timeoutMs: ATTACH_UPLOAD_TIMEOUT_MS });
+      await sendDocument(chatId, resolved, {
+        caption,
+        fileName,
+        timeoutMs: ATTACH_UPLOAD_TIMEOUT_MS,
+        replyToMessageId,
+        routeWorkerId,
+      });
     } catch (err) {
       await sendMessage(chatId, `Failed to send attachment ${fileName}: ${String(err?.message || err)}`);
     }
@@ -2876,20 +3960,25 @@ async function enqueueTts(chatId, inputText, source, options = {}) {
     await sendMessage(chatId, "Empty TTS text ignored.");
     return false;
   }
-  if (MAX_QUEUE_SIZE > 0 && queue.length >= MAX_QUEUE_SIZE) {
+
+  const lane = ensureTtsLane();
+  if (MAX_QUEUE_SIZE > 0 && totalQueuedJobs() >= MAX_QUEUE_SIZE) {
     await sendMessage(chatId, `Queue is full (${MAX_QUEUE_SIZE}). Use /queue or /clear.`);
     return false;
   }
 
+  const workerId = String(options?.workerId || "").trim() || getActiveWorkerForChat(chatId);
   const job = {
     id: nextJobId++,
     chatId,
     text,
     source,
     kind: "tts",
+    workerId,
     afterText: String(options.afterText || "").trim(),
     skipResultText: options.skipResultText === true,
     attachments: Array.isArray(options.attachments) ? options.attachments : [],
+    replyToMessageId: Number(options?.replyToMessageId || 0),
     startedAt: 0,
     cancelRequested: false,
     timedOut: false,
@@ -2898,8 +3987,8 @@ async function enqueueTts(chatId, inputText, source, options = {}) {
     stderrTail: "",
   };
 
-  queue.push(job);
-  void processQueue();
+  lane.queue.push(job);
+  void processLane(lane.id);
   return true;
 }
 
@@ -2910,20 +3999,25 @@ async function enqueueTtsBatch(chatId, inputTexts, source, options = {}) {
     await sendMessage(chatId, "Empty TTS text ignored.");
     return false;
   }
-  if (MAX_QUEUE_SIZE > 0 && queue.length >= MAX_QUEUE_SIZE) {
+
+  const lane = ensureTtsLane();
+  if (MAX_QUEUE_SIZE > 0 && totalQueuedJobs() >= MAX_QUEUE_SIZE) {
     await sendMessage(chatId, `Queue is full (${MAX_QUEUE_SIZE}). Use /queue or /clear.`);
     return false;
   }
 
+  const workerId = String(options?.workerId || "").trim() || getActiveWorkerForChat(chatId);
   const job = {
     id: nextJobId++,
     chatId,
     texts,
     source,
     kind: "tts-batch",
+    workerId,
     afterText: String(options.afterText || "").trim(),
     skipResultText: options.skipResultText === true,
     attachments: Array.isArray(options.attachments) ? options.attachments : [],
+    replyToMessageId: Number(options?.replyToMessageId || 0),
     startedAt: 0,
     cancelRequested: false,
     timedOut: false,
@@ -2932,8 +4026,8 @@ async function enqueueTtsBatch(chatId, inputTexts, source, options = {}) {
     stderrTail: "",
   };
 
-  queue.push(job);
-  void processQueue();
+  lane.queue.push(job);
+  void processLane(lane.id);
   return true;
 }
 
@@ -3121,7 +4215,7 @@ function buildTtsPostprocessFiltergraph(ffmpegBin) {
   return graph;
 }
 
-async function runTtsJob(job) {
+async function runTtsJob(job, lane) {
   let slowNotifyTimer = null;
   const isVoiceReply = String(job?.source || "").trim().toLowerCase() === "voice-reply";
   const afterText = String(job?.afterText || "").trim();
@@ -3207,12 +4301,12 @@ async function runTtsJob(job) {
   ) {
     slowNotifyTimer = setTimeout(() => {
       if (shuttingDown) return;
-      if (currentJob !== job) return;
+      if (lane?.currentJob !== job) return;
       if (job.cancelRequested) return;
       void sendMessage(
         job.chatId,
         "Still generating a voice reply. Use /stop to cancel if needed.",
-        { silent: true },
+        { silent: true, replyToMessageId: job.replyToMessageId, routeWorkerId: job.workerId },
       ).catch(() => {});
     }, TTS_VOICE_REPLY_NOTIFY_AFTER_SEC * 1000);
   }
@@ -3584,7 +4678,7 @@ async function runTtsJob(job) {
     const uploadTimeoutMs = minPositive([TTS_UPLOAD_TIMEOUT_MS, hardTimeoutRemainingMs(job, TTS_HARD_TIMEOUT_MS)]);
     lastUploadTimeoutMs = uploadTimeoutMs;
     try {
-      await sendVoice(job.chatId, oggPath, { timeoutMs: uploadTimeoutMs, signal: abortSignal });
+      await sendVoice(job.chatId, oggPath, { timeoutMs: uploadTimeoutMs, signal: abortSignal, replyToMessageId: job.replyToMessageId, routeWorkerId: job.workerId });
       uploadErr = null;
       break;
     } catch (err) {
@@ -3649,7 +4743,7 @@ async function runTtsJob(job) {
   }
 }
 
-async function runTtsBatchJob(job) {
+async function runTtsBatchJob(job, lane) {
   let slowNotifyTimer = null;
   const isVoiceReply = String(job?.source || "").trim().toLowerCase() === "voice-reply";
   const afterText = String(job?.afterText || "").trim();
@@ -3745,12 +4839,12 @@ async function runTtsBatchJob(job) {
   ) {
     slowNotifyTimer = setTimeout(() => {
       if (shuttingDown) return;
-      if (currentJob !== job) return;
+      if (lane?.currentJob !== job) return;
       if (job.cancelRequested) return;
       void sendMessage(
         job.chatId,
         "Still generating a voice reply. Use /stop to cancel if needed.",
-        { silent: true },
+        { silent: true, replyToMessageId: job.replyToMessageId, routeWorkerId: job.workerId },
       ).catch(() => {});
     }, TTS_VOICE_REPLY_NOTIFY_AFTER_SEC * 1000);
   }
@@ -4135,7 +5229,7 @@ async function runTtsBatchJob(job) {
         const uploadTimeoutMs = minPositive([TTS_UPLOAD_TIMEOUT_MS, hardTimeoutRemainingMs(job, TTS_HARD_TIMEOUT_MS)]);
         lastUploadTimeoutMs = uploadTimeoutMs;
         try {
-          await sendVoice(job.chatId, oggPath, { timeoutMs: uploadTimeoutMs, signal: abortSignal });
+          await sendVoice(job.chatId, oggPath, { timeoutMs: uploadTimeoutMs, signal: abortSignal, replyToMessageId: job.replyToMessageId, routeWorkerId: job.workerId });
           sentCount = idx + 1;
           uploadErr = null;
           break;
@@ -4237,12 +5331,16 @@ function isProgressNoiseLine(line) {
   return false;
 }
 
-function startJobProgressUpdates(job) {
+function startJobProgressUpdates(job, lane) {
   if (!PROGRESS_UPDATES_ENABLED) {
     return () => {};
   }
   // TTS jobs are intentionally noisy (model load, encode, ffmpeg). Don't stream that into Telegram.
   if (String(job?.kind || "") === "tts" || String(job?.kind || "") === "tts-batch") {
+    return () => {};
+  }
+  // Whisper transcription is also noisy and not useful as progress messages.
+  if (String(job?.kind || "") === "whisper") {
     return () => {};
   }
   // For voice-note prompts that will be answered via voice notes, avoid sending text "progress" pings.
@@ -4263,7 +5361,7 @@ function startJobProgressUpdates(job) {
   const debounceMs = 250;
 
   const flush = async () => {
-    if (stopped || shuttingDown || currentJob !== job) return;
+    if (stopped || shuttingDown || lane?.currentJob !== job) return;
     const line = String(job.progressPendingLine || "").trim();
     if (!line) return;
     if (line === String(job.progressLastSentLine || "")) return;
@@ -4273,7 +5371,11 @@ function startJobProgressUpdates(job) {
     job.progressLastSentAt = Date.now();
 
     try {
-      await sendMessage(job.chatId, line, { silent: true });
+      await sendMessage(job.chatId, line, {
+        silent: true,
+        replyToMessageId: job.replyToMessageId,
+        routeWorkerId: job.workerId,
+      });
     } catch (err) {
       log(`sendMessage(progress) failed: ${redactError(err.message || err)}`);
     }
@@ -4284,7 +5386,7 @@ function startJobProgressUpdates(job) {
   };
 
   const schedule = () => {
-    if (stopped || shuttingDown || currentJob !== job) return;
+    if (stopped || shuttingDown || lane?.currentJob !== job) return;
     if (timer) return;
     if (!job.progressPendingLine) return;
 
@@ -4301,7 +5403,7 @@ function startJobProgressUpdates(job) {
   };
 
   const ingest = (chunkText, streamName) => {
-    if (stopped || shuttingDown || currentJob !== job) return;
+    if (stopped || shuttingDown || lane?.currentJob !== job) return;
     // Forwarding stderr into Telegram tends to produce spammy log lines. Keep it opt-in.
     if (String(streamName || "") === "stderr" && !PROGRESS_INCLUDE_STDERR) return;
     const chunk = String(chunkText || "");
@@ -4346,10 +5448,10 @@ async function runCodexJob(job) {
       ok: false,
       text: `Failed to prepare AIDOLON execution: ${err.message || err}`,
     };
-  }
-
-  return await new Promise((resolve) => {
-    let done = false;
+    }
+ 
+    return await new Promise((resolve) => {
+      let done = false;
 
     const finish = (result) => {
       if (done) return;
@@ -4370,7 +5472,7 @@ async function runCodexJob(job) {
       return;
     }
 
-    job.process = child;
+      job.process = child;
     if (typeof spec.stdinText === "string") {
       try {
         child.stdin.end(spec.stdinText);
@@ -4385,11 +5487,14 @@ async function runCodexJob(job) {
       }
     }
 
-    const timeout = CODEX_TIMEOUT_MS > 0
+    const timeoutMs = Number.isFinite(Number(job?.timeoutMs)) && Number(job.timeoutMs) > 0
+      ? Number(job.timeoutMs)
+      : CODEX_TIMEOUT_MS;
+    const timeout = timeoutMs > 0
       ? setTimeout(() => {
         job.timedOut = true;
         terminateChildTree(child, { forceAfterMs: 3000 });
-      }, CODEX_TIMEOUT_MS)
+      }, timeoutMs)
       : null;
 
     child.stdout.on("data", (buf) => {
@@ -4440,7 +5545,7 @@ async function runCodexJob(job) {
         finish({
           ok: false,
           sessionId,
-          text: `Job #${job.id} timed out after ${Math.round(CODEX_TIMEOUT_MS / 1000)}s.${tail ? `\n\n${tail}` : ""}`,
+          text: `Job #${job.id} timed out after ${Math.round(timeoutMs / 1000)}s.${tail ? `\n\n${tail}` : ""}`,
         });
         return;
       }
@@ -4471,43 +5576,51 @@ async function runCodexJob(job) {
   });
 }
 
-async function processQueue() {
-  if (currentJob || shuttingDown) return;
+async function processLane(laneId) {
+  const lane = getLane(laneId);
+  if (!lane || shuttingDown) return;
+  if (lane.currentJob) return;
 
-  while (queue.length > 0 && !shuttingDown) {
-    const job = queue.shift();
-    currentJob = job;
+  while (Array.isArray(lane.queue) && lane.queue.length > 0 && !shuttingDown) {
+    const job = lane.queue.shift();
+    lane.currentJob = job;
     job.startedAt = Date.now();
     // Allow cancellation to abort in-flight fetch() operations (Telegram uploads).
     job.abortController = new AbortController();
-    const stopProgressUpdates = startJobProgressUpdates(job);
+    const stopProgressUpdates = startJobProgressUpdates(job, lane);
 
     let result;
     try {
-      try {
-        result = job.kind === "raw"
-          ? await runRawCodexJob(job)
-          : job.kind === "tts"
-            ? await runTtsJob(job)
-            : job.kind === "tts-batch"
-              ? await runTtsBatchJob(job)
-              : await runCodexJob(job);
-      } catch (err) {
-        const msg = String(err?.message || err || "").trim() || "Unknown error";
-        result = { ok: false, text: `Job #${job.id} failed unexpectedly: ${msg}` };
-      }
+        try {
+          result = job.kind === "raw"
+            ? await runRawCodexJob(job)
+            : job.kind === "tts"
+              ? await runTtsJob(job, lane)
+              : job.kind === "tts-batch"
+                ? await runTtsBatchJob(job, lane)
+                : job.kind === "whisper"
+                  ? await runWhisperJob(job, lane)
+                  : await runCodexJob(job);
+        } catch (err) {
+          const msg = String(err?.message || err || "").trim() || "Unknown error";
+          result = { ok: false, text: `Job #${job.id} failed unexpectedly: ${msg}` };
+        }
     } finally {
       stopProgressUpdates();
     }
 
-    if (result.ok) {
+    if (result && result.ok) {
       const resolvedSessionId = String(result.sessionId || job.resumeSessionId || "").trim();
       if (resolvedSessionId) {
-        setActiveSessionForChat(job.chatId, resolvedSessionId);
+        const wid = String(job?.workerId || "").trim() || String(lane.id || "").trim() || ORCH_GENERAL_WORKER_ID;
+        setSessionForChatWorker(job.chatId, wid, resolvedSessionId);
       }
     }
 
     try {
+      const routeWorkerId = String(job?.workerId || "").trim() || String(lane.id || "").trim();
+      const replyToMessageId = Number(job?.replyToMessageId || 0);
+
       const attachParsed = extractAttachDirectives(String(result?.text || ""));
       const attachments = Array.isArray(attachParsed.attachments) ? attachParsed.attachments : [];
       const resultAfterText = String(result?.afterText || "").trim();
@@ -4548,12 +5661,16 @@ async function processQueue() {
               // Even if TTS_SEND_TEXT=1 globally, don't duplicate the spoken content for voice replies.
               skipResultText: true,
               attachments,
+              workerId: routeWorkerId,
+              replyToMessageId,
             })
             : await enqueueTts(job.chatId, chunks[0] || spoken, "voice-reply", {
               afterText,
               // Even if TTS_SEND_TEXT=1 globally, don't duplicate the spoken content for voice replies.
               skipResultText: true,
               attachments,
+              workerId: routeWorkerId,
+              replyToMessageId,
             });
         } catch (err) {
           // If voice enqueue fails, fall back to sending text so the user still gets an answer.
@@ -4564,7 +5681,10 @@ async function processQueue() {
 
       if (!result || (result.skipSendMessage !== true && !(shouldVoiceReply && voiceQueued))) {
         try {
-          await sendMessage(job.chatId, normalizeResponse(result?.text));
+          await sendMessage(job.chatId, normalizeResponse(result?.text), {
+            replyToMessageId,
+            routeWorkerId,
+          });
         } catch (err) {
           log(`sendMessage(result) failed: ${redactError(err.message || err)}`);
         }
@@ -4572,7 +5692,7 @@ async function processQueue() {
 
       if (resultAfterText && !(shouldVoiceReply && voiceQueued)) {
         try {
-          await sendMessage(job.chatId, resultAfterText);
+          await sendMessage(job.chatId, resultAfterText, { replyToMessageId, routeWorkerId });
         } catch (err) {
           log(`sendMessage(afterText) failed: ${redactError(err?.message || err)}`);
         }
@@ -4581,29 +5701,30 @@ async function processQueue() {
       // If we replied via voice, attachments will be sent by the TTS job(s) to keep ordering sane.
       if (allAttachments.length > 0 && !(shouldVoiceReply && voiceQueued)) {
         try {
-          await sendAttachments(job.chatId, allAttachments);
+          await sendAttachments(job.chatId, allAttachments, { replyToMessageId, routeWorkerId });
         } catch (err) {
           log(`sendAttachments(result) failed: ${redactError(err?.message || err)}`);
         }
       }
     } catch (err) {
-      log(`processQueue(post) failed: ${redactError(err?.message || err)}`);
+      log(`processLane(post) failed: ${redactError(err?.message || err)}`);
     } finally {
-      currentJob = null;
+      lane.currentJob = null;
     }
   }
 }
 
-async function getTelegramFileMeta(fileId) {
+async function getTelegramFileMeta(fileId, { signal } = {}) {
   const params = new URLSearchParams({ file_id: String(fileId || "") });
   return await telegramApi("getFile", {
     query: params.toString(),
+    signal,
   });
 }
 
-async function downloadTelegramFile(filePath, destinationPath) {
+async function downloadTelegramFile(filePath, destinationPath, { signal } = {}) {
   const url = `https://api.telegram.org/file/bot${TOKEN}/${filePath}`;
-  const res = await fetch(url);
+  const res = await fetch(url, { signal });
   if (!res.ok) {
     throw new Error(`File download failed: HTTP ${res.status}`);
   }
@@ -4615,7 +5736,7 @@ async function downloadTelegramFile(filePath, destinationPath) {
   return fs.statSync(destinationPath).size;
 }
 
-async function transcribeAudioWithWhisper(audioPath) {
+async function transcribeAudioWithWhisper(audioPath, { abortSignal, job } = {}) {
   if (!WHISPER_ENABLED) {
     throw new Error("Voice transcription disabled");
   }
@@ -4640,9 +5761,33 @@ async function transcribeAudioWithWhisper(audioPath) {
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    if (job && typeof job === "object") {
+      job.process = py;
+    }
 
     let stdout = "";
     let stderr = "";
+
+    let aborted = false;
+    const onAbort = () => {
+      aborted = true;
+      try {
+        terminateChildTree(py, { forceAfterMs: 1500 });
+      } catch {
+        // best effort
+      }
+    };
+    if (abortSignal && typeof abortSignal === "object") {
+      try {
+        if (abortSignal.aborted) {
+          onAbort();
+        } else if (typeof abortSignal.addEventListener === "function") {
+          abortSignal.addEventListener("abort", onAbort, { once: true });
+        }
+      } catch {
+        // best effort
+      }
+    }
 
     py.stdout.on("data", (buf) => {
       const chunk = String(buf || "");
@@ -4658,6 +5803,17 @@ async function transcribeAudioWithWhisper(audioPath) {
       reject(new Error(`Whisper process error: ${err.message || err}`));
     });
     py.on("close", (code) => {
+      try {
+        if (abortSignal && typeof abortSignal.removeEventListener === "function") {
+          abortSignal.removeEventListener("abort", onAbort);
+        }
+      } catch {
+        // best effort
+      }
+      if (aborted) {
+        reject(new Error("Whisper canceled."));
+        return;
+      }
       if (code !== 0) {
         reject(new Error(stderr.trim() || `Whisper failed with exit ${code}`));
         return;
@@ -4665,6 +5821,84 @@ async function transcribeAudioWithWhisper(audioPath) {
       resolve(stdout.trim());
     });
   });
+}
+
+async function runWhisperJob(job) {
+  const chatId = String(job?.chatId || "").trim();
+  if (!chatId) {
+    return { ok: false, text: "Voice transcription failed: missing chat id." };
+  }
+  if (!WHISPER_ENABLED) {
+    return { ok: false, text: "Voice messages are disabled." };
+  }
+
+  const abortSignal = job?.abortController?.signal;
+  const fileId = String(job?.fileId || "").trim();
+  if (!fileId) {
+    return { ok: false, text: "Voice message missing file id." };
+  }
+
+  const limMb = Number(WHISPER_MAX_FILE_MB);
+  const maxBytes = Number.isFinite(limMb) && limMb > 0 ? limMb * 1024 * 1024 : Infinity;
+  const declaredBytes = Number(job?.declaredBytes || 0);
+  if (Number.isFinite(maxBytes) && declaredBytes > 0 && declaredBytes > maxBytes) {
+    return { ok: false, text: `Voice message too large (${Math.round(declaredBytes / (1024 * 1024))}MB). Max is ${WHISPER_MAX_FILE_MB}MB.` };
+  }
+
+  const fileMeta = await getTelegramFileMeta(fileId, { signal: abortSignal });
+  const remotePath = String(fileMeta?.file_path || "");
+  if (!remotePath) {
+    return { ok: false, text: "Could not resolve Telegram voice file path." };
+  }
+
+  const ext = path.extname(remotePath) || ".ogg";
+  const localPath = path.join(
+    VOICE_DIR,
+    `voice-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`,
+  );
+
+  try {
+    await downloadTelegramFile(remotePath, localPath, { signal: abortSignal });
+
+    const transcript = String(await transcribeAudioWithWhisper(localPath, { abortSignal, job })).trim();
+    if (job.cancelRequested) {
+      return { ok: false, text: "Voice transcription canceled." };
+    }
+    if (!transcript) {
+      return { ok: false, text: "No speech detected in voice message." };
+    }
+
+    const user = String(job?.user || "").trim();
+    logChat("in", chatId, transcript, { source: "voice-transcript", user: user || "unknown" });
+
+    const replyToMessageId = Number(job?.replyToMessageId || 0);
+    const replyHintMessageId = Number(job?.replyHintMessageId || 0);
+    const replyHintWorkerId = replyHintMessageId > 0 ? lookupReplyRouteWorker(chatId, replyHintMessageId) : "";
+
+    await routeAndEnqueuePrompt(chatId, transcript, "voice", {
+      replyStyle: TTS_REPLY_TO_VOICE && TTS_ENABLED ? "voice" : "",
+      replyToMessageId,
+      replyHintWorkerId,
+    });
+
+    // The whisper job itself should not emit a Telegram message; it schedules the real Codex job.
+    return { ok: true, text: "", skipSendMessage: true };
+  } catch (err) {
+    if (job.cancelRequested) {
+      return { ok: false, text: "Voice transcription canceled." };
+    }
+    const msg = String(err?.message || err || "");
+    if (/whisper canceled/i.test(msg) || /aborted/i.test(msg)) {
+      return { ok: false, text: "Voice transcription canceled." };
+    }
+    return { ok: false, text: `Voice transcription failed: ${msg}` };
+  } finally {
+    try {
+      if (fs.existsSync(localPath)) fs.unlinkSync(localPath);
+    } catch {
+      // best effort
+    }
+  }
 }
 
 async function handleVoiceMessage(msg) {
@@ -4685,43 +5919,48 @@ async function handleVoiceMessage(msg) {
     return;
   }
 
-  const fileMeta = await getTelegramFileMeta(fileId);
-  const remotePath = String(fileMeta?.file_path || "");
-  if (!remotePath) {
-    await sendMessage(chatId, "Could not resolve Telegram voice file path.");
+  const limMb = Number(WHISPER_MAX_FILE_MB);
+  const maxBytes = Number.isFinite(limMb) && limMb > 0 ? limMb * 1024 * 1024 : Infinity;
+  const declaredBytes = Number(voice?.file_size || 0);
+  if (Number.isFinite(maxBytes) && declaredBytes > 0 && declaredBytes > maxBytes) {
+    await sendMessage(chatId, `Voice message too large (${Math.round(declaredBytes / (1024 * 1024))}MB). Max is ${WHISPER_MAX_FILE_MB}MB.`);
     return;
   }
 
-  const ext = path.extname(remotePath) || ".ogg";
-  const localPath = path.join(
-    VOICE_DIR,
-    `voice-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`,
-  );
+  const replyHintMessageId = Number(msg?.reply_to_message?.message_id || 0);
+  const replyHintWorkerId = replyHintMessageId > 0 ? lookupReplyRouteWorker(chatId, replyHintMessageId) : "";
+  const routeWorkerId = replyHintWorkerId || getActiveWorkerForChat(chatId) || ORCH_GENERAL_WORKER_ID;
 
-  try {
-    await downloadTelegramFile(remotePath, localPath);
+  const lane = ensureWhisperLane();
+  const job = {
+    id: nextJobId++,
+    chatId,
+    kind: "whisper",
+    source: "whisper",
+    workerId: routeWorkerId,
+    fileId,
+    declaredBytes,
+    user,
+    replyToMessageId: Number(msg?.message_id || 0),
+    replyHintMessageId,
+    workdir: lane.workdir,
+    startedAt: 0,
+    cancelRequested: false,
+    timedOut: false,
+    process: null,
+    stdoutTail: "",
+    stderrTail: "",
+  };
 
-    const transcript = String(await transcribeAudioWithWhisper(localPath)).trim();
-    if (!transcript) {
-      await sendMessage(chatId, "No speech detected in voice message.");
-      return;
-    }
-
-    logChat("in", chatId, transcript, { source: "voice-transcript", user });
-    const activeSession = getActiveSessionForChat(chatId);
-    await enqueuePrompt(chatId, transcript, "voice", {
-      resumeSessionId: activeSession || "",
-      replyStyle: TTS_REPLY_TO_VOICE && TTS_ENABLED ? "voice" : "",
+  if (MAX_QUEUE_SIZE > 0 && totalQueuedJobs() >= MAX_QUEUE_SIZE) {
+    await sendMessage(chatId, `Queue is full (${MAX_QUEUE_SIZE}). Use /queue or /clear.`, {
+      replyToMessageId: Number(msg?.message_id || 0),
     });
-  } catch (err) {
-    await sendMessage(chatId, `Voice transcription failed: ${err.message || err}`);
-  } finally {
-    try {
-      if (fs.existsSync(localPath)) fs.unlinkSync(localPath);
-    } catch {
-      // best effort
-    }
+    return;
   }
+
+  lane.queue.push(job);
+  void processLane(lane.id);
 }
 
 async function handlePhotoOrImageDocument(msg) {
@@ -4802,10 +6041,13 @@ async function handlePhotoOrImageDocument(msg) {
       return;
     }
 
-    const activeSession = getActiveSessionForChat(chatId);
-    await enqueuePrompt(chatId, caption, "image-caption", {
-      resumeSessionId: activeSession || "",
+    const replyToMessageId = Number(msg?.message_id || 0);
+    const replyHintMessageId = Number(msg?.reply_to_message?.message_id || 0);
+    const replyHintWorkerId = replyHintMessageId > 0 ? lookupReplyRouteWorker(chatId, replyHintMessageId) : "";
+    await routeAndEnqueuePrompt(chatId, caption, "image-caption", {
       imagePaths: [localPath],
+      replyToMessageId,
+      replyHintWorkerId,
     });
   } catch (err) {
     await sendMessage(chatId, `Image handling failed: ${String(err?.message || err)}`);
@@ -4897,6 +6139,62 @@ async function handleCallbackQuery(cb) {
     if (pending) {
       await sendMessage(chatId, `Canceled pending command:\ncodex ${pending.rawLine}`);
     }
+    return;
+  }
+
+  if (data === "orch_retire_cancel") {
+    orchPendingSpawnByChat.delete(String(chatId || "").trim());
+    await answerCallbackQuery(id, "Canceled");
+    await sendMessage(chatId, "Canceled workspace creation.");
+    return;
+  }
+
+  if (data.startsWith("orch_retire:")) {
+    const retireId = data.slice("orch_retire:".length).trim();
+    const pending = orchPendingSpawnByChat.get(String(chatId || "").trim()) || null;
+    if (!pending || typeof pending !== "object") {
+      await answerCallbackQuery(id, "No pending request");
+      return;
+    }
+
+    const desiredWorkdir = String(pending.desiredWorkdir || "").trim();
+    const title = String(pending.title || "").trim();
+    const promptText = String(pending.promptText || "");
+    const source = String(pending.source || "plain").trim() || "plain";
+    const options = pending.options && typeof pending.options === "object" ? { ...pending.options } : {};
+    const replyToMessageId = Number(options.replyToMessageId || 0);
+
+    try {
+      retireWorker(retireId);
+    } catch (err) {
+      await answerCallbackQuery(id, "Failed");
+      await sendMessage(chatId, `Failed to retire worker: ${String(err?.message || err)}`, { replyToMessageId });
+      return;
+    }
+
+    let newWorkerId = "";
+    try {
+      newWorkerId = createRepoWorker(desiredWorkdir, title);
+    } catch (err) {
+      await answerCallbackQuery(id, "Failed");
+      await sendMessage(chatId, `Failed to create workspace: ${String(err?.message || err)}`, { replyToMessageId });
+      return;
+    } finally {
+      orchPendingSpawnByChat.delete(String(chatId || "").trim());
+    }
+
+    await answerCallbackQuery(id, "OK");
+    await sendMessage(chatId, `Using workspace ${newWorkerId}: ${String(getCodexWorker(newWorkerId)?.title || title || newWorkerId)}`, {
+      replyToMessageId,
+      routeWorkerId: newWorkerId,
+    });
+
+    try {
+      await enqueuePrompt(chatId, promptText, source, { ...options, workerId: newWorkerId, replyToMessageId });
+    } catch (err) {
+      await sendMessage(chatId, `Failed to enqueue the request: ${String(err?.message || err)}`, { replyToMessageId });
+    }
+    return;
   }
 }
 
@@ -4935,24 +6233,28 @@ async function handleIncomingMessage(msg) {
   const handled = await handleCommand(chatId, text);
   if (handled) return;
 
+  const replyToMessageId = Number(msg?.message_id || 0);
+  const replyHintMessageId = Number(msg?.reply_to_message?.message_id || 0);
+  const replyHintWorkerId = replyHintMessageId > 0 ? lookupReplyRouteWorker(chatId, replyHintMessageId) : "";
+
   // If vision is enabled and the user sends plain text while an image is "active",
   // treat it as a question about the last image (unless they explicitly used a slash command).
   if (VISION_ENABLED) {
     const img = getLastImageForChat(chatId);
     const freshEnough = img && (VISION_AUTO_FOLLOWUP_SEC <= 0 || (Date.now() - Number(img.at || 0)) <= VISION_AUTO_FOLLOWUP_SEC * 1000);
     if (img && freshEnough) {
-      const activeSession = getActiveSessionForChat(chatId);
-      await enqueuePrompt(chatId, text, "image-followup", {
-        resumeSessionId: activeSession || "",
+      await routeAndEnqueuePrompt(chatId, text, "image-followup", {
         imagePaths: [img.path],
+        replyToMessageId,
+        replyHintWorkerId,
       });
       return;
     }
   }
 
-  const activeSession = getActiveSessionForChat(chatId);
-  await enqueuePrompt(chatId, text, activeSession ? "plain-resume" : "plain", {
-    resumeSessionId: activeSession || "",
+  await routeAndEnqueuePrompt(chatId, text, "plain", {
+    replyToMessageId,
+    replyHintWorkerId,
   });
 }
 
@@ -5017,13 +6319,35 @@ async function shutdown(code = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
 
-  if (currentJob?.process) {
-    try {
-      currentJob.cancelRequested = true;
-      terminateChildTree(currentJob.process, { forceAfterMs: 2000 });
-    } catch {
-      // best effort
+  try {
+    for (const item of listActiveJobs()) {
+      const job = item.job;
+      if (!job) continue;
+      job.cancelRequested = true;
+      try {
+        if (job.abortController instanceof AbortController) {
+          job.abortController.abort();
+        }
+      } catch {
+        // best effort
+      }
+      if (job.process) {
+        try {
+          terminateChildTree(job.process, { forceAfterMs: 2000 });
+        } catch {
+          // best effort
+        }
+      }
     }
+    for (const lane of lanes.values()) {
+      try {
+        if (Array.isArray(lane.queue)) lane.queue = [];
+      } catch {
+        // best effort
+      }
+    }
+  } catch {
+    // best effort
   }
 
   persistState();
