@@ -23,6 +23,10 @@ ENV_KEYS = (
     "TTS_SAMPLE_RATE",
 )
 
+# HuggingFace tokenizers can spawn threads; in practice this has caused rare, hard-to-debug
+# issues when combined with other thread-based runtimes. Disable by default (caller can override).
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 
 def _parse_env_file(env_path: Path) -> dict[str, str]:
     out: dict[str, str] = {}
@@ -243,28 +247,55 @@ def main() -> int:
         print("TTS: synthesizing...", file=sys.stderr)
 
     started = time.perf_counter()
-    for idx, (speak, out_wav) in enumerate(zip(texts, out_wavs)):
+
+    if args.batch_jsonl:
+        # One pipeline call for the whole batch is more robust than calling generate() repeatedly.
         try:
-            audio = tts.generate(speak, ctx)
+            formatted_prompts = [tts.codec.format_prompt(t, ctx, None) for t in texts]
+            responses = tts.pipe(formatted_prompts, gen_config=tts.gen_config, do_preprocess=False)
+            if not isinstance(responses, list):
+                raise TypeError(f"Unexpected pipeline response type: {type(responses)}")
+            if len(responses) != len(texts):
+                raise RuntimeError(f"Unexpected pipeline response count: got {len(responses)}, expected {len(texts)}")
         except Exception as exc:
-            suffix = f" (item {idx})" if args.batch_jsonl else ""
-            print(f"TTS: synthesis failed{suffix}: {exc}", file=sys.stderr)
+            print(f"TTS: synthesis failed (batch): {exc}", file=sys.stderr)
             return 7
 
-        try:
-            _write_wav(out_wav, audio, sample_rate)
-        except Exception as exc:
-            suffix = f" (item {idx})" if args.batch_jsonl else ""
-            print(f"TTS: wav write failed{suffix}: {exc}", file=sys.stderr)
-            return 7
+        for idx, (resp, out_wav) in enumerate(zip(responses, out_wavs)):
+            try:
+                audio = tts.codec.decode(resp.text, ctx)
+            except Exception as exc:
+                print(f"TTS: decode failed (item {idx}): {exc}", file=sys.stderr)
+                return 7
 
-        if not out_wav.is_file():
-            suffix = f" (item {idx})" if args.batch_jsonl else ""
-            print(f"TTS: output WAV missing after synthesis{suffix}.", file=sys.stderr)
-            return 8
+            try:
+                _write_wav(out_wav, audio, sample_rate)
+            except Exception as exc:
+                print(f"TTS: wav write failed (item {idx}): {exc}", file=sys.stderr)
+                return 7
 
-        if args.batch_jsonl:
+            if not out_wav.is_file():
+                print(f"TTS: output WAV missing after synthesis (item {idx}).", file=sys.stderr)
+                return 8
+
             print(str(out_wav), file=sys.stdout)
+    else:
+        for idx, (speak, out_wav) in enumerate(zip(texts, out_wavs)):
+            try:
+                audio = tts.generate(speak, ctx)
+            except Exception as exc:
+                print(f"TTS: synthesis failed: {exc}", file=sys.stderr)
+                return 7
+
+            try:
+                _write_wav(out_wav, audio, sample_rate)
+            except Exception as exc:
+                print(f"TTS: wav write failed: {exc}", file=sys.stderr)
+                return 7
+
+            if not out_wav.is_file():
+                print("TTS: output WAV missing after synthesis.", file=sys.stderr)
+                return 8
 
     elapsed = time.perf_counter() - started
     print(f"TTS: done ({elapsed:.2f}s).", file=sys.stderr)

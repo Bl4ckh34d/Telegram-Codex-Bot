@@ -81,6 +81,64 @@ function toTimeoutMs(value, fallback, min = null, max = null) {
   return clamped;
 }
 
+function combineAbortSignals(signals) {
+  const list = Array.isArray(signals) ? signals.filter(Boolean) : [];
+  if (list.length === 0) return { signal: undefined, cleanup: () => {} };
+  if (globalThis.AbortSignal && typeof globalThis.AbortSignal.any === "function") {
+    return { signal: globalThis.AbortSignal.any(list), cleanup: () => {} };
+  }
+
+  const controller = new AbortController();
+  const listeners = [];
+  for (const sig of list) {
+    try {
+      if (sig.aborted) {
+        controller.abort();
+        break;
+      }
+      const onAbort = () => controller.abort();
+      sig.addEventListener("abort", onAbort, { once: true });
+      listeners.push([sig, onAbort]);
+    } catch {
+      // best effort
+    }
+  }
+
+  const cleanup = () => {
+    for (const [sig, onAbort] of listeners) {
+      try {
+        sig.removeEventListener("abort", onAbort);
+      } catch {
+        // best effort
+      }
+    }
+  };
+
+  return { signal: controller.signal, cleanup };
+}
+
+function minPositive(values) {
+  const list = Array.isArray(values) ? values : [];
+  let best = 0;
+  for (const raw of list) {
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) continue;
+    if (!best || n < best) best = n;
+  }
+  return best;
+}
+
+function hardTimeoutRemainingMs(job, hardTimeoutMs) {
+  const ms = Number(hardTimeoutMs);
+  if (!Number.isFinite(ms) || ms <= 0) return 0;
+  const startedAt = Number(job?.startedAt || 0);
+  if (!Number.isFinite(startedAt) || startedAt <= 0) return ms;
+  const remaining = startedAt + ms - Date.now();
+  // If the deadline already passed, return a tiny positive value so callers can trip timeouts immediately.
+  if (remaining <= 0) return 1;
+  return remaining;
+}
+
 function parseList(value) {
   return String(value || "")
     .split(",")
@@ -293,6 +351,7 @@ function releaseProcessLock(lockPath) {
 function commandExists(binName) {
   const probe = spawnSync(binName, ["--version"], {
     stdio: "ignore",
+    timeout: SUBPROCESS_PROBE_TIMEOUT_MS > 0 ? SUBPROCESS_PROBE_TIMEOUT_MS : undefined,
     windowsHide: true,
   });
   if (!probe.error) return true;
@@ -302,6 +361,7 @@ function commandExists(binName) {
   const shellProbe = spawnSync(binName, ["--version"], {
     shell: true,
     stdio: "ignore",
+    timeout: SUBPROCESS_PROBE_TIMEOUT_MS > 0 ? SUBPROCESS_PROBE_TIMEOUT_MS : undefined,
     windowsHide: true,
   });
   return !shellProbe.error && shellProbe.status === 0;
@@ -310,6 +370,7 @@ function commandExists(binName) {
 function commandRuns(binName, args = []) {
   const probe = spawnSync(binName, args, {
     stdio: "ignore",
+    timeout: SUBPROCESS_PROBE_TIMEOUT_MS > 0 ? SUBPROCESS_PROBE_TIMEOUT_MS : undefined,
     windowsHide: true,
   });
   return !probe.error && probe.status === 0;
@@ -425,8 +486,8 @@ const ALLOWED_CHAT_IDS = new Set([PRIMARY_CHAT_ID, ...EXTRA_ALLOWED].filter(Bool
 const ALLOW_GROUP_CHAT = toBool(process.env.ALLOW_GROUP_CHAT, false);
 const POLL_TIMEOUT_SEC = toInt(process.env.TELEGRAM_POLL_TIMEOUT_SEC, 20);
 // Telegram API request timeouts: 0 disables abort-based timeouts entirely.
-const TELEGRAM_API_TIMEOUT_MS = toTimeoutMs(process.env.TELEGRAM_API_TIMEOUT_MS, 0);
-const TELEGRAM_UPLOAD_TIMEOUT_MS = toTimeoutMs(process.env.TELEGRAM_UPLOAD_TIMEOUT_MS, 0);
+const TELEGRAM_API_TIMEOUT_MS = toTimeoutMs(process.env.TELEGRAM_API_TIMEOUT_MS, 60_000);
+const TELEGRAM_UPLOAD_TIMEOUT_MS = toTimeoutMs(process.env.TELEGRAM_UPLOAD_TIMEOUT_MS, 120_000);
 // Per-message chunk size for Telegram sendMessage(). 0 disables chunking (not recommended).
 const TELEGRAM_MESSAGE_MAX_CHARS = toInt(process.env.TELEGRAM_MESSAGE_MAX_CHARS, 3800);
 const STARTUP_MESSAGE = toBool(process.env.STARTUP_MESSAGE, true);
@@ -472,6 +533,9 @@ const CODEX_APPROVAL_POLICY = ["untrusted", "on-failure", "on-request", "never"]
   ? CODEX_APPROVAL_RAW
   : "on-request";
 const MAX_TIMEOUT_MS = 2_147_483_647; // Node timers clamp near this anyway (~24.8 days)
+// Used for spawnSync()-based probing (ffmpeg filters, command --version).
+// 0 disables probing timeouts (not recommended; a hung subprocess can freeze the bot).
+const SUBPROCESS_PROBE_TIMEOUT_MS = toTimeoutMs(process.env.SUBPROCESS_PROBE_TIMEOUT_MS, 5000, 0, MAX_TIMEOUT_MS);
 // 0 disables the hard wall-clock timeout.
 const CODEX_TIMEOUT_MS = toTimeoutMs(process.env.CODEX_TIMEOUT_MS, 0, null, MAX_TIMEOUT_MS);
 const parsedExtraArgs = parseArgString(process.env.CODEX_EXTRA_ARGS || "");
@@ -486,6 +550,10 @@ const WHISPER_PYTHON = process.platform === "win32"
   : path.join(WHISPER_VENV_PATH, "bin", "python");
 const WHISPER_MODEL = String(process.env.WHISPER_MODEL || "base").trim();
 const WHISPER_LANGUAGE = String(process.env.WHISPER_LANGUAGE || "auto").trim();
+const WHISPER_STREAM_OUTPUT_TO_TERMINAL = toBool(
+  process.env.WHISPER_STREAM_OUTPUT_TO_TERMINAL,
+  true,
+);
 
 const VISION_ENABLED = toBool(process.env.VISION_ENABLED, false);
 // 0 disables the size cap (Telegram still enforces its own limits).
@@ -493,6 +561,7 @@ const VISION_MAX_FILE_MB = toInt(process.env.VISION_MAX_FILE_MB, 12);
 const VISION_AUTO_FOLLOWUP_SEC = toInt(process.env.VISION_AUTO_FOLLOWUP_SEC, 900);
 
 const TTS_ENABLED = toBool(process.env.TTS_ENABLED, false);
+const TTS_STREAM_OUTPUT_TO_TERMINAL = toBool(process.env.TTS_STREAM_OUTPUT_TO_TERMINAL, true);
 // Max characters per synthesized chunk. This does not cap total TTS input length.
 // Set to 0 to disable chunk-size capping (not recommended; may be slow/unstable for very long inputs).
 const TTS_MAX_TEXT_CHARS = toInt(process.env.TTS_MAX_TEXT_CHARS, 1200);
@@ -504,6 +573,21 @@ const TTS_VOICE_MAX_SENTENCES = toInt(process.env.TTS_VOICE_MAX_SENTENCES, 3);
 const TTS_VOICE_MAX_CHUNKS = toInt(process.env.TTS_VOICE_MAX_CHUNKS, 0);
 // 0 disables the hard wall-clock timeout.
 const TTS_TIMEOUT_MS = toTimeoutMs(process.env.TTS_TIMEOUT_MS, 0, null, MAX_TIMEOUT_MS);
+// Safety net timeouts for later TTS stages. These apply even if TTS_TIMEOUT_MS=0.
+// 0 disables the relevant timeout (not recommended).
+const TTS_ENCODE_TIMEOUT_MS = toTimeoutMs(process.env.TTS_ENCODE_TIMEOUT_MS, 120_000, 0, MAX_TIMEOUT_MS);
+const TTS_UPLOAD_TIMEOUT_MS = toTimeoutMs(
+  process.env.TTS_UPLOAD_TIMEOUT_MS,
+  TELEGRAM_UPLOAD_TIMEOUT_MS > 0 ? TELEGRAM_UPLOAD_TIMEOUT_MS : 120_000,
+  0,
+  MAX_TIMEOUT_MS,
+);
+// Global safety net so a stuck TTS job can't wedge the queue forever. 0 disables (not recommended).
+const TTS_HARD_TIMEOUT_MS = toTimeoutMs(process.env.TTS_HARD_TIMEOUT_MS, 300_000, 0, MAX_TIMEOUT_MS);
+// Extra attempts (in addition to the initial attempt) when a TTS stage times out.
+// This applies to synth/encode timeouts and (best-effort) upload timeouts.
+// Synthesis failures may also be retried (best-effort) to handle flaky backends. 0 disables retries.
+const TTS_TIMEOUT_RETRIES = toInt(process.env.TTS_TIMEOUT_RETRIES, 2, 0, 10);
 const TTS_VENV_PATH = resolveMaybeRelativePath(process.env.TTS_VENV_PATH || path.join(ROOT, ".tts-venv"));
 const TTS_MODEL = String(process.env.TTS_MODEL || "").trim();
 const TTS_REFERENCE_AUDIO = resolveMaybeRelativePath(process.env.TTS_REFERENCE_AUDIO || "");
@@ -513,6 +597,16 @@ const TTS_FFMPEG_BIN = String(process.env.TTS_FFMPEG_BIN || "ffmpeg").trim();
 const TTS_OPUS_BITRATE_KBPS = toInt(process.env.TTS_OPUS_BITRATE_KBPS, 48);
 const TTS_SEND_TEXT = toBool(process.env.TTS_SEND_TEXT, false);
 const TTS_REPLY_TO_VOICE = toBool(process.env.TTS_REPLY_TO_VOICE, false);
+// When auto-replying to voice notes with TTS, optionally send a small "still working" ping
+// if generation takes longer than this many seconds. 0 disables.
+const TTS_VOICE_REPLY_NOTIFY_AFTER_SEC = toInt(process.env.TTS_VOICE_REPLY_NOTIFY_AFTER_SEC, 0, 0, 3600);
+// Optional post-processing effects for the synthesized WAV before encoding to Opus/OGG.
+// This is intentionally ffmpeg-only (no extra deps), and is best-effort: presets approximate Audacity effects.
+const TTS_POSTPROCESS_ENABLED = toBool(process.env.TTS_POSTPROCESS_ENABLED, false);
+const TTS_POSTPROCESS_PRESET = String(process.env.TTS_POSTPROCESS_PRESET || "").trim().toLowerCase();
+// Raw ffmpeg audio filtergraph string passed to `-af` (overrides preset when set).
+const TTS_POSTPROCESS_FFMPEG_AF = String(process.env.TTS_POSTPROCESS_FFMPEG_AF || "").trim();
+const TTS_POSTPROCESS_DEBUG = toBool(process.env.TTS_POSTPROCESS_DEBUG, false);
 
 const ATTACH_ENABLED = toBool(process.env.ATTACH_ENABLED, true);
 // Security: only allow attaching files from within this folder.
@@ -1273,19 +1367,20 @@ function buildCodexExecSpec(job) {
   };
 }
 
-async function telegramApi(method, { query = "", body = null, timeoutMs = TELEGRAM_API_TIMEOUT_MS } = {}) {
+async function telegramApi(method, { query = "", body = null, timeoutMs = TELEGRAM_API_TIMEOUT_MS, signal } = {}) {
   const url = `https://api.telegram.org/bot${TOKEN}/${method}${query ? `?${query}` : ""}`;
 
   const controller = new AbortController();
   const ms = Number(timeoutMs);
   const useTimeout = Number.isFinite(ms) && ms > 0;
   const timer = useTimeout ? setTimeout(() => controller.abort(), ms) : null;
+  const combined = combineAbortSignals([controller.signal, signal]);
   try {
     const res = await fetch(url, {
       method: body ? "POST" : "GET",
       headers: body ? { "Content-Type": "application/json" } : undefined,
       body: body ? JSON.stringify(body) : undefined,
-      signal: controller.signal,
+      signal: combined.signal,
     });
 
     const data = await res.json().catch(() => ({}));
@@ -1295,21 +1390,23 @@ async function telegramApi(method, { query = "", body = null, timeoutMs = TELEGR
     }
     return data.result;
   } finally {
+    combined.cleanup();
     if (timer) clearTimeout(timer);
   }
 }
 
-async function telegramApiMultipart(method, formData, timeoutMs = TELEGRAM_UPLOAD_TIMEOUT_MS) {
+async function telegramApiMultipart(method, formData, timeoutMs = TELEGRAM_UPLOAD_TIMEOUT_MS, { signal } = {}) {
   const url = `https://api.telegram.org/bot${TOKEN}/${method}`;
   const controller = new AbortController();
   const ms = Number(timeoutMs);
   const useTimeout = Number.isFinite(ms) && ms > 0;
   const timer = useTimeout ? setTimeout(() => controller.abort(), ms) : null;
+  const combined = combineAbortSignals([controller.signal, signal]);
   try {
     const res = await fetch(url, {
       method: "POST",
       body: formData,
-      signal: controller.signal,
+      signal: combined.signal,
     });
 
     const data = await res.json().catch(() => ({}));
@@ -1319,6 +1416,7 @@ async function telegramApiMultipart(method, formData, timeoutMs = TELEGRAM_UPLOA
     }
     return data.result;
   } finally {
+    combined.cleanup();
     if (timer) clearTimeout(timer);
   }
 }
@@ -1479,6 +1577,7 @@ async function sendPhoto(chatId, filePath, options = {}) {
   const silent = options.silent === true;
   const caption = String(options.caption || "").trim();
   const timeoutMs = Number.isFinite(options.timeoutMs) ? Number(options.timeoutMs) : TELEGRAM_UPLOAD_TIMEOUT_MS;
+  const signal = options.signal;
   const fileName = path.basename(filePath) || "image.png";
   let blob;
   try {
@@ -1497,7 +1596,7 @@ async function sendPhoto(chatId, filePath, options = {}) {
       form.append("disable_notification", silent ? "true" : "false");
       if (caption) form.append("caption", caption);
       form.append("photo", blob, fileName);
-      await telegramApiMultipart("sendPhoto", form, timeoutMs);
+      await telegramApiMultipart("sendPhoto", form, timeoutMs, { signal });
       logChat("out", chatId, caption || "[photo]", { source: "telegram-photo" });
       return;
     } catch (err) {
@@ -1512,6 +1611,7 @@ async function sendVoice(chatId, filePath, options = {}) {
   const caption = String(options.caption || "").trim();
   const duration = Number(options.duration || 0);
   const timeoutMs = Number.isFinite(options.timeoutMs) ? Number(options.timeoutMs) : TELEGRAM_UPLOAD_TIMEOUT_MS;
+  const signal = options.signal;
   const fileName = path.basename(filePath) || "voice.ogg";
   let blob;
   try {
@@ -1533,10 +1633,12 @@ async function sendVoice(chatId, filePath, options = {}) {
         form.append("duration", String(Math.round(duration)));
       }
       form.append("voice", blob, fileName);
-      await telegramApiMultipart("sendVoice", form, timeoutMs);
+      await telegramApiMultipart("sendVoice", form, timeoutMs, { signal });
       logChat("out", chatId, caption || "[voice]", { source: "telegram-voice" });
       return;
     } catch (err) {
+      // If we hit our own abort timeout, don't retry multiple times; it'll just stall the bot.
+      if (String(err?.name || "").trim() === "AbortError") throw err;
       if (attempt >= 3) throw err;
       await sleep(350 * attempt);
     }
@@ -1550,6 +1652,7 @@ async function sendDocument(chatId, filePath, options = {}) {
   const timeoutMs = Number.isFinite(options.timeoutMs)
     ? Number(options.timeoutMs)
     : ATTACH_UPLOAD_TIMEOUT_MS;
+  const signal = options.signal;
 
   let blob;
   try {
@@ -1568,7 +1671,7 @@ async function sendDocument(chatId, filePath, options = {}) {
       form.append("disable_notification", silent ? "true" : "false");
       if (caption) form.append("caption", caption);
       form.append("document", blob, fileName);
-      await telegramApiMultipart("sendDocument", form, timeoutMs);
+      await telegramApiMultipart("sendDocument", form, timeoutMs, { signal });
       logChat("out", chatId, caption || `[document] ${fileName}`, { source: "telegram-document" });
       return;
     } catch (err) {
@@ -1916,6 +2019,13 @@ async function cancelCurrent(chatId) {
     return;
   }
   currentJob.cancelRequested = true;
+  try {
+    if (currentJob.abortController instanceof AbortController) {
+      currentJob.abortController.abort();
+    }
+  } catch {
+    // best effort
+  }
   terminateChildTree(currentJob.process, { forceAfterMs: 2000 });
   await sendMessage(chatId, `Cancellation requested for job #${currentJob.id}.`);
 }
@@ -2395,17 +2505,42 @@ function splitVoiceReplyParts(text) {
   // ...
   //
   // If the markers are missing, treat everything as spoken and leave textOnly empty.
-  const spokenRe = /(^|\n)\s*SPOKEN\s*:\s*\n/i;
-  const textRe = /(^|\n)\s*TEXT[_ ]?ONLY\s*:\s*\n/i;
+  // Be tolerant: models sometimes omit the trailing newline after the marker when the section is empty.
+  // Also allow same-line content (e.g. "SPOKEN: hello") even though we prefer a newline.
+  const spokenRe = /(^|\n)\s*SPOKEN\s*:[ \t]*(?:\r?\n)?/i;
+  const textRe = /(^|\n)\s*TEXT[_ ]?ONLY\s*:[ \t]*(?:\r?\n)?/i;
 
-  const spokenMatch = spokenRe.exec(src);
-  const textMatch = textRe.exec(src);
+  let spokenMatch = spokenRe.exec(src);
+  let textMatch = textRe.exec(src);
+
+  // Fallback: models sometimes compress the format onto a single line, e.g.:
+  // "SPOKEN: hello TEXT_ONLY:"
+  // In that case TEXT_ONLY isn't at a line start, so the strict regex won't match.
+  if (spokenMatch && !textMatch) {
+    const spokenStartStrict = spokenMatch.index + spokenMatch[0].length;
+    const looseTextRe = /\bTEXT[_ ]?ONLY\s*:[ \t]*(?:\r?\n)?/i;
+    const m = looseTextRe.exec(src);
+    if (m && m.index >= spokenStartStrict) textMatch = m;
+  } else if (textMatch && !spokenMatch) {
+    const looseSpokenRe = /\bSPOKEN\s*:[ \t]*(?:\r?\n)?/i;
+    const m = looseSpokenRe.exec(src);
+    if (m && m.index <= textMatch.index) spokenMatch = m;
+  }
+
+  // If a loose TEXT_ONLY match happens to appear before SPOKEN, treat it as normal text.
+  if (spokenMatch && textMatch && textMatch.index < spokenMatch.index) {
+    textMatch = null;
+  }
 
   if (!spokenMatch && !textMatch) {
     return { spoken: src, textOnly: "" };
   }
 
   const spokenStart = spokenMatch ? spokenMatch.index + spokenMatch[0].length : 0;
+  if (textMatch && textMatch.index < spokenStart) {
+    // Likely a false positive / bad marker order.
+    textMatch = null;
+  }
   const textStart = textMatch ? textMatch.index + textMatch[0].length : -1;
 
   if (textStart >= 0) {
@@ -2557,6 +2692,11 @@ function makeSpeakableTextForTts(text) {
   // Prefer the model following the voice prompt, but strip common formatting just in case.
   let out = String(text || "").trim();
   if (!out) return "";
+
+  // If the model accidentally includes the voice format markers in the spoken part, strip them.
+  // Don't require line breaks; models sometimes inline them ("... TEXT_ONLY:").
+  out = out.replace(/\bSPOKEN\s*:\s*/gi, " ");
+  out = out.replace(/\bTEXT[_ ]?ONLY\s*:\s*/gi, " ");
 
   // Remove fenced code blocks.
   out = out.replace(/```[\s\S]*?```/g, " ");
@@ -2843,29 +2983,205 @@ function resolveTtsFfmpegBin() {
   return commandExists(override) ? override : "";
 }
 
+const _ffmpegAudioFilterCache = new Map(); // key: ffmpeg bin path -> Set<string> | null
+
+function getFfmpegAudioFilterSet(ffmpegBin) {
+  const key = String(ffmpegBin || "").trim();
+  if (!key) return null;
+  if (_ffmpegAudioFilterCache.has(key)) return _ffmpegAudioFilterCache.get(key) || null;
+
+  const probe = spawnSync(key, ["-hide_banner", "-filters"], {
+    encoding: "utf8",
+    timeout: SUBPROCESS_PROBE_TIMEOUT_MS > 0 ? SUBPROCESS_PROBE_TIMEOUT_MS : undefined,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (probe.status !== 0) {
+    _ffmpegAudioFilterCache.set(key, null);
+    return null;
+  }
+
+  const set = new Set();
+  const out = String(probe.stdout || "");
+  for (const rawLine of out.split(/\r?\n/)) {
+    const line = String(rawLine || "").trim();
+    if (!line) continue;
+    if (line.startsWith("Filters:")) continue;
+    if (line.startsWith("-")) continue;
+
+    // Typical format:
+    //  ..C afade            A->A       Fade in/out input audio.
+    const parts = line.split(/\s+/);
+    if (parts.length < 2) continue;
+    const name = parts[1] || "";
+    const io = parts[2] || "";
+    if (!name) continue;
+    // The input/output types are expressed in the third column (e.g. "A->A", "N->A", "A->V").
+    // We only need to know whether a filter is audio-capable for our -af post-processing.
+    if (!io.includes("->")) continue; // skip header legend lines like "T.. = Timeline support"
+    if (io.includes("A")) set.add(name);
+  }
+
+  _ffmpegAudioFilterCache.set(key, set);
+  return set;
+}
+
+function clamp01(x) {
+  const n = Number(x);
+  if (!Number.isFinite(n)) return 0;
+  if (n < 0) return 0;
+  if (n > 1) return 1;
+  return n;
+}
+
+function fmtFloat(x, digits = 6) {
+  const n = Number(x);
+  if (!Number.isFinite(n)) return "0";
+  return n.toFixed(digits).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function buildTtsPostprocessFiltergraph(ffmpegBin) {
+  if (!TTS_POSTPROCESS_ENABLED) return "";
+  if (TTS_POSTPROCESS_FFMPEG_AF) return TTS_POSTPROCESS_FFMPEG_AF;
+
+  const preset = TTS_POSTPROCESS_PRESET || "audacity-stack";
+  const audioFilters = getFfmpegAudioFilterSet(ffmpegBin) || new Set();
+
+  if (preset !== "audacity-stack") return "";
+
+  // Requested (Audacity-like) stack:
+  // - Medium "overdrive" distortion (amount=60, output=30)
+  // - Phaser (dry/wet=45/255, LFO=2.4Hz, feedback=20%, etc) -> approximated with ffmpeg aphaser
+  // - Paulstretch (factor=1.1, time resolution=0.075) -> approximated with atempo=0.909...
+  // - Pitch shift (semitones=-5.69) without tempo change -> rubberband if available
+  // - Tempo +10% without pitch change -> atempo=1.1
+  //
+  // Notes:
+  // - ffmpeg doesn't expose Audacity's Paulstretch parameters; this is a best-effort approximation.
+  // - ffmpeg aphaser doesn't match Audacity phaser 1:1 (stages/depth/start phase), so those are ignored.
+
+  const parts = [];
+
+  // Keep sample rate stable for later filters (especially pitch/tempo).
+  if (audioFilters.has("aresample")) parts.push("aresample=48000");
+
+  // Distortion approximation (soft clip) with pregain and a final output trim.
+  // amount 60/100: pregain ~2.8, threshold ~0.7, then output level ~0.3.
+  const distortionAmount = 60;
+  const outputLevel = 30;
+  const pregain = 1 + (distortionAmount / 100) * 3.0;
+  const threshold = 1 - (distortionAmount / 100) * 0.5;
+  const outVol = outputLevel / 100;
+  if (audioFilters.has("volume")) parts.push(`volume=${fmtFloat(pregain, 4)}`);
+  if (audioFilters.has("asoftclip")) {
+    parts.push(`asoftclip=type=tanh:threshold=${fmtFloat(clamp01(threshold), 4)}`);
+  }
+  if (audioFilters.has("volume")) parts.push(`volume=${fmtFloat(clamp01(outVol), 4)}`);
+
+  // Phaser approximation with dry/wet mix.
+  const dryWet = 45 / 255; // requested wet fraction
+  const wet = clamp01(dryWet);
+  const dry = clamp01(1 - wet);
+  const hasSplit = audioFilters.has("asplit");
+  const hasMix = audioFilters.has("amix");
+  const hasAphaser = audioFilters.has("aphaser");
+  if (hasAphaser && hasSplit && hasMix && wet > 0) {
+    // ffmpeg's aphaser speed is capped at 2 in common builds; clamp the requested 2.4Hz.
+    const speedHz = 2.0;
+    const feedbackPct = 20;
+    const decay = clamp01(feedbackPct / 100);
+    const delayMs = 3.0; // no direct mapping from Audacity depth/stages; keep a mild delay
+    // This introduces a graph break (labels), so we emit a single filtergraph string later.
+    // We'll splice this after the simple chain.
+    const phaserGraph = `asplit=2[dry][wet];[wet]aphaser=speed=${fmtFloat(speedHz, 3)}:decay=${fmtFloat(decay, 3)}:delay=${fmtFloat(delayMs, 3)} [ph];[dry][ph]amix=inputs=2:weights='${fmtFloat(dry, 6)} ${fmtFloat(wet, 6)}'`;
+    parts.push(phaserGraph);
+  } else if (hasAphaser) {
+    // Fall back to 100% wet if we can't do a proper dry/wet mix.
+    parts.push(`aphaser=speed=${fmtFloat(2.0, 3)}:decay=${fmtFloat(0.2, 3)}:delay=${fmtFloat(3.0, 3)}`);
+  }
+
+  // Paulstretch approximation: slow down by factor 1.1 (i.e., tempo 1/1.1).
+  // ffmpeg atempo preserves pitch.
+  if (audioFilters.has("atempo")) parts.push(`atempo=${fmtFloat(1 / 1.1, 6)}`);
+
+  // Pitch shift without tempo change (semitones=-5.69). Prefer rubberband if available.
+  const semitones = -5.69;
+  const pitchRatio = Math.pow(2, semitones / 12);
+  if (audioFilters.has("rubberband")) {
+    parts.push(`rubberband=pitch=${fmtFloat(pitchRatio, 8)}`);
+  } else if (TTS_POSTPROCESS_DEBUG) {
+    log("TTS postprocess: ffmpeg filter 'rubberband' not available; skipping pitch shift.");
+  }
+
+  // Tempo +10% without pitch change.
+  if (audioFilters.has("atempo")) parts.push(`atempo=${fmtFloat(1.1, 6)}`);
+
+  const graph = parts.filter(Boolean).join(",");
+  if (TTS_POSTPROCESS_DEBUG) log(`TTS postprocess -af: ${graph || "(none)"}`);
+  return graph;
+}
+
 async function runTtsJob(job) {
+  let slowNotifyTimer = null;
+  const isVoiceReply = String(job?.source || "").trim().toLowerCase() === "voice-reply";
+  const afterText = String(job?.afterText || "").trim();
+  const attachments = Array.isArray(job?.attachments) ? job.attachments : [];
+  const text = normalizeTtsText(job?.text);
+  const jobAbortController = job?.abortController instanceof AbortController ? job.abortController : null;
+  const abortSignal = jobAbortController ? jobAbortController.signal : undefined;
+
+  const formatFailureText = (errMsg) => {
+    const err = oneLine(String(errMsg || "").trim());
+    if (isVoiceReply && job?.skipResultText === true && text) {
+      const cap = err.length > 240 ? `${err.slice(0, 237)}...` : err;
+      return cap ? `${text}\n\n(Voice reply failed: ${cap})` : text;
+    }
+    return err;
+  };
+  try {
   if (!TTS_ENABLED) {
-    return { ok: false, text: "TTS is disabled on this bot (TTS_ENABLED=0)." };
+    return {
+      ok: false,
+      text: formatFailureText("TTS is disabled on this bot (TTS_ENABLED=0)."),
+      afterText,
+      attachments,
+    };
   }
   if (!fs.existsSync(AIDOLON_TTS_SCRIPT_PATH)) {
     return {
       ok: false,
-      text: `TTS helper script missing: ${AIDOLON_TTS_SCRIPT_PATH}`,
+      text: formatFailureText(`TTS helper script missing: ${AIDOLON_TTS_SCRIPT_PATH}`),
+      afterText,
+      attachments,
     };
   }
 
   if (!TTS_MODEL) {
-    return { ok: false, text: "TTS model is not configured. Set TTS_MODEL in .env." };
+    return {
+      ok: false,
+      text: formatFailureText("TTS model is not configured. Set TTS_MODEL in .env."),
+      afterText,
+      attachments,
+    };
   }
   if (!TTS_REFERENCE_AUDIO) {
-    return { ok: false, text: "TTS reference audio is not configured. Set TTS_REFERENCE_AUDIO in .env." };
+    return {
+      ok: false,
+      text: formatFailureText("TTS reference audio is not configured. Set TTS_REFERENCE_AUDIO in .env."),
+      afterText,
+      attachments,
+    };
   }
 
   const pyBin = resolveTtsPythonBin();
   if (!pyBin) {
     return {
       ok: false,
-      text: "Python not found for TTS. Set TTS_PYTHON or create a venv at TTS_VENV_PATH (default .tts-venv).",
+      text: formatFailureText(
+        "Python not found for TTS. Set TTS_PYTHON or create a venv at TTS_VENV_PATH (default .tts-venv).",
+      ),
+      afterText,
+      attachments,
     };
   }
 
@@ -2873,118 +3189,201 @@ async function runTtsJob(job) {
   if (!ffmpegBin) {
     return {
       ok: false,
-      text: `ffmpeg not found ('${TTS_FFMPEG_BIN}'). Install ffmpeg or set TTS_FFMPEG_BIN.`,
+      text: formatFailureText(
+        `ffmpeg not found ('${TTS_FFMPEG_BIN}'). Install ffmpeg or set TTS_FFMPEG_BIN.`,
+      ),
+      afterText,
+      attachments,
     };
   }
 
-  const text = normalizeTtsText(job.text);
-  if (!text) return { ok: false, text: "Empty TTS text." };
+  if (!text) {
+    return { ok: false, text: formatFailureText("Empty TTS text."), afterText, attachments };
+  }
 
-  const base = `tts-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  const wavPath = path.join(TTS_DIR, `${base}.wav`);
-  const oggPath = path.join(TTS_DIR, `${base}.ogg`);
+  if (
+    TTS_VOICE_REPLY_NOTIFY_AFTER_SEC > 0 &&
+    String(job?.source || "").trim().toLowerCase() === "voice-reply"
+  ) {
+    slowNotifyTimer = setTimeout(() => {
+      if (shuttingDown) return;
+      if (currentJob !== job) return;
+      if (job.cancelRequested) return;
+      void sendMessage(
+        job.chatId,
+        "Still generating a voice reply. Use /stop to cancel if needed.",
+        { silent: true },
+      ).catch(() => {});
+    }, TTS_VOICE_REPLY_NOTIFY_AFTER_SEC * 1000);
+  }
 
-  const synthArgs = [
-    AIDOLON_TTS_SCRIPT_PATH,
-    "--out-wav",
-    wavPath,
-    "--model",
-    TTS_MODEL,
-    "--reference-audio",
-    TTS_REFERENCE_AUDIO,
-    "--sample-rate",
-    String(TTS_SAMPLE_RATE || 48000),
-  ];
+  const maxStageAttempts = Math.max(1, 1 + Math.max(0, Number(TTS_TIMEOUT_RETRIES) || 0));
+  const resetTimeoutState = () => {
+    job.timedOut = false;
+    job.timedOutMs = 0;
+    job.timedOutStage = "";
+  };
 
-  const synthOk = await new Promise((resolve) => {
-    let done = false;
-    const finish = (result) => {
-      if (done) return;
-      done = true;
-      resolve(result);
-    };
+  let wavPath = "";
+  let oggPath = "";
 
-    let child;
-    try {
-      child = spawn(pyBin, synthArgs, {
-        cwd: ROOT,
-        windowsHide: true,
-        stdio: ["pipe", "pipe", "pipe"],
+  const runSynthOnce = async (outWavPath) => {
+    const synthArgs = [
+      AIDOLON_TTS_SCRIPT_PATH,
+      "--out-wav",
+      outWavPath,
+      "--model",
+      TTS_MODEL,
+      "--reference-audio",
+      TTS_REFERENCE_AUDIO,
+      "--sample-rate",
+      String(TTS_SAMPLE_RATE || 48000),
+    ];
+
+    return await new Promise((resolve) => {
+      let done = false;
+      const finish = (result) => {
+        if (done) return;
+        done = true;
+        resolve(result);
+      };
+
+      let child;
+      try {
+        child = spawn(pyBin, synthArgs, {
+          cwd: ROOT,
+          windowsHide: true,
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+      } catch (err) {
+        finish({ ok: false, text: `Failed to start TTS python: ${err.message || err}` });
+        return;
+      }
+
+      job.process = child;
+
+      try {
+        child.stdin.end(text);
+      } catch {
+        // best effort
+      }
+
+      const timeoutMs = minPositive([TTS_TIMEOUT_MS, hardTimeoutRemainingMs(job, TTS_HARD_TIMEOUT_MS)]);
+      let timeoutForceFinish = null;
+      const timeout = timeoutMs > 0
+        ? setTimeout(() => {
+          job.timedOut = true;
+          job.timedOutMs = timeoutMs;
+          job.timedOutStage = "synth";
+          terminateChildTree(child, { forceAfterMs: 3000 });
+          // Fail-safe: if termination doesn't trigger a close event, finish anyway.
+          timeoutForceFinish = setTimeout(() => {
+            const tail = job.stderrTail.trim() || job.stdoutTail.trim();
+            finish({
+              ok: false,
+              text: `TTS timed out after ${Math.round(timeoutMs / 1000)}s.${tail ? `\n\n${tail}` : ""}`,
+            });
+          }, 10_000);
+        }, timeoutMs)
+        : null;
+
+      child.stdout.on("data", (buf) => {
+        const chunk = String(buf || "");
+        job.stdoutTail = appendTail(job.stdoutTail, chunk, 50000);
+        if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
       });
-    } catch (err) {
-      finish({ ok: false, text: `Failed to start TTS python: ${err.message || err}` });
-      return;
+      child.stderr.on("data", (buf) => {
+        const chunk = String(buf || "");
+        job.stderrTail = appendTail(job.stderrTail, chunk, 50000);
+        if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
+      });
+      child.on("error", (err) => {
+        clearTimeout(timeout);
+        if (timeoutForceFinish) clearTimeout(timeoutForceFinish);
+        finish({ ok: false, text: `TTS python process error: ${err.message || err}` });
+      });
+      child.on("close", (code, signal) => {
+        clearTimeout(timeout);
+        if (timeoutForceFinish) clearTimeout(timeoutForceFinish);
+
+        if (job.cancelRequested) {
+          finish({ ok: false, text: "TTS canceled." });
+          return;
+        }
+        if (job.timedOut) {
+          const ms = Number(job.timedOutMs || 0) || timeoutMs || TTS_HARD_TIMEOUT_MS || 0;
+          const tail = job.stderrTail.trim() || job.stdoutTail.trim();
+          finish({
+            ok: false,
+            text: `TTS timed out after ${Math.round(ms / 1000)}s.${tail ? `\n\n${tail}` : ""}`,
+          });
+          return;
+        }
+        if (typeof code === "number" && code !== 0) {
+          const tail = job.stderrTail.trim() || job.stdoutTail.trim();
+          finish({
+            ok: false,
+            text: `TTS synthesis failed (exit ${code}${signal ? `, signal ${signal}` : ""}).${tail ? `\n\n${tail}` : ""}`,
+          });
+          return;
+        }
+
+        if (!fs.existsSync(outWavPath)) {
+          finish({ ok: false, text: "TTS synthesis finished, but WAV output file is missing." });
+          return;
+        }
+
+        finish({ ok: true });
+      });
+    });
+  };
+
+  let synthOk = { ok: false, text: "TTS synthesis failed." };
+  for (let attempt = 1; attempt <= maxStageAttempts; attempt += 1) {
+    resetTimeoutState();
+    job.stdoutTail = "";
+    job.stderrTail = "";
+
+    const base = `tts-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const outWav = path.join(TTS_DIR, `${base}.wav`);
+
+    synthOk = await runSynthOnce(outWav);
+    if (synthOk.ok) {
+      wavPath = outWav;
+      break;
     }
 
-    job.process = child;
-
     try {
-      child.stdin.end(text);
+      if (fs.existsSync(outWav)) fs.unlinkSync(outWav);
     } catch {
       // best effort
     }
 
-    const timeout = TTS_TIMEOUT_MS > 0
-      ? setTimeout(() => {
-        job.timedOut = true;
-        terminateChildTree(child, { forceAfterMs: 3000 });
-      }, TTS_TIMEOUT_MS)
-      : null;
-
-    child.stdout.on("data", (buf) => {
-      const chunk = String(buf || "");
-      job.stdoutTail = appendTail(job.stdoutTail, chunk, 50000);
-      if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
-    });
-    child.stderr.on("data", (buf) => {
-      const chunk = String(buf || "");
-      job.stderrTail = appendTail(job.stderrTail, chunk, 50000);
-      if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
-    });
-    child.on("error", (err) => {
-      clearTimeout(timeout);
-      finish({ ok: false, text: `TTS python process error: ${err.message || err}` });
-    });
-    child.on("close", (code, signal) => {
-      clearTimeout(timeout);
-
-      if (job.cancelRequested) {
-        finish({ ok: false, text: "TTS canceled." });
-        return;
-      }
-      if (job.timedOut) {
-        const tail = job.stderrTail.trim() || job.stdoutTail.trim();
-        finish({
-          ok: false,
-          text: `TTS timed out after ${Math.round(TTS_TIMEOUT_MS / 1000)}s.${tail ? `\n\n${tail}` : ""}`,
-        });
-        return;
-      }
-      if (typeof code === "number" && code !== 0) {
-        const tail = job.stderrTail.trim() || job.stdoutTail.trim();
-        finish({
-          ok: false,
-          text: `TTS synthesis failed (exit ${code}${signal ? `, signal ${signal}` : ""}).${tail ? `\n\n${tail}` : ""}`,
-        });
-        return;
-      }
-
-      if (!fs.existsSync(wavPath)) {
-        finish({ ok: false, text: "TTS synthesis finished, but WAV output file is missing." });
-        return;
-      }
-
-      finish({ ok: true });
-    });
-  });
-
-  if (!synthOk.ok) {
-    try {
-      if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
-    } catch {
-      // best effort
+    if (job.cancelRequested) {
+      return { ok: false, text: "TTS canceled." };
     }
-    return { ok: false, text: synthOk.text };
+
+    const timedOut = Boolean(job.timedOut && job.timedOutStage === "synth");
+    const hardRemaining = hardTimeoutRemainingMs(job, TTS_HARD_TIMEOUT_MS);
+    const canRetryTimeout = timedOut && attempt < maxStageAttempts && (hardRemaining === 0 || hardRemaining > 1);
+    if (canRetryTimeout) {
+      log(`TTS: synth attempt ${attempt}/${maxStageAttempts} timed out; retrying...`);
+      await sleep(250);
+      continue;
+    }
+
+    const canRetryFailure = !timedOut && attempt < maxStageAttempts && (hardRemaining === 0 || hardRemaining > 1);
+    if (canRetryFailure) {
+      log(`TTS: synth attempt ${attempt}/${maxStageAttempts} failed; retrying...`);
+      await sleep(350);
+      continue;
+    }
+
+    return { ok: false, text: formatFailureText(synthOk.text), afterText, attachments };
+  }
+
+  if (!wavPath) {
+    return { ok: false, text: formatFailureText(synthOk.text), afterText, attachments };
   }
 
   if (job.cancelRequested) {
@@ -3000,344 +3399,16 @@ async function runTtsJob(job) {
     job.onProgressChunk("TTS: encoding voice message...\n", "stderr");
   }
 
-  const ffArgs = [
-    "-y",
-    "-hide_banner",
-    "-loglevel",
-    "error",
-    "-i",
-    wavPath,
-    "-ac",
-    "1",
-    "-ar",
-    "48000",
-    "-c:a",
-    "libopus",
-    "-b:a",
-    `${TTS_OPUS_BITRATE_KBPS}k`,
-    "-vbr",
-    "on",
-    "-compression_level",
-    "10",
-    "-application",
-    "voip",
-    oggPath,
-  ];
-
-  const encodeOk = await new Promise((resolve) => {
-    let done = false;
-    const finish = (result) => {
-      if (done) return;
-      done = true;
-      resolve(result);
-    };
-
-    let child;
-    try {
-      child = spawn(ffmpegBin, ffArgs, {
-        cwd: ROOT,
-        windowsHide: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-    } catch (err) {
-      finish({ ok: false, text: `Failed to start ffmpeg: ${err.message || err}` });
-      return;
-    }
-
-    job.process = child;
-
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (buf) => {
-      const chunk = String(buf || "");
-      stdout = appendTail(stdout, chunk, 50000);
-      if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
-    });
-    child.stderr.on("data", (buf) => {
-      const chunk = String(buf || "");
-      stderr = appendTail(stderr, chunk, 50000);
-      if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
-    });
-    child.on("error", (err) => {
-      finish({ ok: false, text: `ffmpeg error: ${err.message || err}` });
-    });
-    child.on("close", (code, signal) => {
-      if (job.cancelRequested) {
-        finish({ ok: false, text: "TTS canceled." });
-        return;
-      }
-      if (typeof code === "number" && code !== 0) {
-        const tail = String(stderr || stdout || "").trim();
-        finish({
-          ok: false,
-          text: `ffmpeg failed (exit ${code}${signal ? `, signal ${signal}` : ""}).${tail ? `\n\n${tail}` : ""}`,
-        });
-        return;
-      }
-      if (!fs.existsSync(oggPath)) {
-        finish({ ok: false, text: "ffmpeg completed, but OGG output file is missing." });
-        return;
-      }
-      finish({ ok: true });
-    });
-  });
-
-  try {
-    if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
-  } catch {
-    // best effort
-  }
-
-  if (!encodeOk.ok) {
-    try {
-      if (fs.existsSync(oggPath)) fs.unlinkSync(oggPath);
-    } catch {
-      // best effort
-    }
-    return { ok: false, text: encodeOk.text };
-  }
-
-  if (job.cancelRequested) {
-    try {
-      if (fs.existsSync(oggPath)) fs.unlinkSync(oggPath);
-    } catch {
-      // best effort
-    }
-    return { ok: false, text: "TTS canceled." };
-  }
-
-  if (typeof job.onProgressChunk === "function") {
-    job.onProgressChunk("TTS: sending voice message...\n", "stderr");
-  }
-
-  try {
-    await sendVoice(job.chatId, oggPath);
-  } catch (err) {
-    return { ok: false, text: `Failed to send Telegram voice message: ${String(err?.message || err)}` };
-  } finally {
-    try {
-      if (fs.existsSync(oggPath)) fs.unlinkSync(oggPath);
-    } catch {
-      // best effort
-    }
-  }
-
-  const afterText = String(job?.afterText || "").trim();
-  if (afterText) {
-    try {
-      await sendMessage(job.chatId, afterText);
-    } catch (err) {
-      log(`sendMessage(tts-afterText) failed: ${redactError(err?.message || err)}`);
-    }
-  }
-
-  const attachments = Array.isArray(job?.attachments) ? job.attachments : [];
-  if (attachments.length > 0) {
-    try {
-      await sendAttachments(job.chatId, attachments);
-    } catch (err) {
-      log(`sendAttachments(tts) failed: ${redactError(err?.message || err)}`);
-    }
-  }
-
-  if (job?.skipResultText === true) {
-    return { ok: true, text: "", skipSendMessage: true };
-  }
-
-  if (TTS_SEND_TEXT) {
-    return { ok: true, text };
-  }
-
-  return { ok: true, text: "", skipSendMessage: true };
-}
-
-async function runTtsBatchJob(job) {
-  if (!TTS_ENABLED) {
-    return { ok: false, text: "TTS is disabled on this bot (TTS_ENABLED=0)." };
-  }
-  if (!fs.existsSync(AIDOLON_TTS_SCRIPT_PATH)) {
-    return {
-      ok: false,
-      text: `TTS helper script missing: ${AIDOLON_TTS_SCRIPT_PATH}`,
-    };
-  }
-
-  if (!TTS_MODEL) {
-    return { ok: false, text: "TTS model is not configured. Set TTS_MODEL in .env." };
-  }
-  if (!TTS_REFERENCE_AUDIO) {
-    return { ok: false, text: "TTS reference audio is not configured. Set TTS_REFERENCE_AUDIO in .env." };
-  }
-
-  const pyBin = resolveTtsPythonBin();
-  if (!pyBin) {
-    return {
-      ok: false,
-      text: "Python not found for TTS. Set TTS_PYTHON or create a venv at TTS_VENV_PATH (default .tts-venv).",
-    };
-  }
-
-  const ffmpegBin = resolveTtsFfmpegBin();
-  if (!ffmpegBin) {
-    return {
-      ok: false,
-      text: `ffmpeg not found ('${TTS_FFMPEG_BIN}'). Install ffmpeg or set TTS_FFMPEG_BIN.`,
-    };
-  }
-
-  const raw = Array.isArray(job?.texts) ? job.texts : [];
-  const texts = raw.map((t) => normalizeTtsText(t)).filter(Boolean);
-  if (texts.length === 0) return { ok: false, text: "Empty TTS text." };
-
-  const base = `tts-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  const wavBase = path.join(TTS_DIR, base);
-  const pad3 = (n) => String(n).padStart(3, "0");
-  const wavPaths = texts.map((_, idx) => `${wavBase}-${pad3(idx)}.wav`);
-
-  const synthArgs = [
-    AIDOLON_TTS_SCRIPT_PATH,
-    "--batch-jsonl",
-    "--out-wav-base",
-    wavBase,
-    "--model",
-    TTS_MODEL,
-    "--reference-audio",
-    TTS_REFERENCE_AUDIO,
-    "--sample-rate",
-    String(TTS_SAMPLE_RATE || 48000),
-  ];
-
-  const payload = `${texts.map((t) => JSON.stringify({ text: t })).join("\n")}\n`;
-
-  const synthOk = await new Promise((resolve) => {
-    let done = false;
-    const finish = (result) => {
-      if (done) return;
-      done = true;
-      resolve(result);
-    };
-
-    let child;
-    try {
-      child = spawn(pyBin, synthArgs, {
-        cwd: ROOT,
-        windowsHide: true,
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-    } catch (err) {
-      finish({ ok: false, text: `Failed to start TTS python: ${err.message || err}` });
-      return;
-    }
-
-    job.process = child;
-
-    try {
-      child.stdin.end(payload);
-    } catch {
-      // best effort
-    }
-
-    const timeout = TTS_TIMEOUT_MS > 0
-      ? setTimeout(() => {
-        job.timedOut = true;
-        terminateChildTree(child, { forceAfterMs: 3000 });
-      }, TTS_TIMEOUT_MS)
-      : null;
-
-    child.stdout.on("data", (buf) => {
-      const chunk = String(buf || "");
-      job.stdoutTail = appendTail(job.stdoutTail, chunk, 50000);
-      if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
-    });
-    child.stderr.on("data", (buf) => {
-      const chunk = String(buf || "");
-      job.stderrTail = appendTail(job.stderrTail, chunk, 50000);
-      if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
-    });
-    child.on("error", (err) => {
-      clearTimeout(timeout);
-      finish({ ok: false, text: `TTS python process error: ${err.message || err}` });
-    });
-    child.on("close", (code, signal) => {
-      clearTimeout(timeout);
-
-      if (job.cancelRequested) {
-        finish({ ok: false, text: "TTS canceled." });
-        return;
-      }
-      if (job.timedOut) {
-        const tail = job.stderrTail.trim() || job.stdoutTail.trim();
-        finish({
-          ok: false,
-          text: `TTS timed out after ${Math.round(TTS_TIMEOUT_MS / 1000)}s.${tail ? `\n\n${tail}` : ""}`,
-        });
-        return;
-      }
-      if (typeof code === "number" && code !== 0) {
-        const tail = job.stderrTail.trim() || job.stdoutTail.trim();
-        finish({
-          ok: false,
-          text: `TTS synthesis failed (exit ${code}${signal ? `, signal ${signal}` : ""}).${tail ? `\n\n${tail}` : ""}`,
-        });
-        return;
-      }
-
-      finish({ ok: true });
-    });
-  });
-
-  const cleanupWavs = () => {
-    for (const p of wavPaths) {
-      try {
-        if (fs.existsSync(p)) fs.unlinkSync(p);
-      } catch {
-        // best effort
-      }
-    }
-  };
-
-  if (!synthOk.ok) {
-    cleanupWavs();
-    return { ok: false, text: synthOk.text };
-  }
-
-  if (job.cancelRequested) {
-    cleanupWavs();
-    return { ok: false, text: "TTS canceled." };
-  }
-
-  for (const p of wavPaths) {
-    if (!fs.existsSync(p)) {
-      cleanupWavs();
-      return { ok: false, text: "TTS synthesis finished, but one or more WAV output files are missing." };
-    }
-  }
-
-  if (typeof job.onProgressChunk === "function") {
-    job.onProgressChunk("TTS: encoding voice messages...\n", "stderr");
-  }
-
-  for (let idx = 0; idx < wavPaths.length; idx += 1) {
-    const wavPath = wavPaths[idx];
-    const oggPath = path.join(TTS_DIR, `${base}-${pad3(idx)}.ogg`);
-
-    if (job.cancelRequested) {
-      try {
-        cleanupWavs();
-        if (fs.existsSync(oggPath)) fs.unlinkSync(oggPath);
-      } catch {
-        // best effort
-      }
-      return { ok: false, text: "TTS canceled." };
-    }
-
+  const ttsFxGraph = buildTtsPostprocessFiltergraph(ffmpegBin);
+  const runEncodeOnce = async (inWavPath, outOggPath) => {
     const ffArgs = [
       "-y",
       "-hide_banner",
       "-loglevel",
       "error",
       "-i",
-      wavPath,
+      inWavPath,
+      ...(ttsFxGraph ? ["-af", ttsFxGraph] : []),
       "-ac",
       "1",
       "-ar",
@@ -3352,10 +3423,10 @@ async function runTtsBatchJob(job) {
       "10",
       "-application",
       "voip",
-      oggPath,
+      outOggPath,
     ];
 
-    const encodeOk = await new Promise((resolve) => {
+    return await new Promise((resolve) => {
       let done = false;
       const finish = (result) => {
         if (done) return;
@@ -3377,24 +3448,58 @@ async function runTtsBatchJob(job) {
 
       job.process = child;
 
+      const timeoutMs = minPositive([TTS_ENCODE_TIMEOUT_MS, hardTimeoutRemainingMs(job, TTS_HARD_TIMEOUT_MS)]);
+      let timeoutForceFinish = null;
+      const timeout = timeoutMs > 0
+        ? setTimeout(() => {
+          job.timedOut = true;
+          job.timedOutMs = timeoutMs;
+          job.timedOutStage = "encode";
+          terminateChildTree(child, { forceAfterMs: 3000 });
+          // Fail-safe: if termination doesn't trigger a close event, finish anyway.
+          timeoutForceFinish = setTimeout(() => {
+            const tail = String(stderr || stdout || "").trim();
+            finish({
+              ok: false,
+              text: `TTS encoding timed out after ${Math.round(timeoutMs / 1000)}s.${tail ? `\n\n${tail}` : ""}`,
+            });
+          }, 10_000);
+        }, timeoutMs)
+        : null;
+
       let stdout = "";
       let stderr = "";
       child.stdout.on("data", (buf) => {
         const chunk = String(buf || "");
         stdout = appendTail(stdout, chunk, 50000);
+        if (TTS_STREAM_OUTPUT_TO_TERMINAL) process.stdout.write(chunk);
         if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
       });
       child.stderr.on("data", (buf) => {
         const chunk = String(buf || "");
         stderr = appendTail(stderr, chunk, 50000);
+        if (TTS_STREAM_OUTPUT_TO_TERMINAL) process.stderr.write(chunk);
         if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
       });
       child.on("error", (err) => {
+        clearTimeout(timeout);
+        if (timeoutForceFinish) clearTimeout(timeoutForceFinish);
         finish({ ok: false, text: `ffmpeg error: ${err.message || err}` });
       });
       child.on("close", (code, signal) => {
+        clearTimeout(timeout);
+        if (timeoutForceFinish) clearTimeout(timeoutForceFinish);
         if (job.cancelRequested) {
           finish({ ok: false, text: "TTS canceled." });
+          return;
+        }
+        if (job.timedOut) {
+          const ms = Number(job.timedOutMs || 0) || timeoutMs || TTS_HARD_TIMEOUT_MS || 0;
+          const tail = String(stderr || stdout || "").trim();
+          finish({
+            ok: false,
+            text: `TTS encoding timed out after ${Math.round(ms / 1000)}s.${tail ? `\n\n${tail}` : ""}`,
+          });
           return;
         }
         if (typeof code === "number" && code !== 0) {
@@ -3405,13 +3510,612 @@ async function runTtsBatchJob(job) {
           });
           return;
         }
-        if (!fs.existsSync(oggPath)) {
+        if (!fs.existsSync(outOggPath)) {
           finish({ ok: false, text: "ffmpeg completed, but OGG output file is missing." });
           return;
         }
         finish({ ok: true });
       });
     });
+  };
+
+  let encodeOk = { ok: false, text: "TTS encoding failed." };
+  for (let attempt = 1; attempt <= maxStageAttempts; attempt += 1) {
+    resetTimeoutState();
+    const outOgg = path.join(TTS_DIR, `${path.basename(wavPath, ".wav")}-enc${attempt}.ogg`);
+
+    encodeOk = await runEncodeOnce(wavPath, outOgg);
+    if (encodeOk.ok) {
+      oggPath = outOgg;
+      break;
+    }
+
+    try {
+      if (fs.existsSync(outOgg)) fs.unlinkSync(outOgg);
+    } catch {
+      // best effort
+    }
+
+    if (job.cancelRequested) {
+      break;
+    }
+
+    const timedOut = Boolean(job.timedOut && job.timedOutStage === "encode");
+    const hardRemaining = hardTimeoutRemainingMs(job, TTS_HARD_TIMEOUT_MS);
+    const canRetry = timedOut && attempt < maxStageAttempts && (hardRemaining === 0 || hardRemaining > 1);
+    if (canRetry) {
+      log(`TTS: encode attempt ${attempt}/${maxStageAttempts} timed out; retrying...`);
+      await sleep(250);
+      continue;
+    }
+
+    break;
+  }
+
+  try {
+    if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
+  } catch {
+    // best effort
+  }
+
+  if (!oggPath) {
+    if (job.cancelRequested) {
+      return { ok: false, text: "TTS canceled." };
+    }
+    return { ok: false, text: formatFailureText(encodeOk.text), afterText, attachments };
+  }
+
+  if (job.cancelRequested) {
+    try {
+      if (fs.existsSync(oggPath)) fs.unlinkSync(oggPath);
+    } catch {
+      // best effort
+    }
+    return { ok: false, text: "TTS canceled." };
+  }
+
+  if (typeof job.onProgressChunk === "function") {
+    job.onProgressChunk("TTS: sending voice message...\n", "stderr");
+  }
+
+  let uploadErr = null;
+  let lastUploadTimeoutMs = 0;
+  for (let attempt = 1; attempt <= maxStageAttempts; attempt += 1) {
+    const uploadTimeoutMs = minPositive([TTS_UPLOAD_TIMEOUT_MS, hardTimeoutRemainingMs(job, TTS_HARD_TIMEOUT_MS)]);
+    lastUploadTimeoutMs = uploadTimeoutMs;
+    try {
+      await sendVoice(job.chatId, oggPath, { timeoutMs: uploadTimeoutMs, signal: abortSignal });
+      uploadErr = null;
+      break;
+    } catch (err) {
+      uploadErr = err;
+
+      if (job.cancelRequested) break;
+
+      const isAbort = String(err?.name || "").trim() === "AbortError";
+      const canceledByCaller = Boolean(abortSignal && abortSignal.aborted);
+      const hardRemaining = hardTimeoutRemainingMs(job, TTS_HARD_TIMEOUT_MS);
+      const canRetry = isAbort && !canceledByCaller && attempt < maxStageAttempts && (hardRemaining === 0 || hardRemaining > 1);
+      if (canRetry) {
+        log(`TTS: upload attempt ${attempt}/${maxStageAttempts} timed out; retrying...`);
+        await sleep(350);
+        continue;
+      }
+
+      break;
+    }
+  }
+
+  try {
+    if (fs.existsSync(oggPath)) fs.unlinkSync(oggPath);
+  } catch {
+    // best effort
+  }
+
+  if (uploadErr) {
+    if (job.cancelRequested) {
+      return { ok: false, text: "TTS canceled." };
+    }
+    if (String(uploadErr?.name || "").trim() === "AbortError") {
+      const ms = Number(lastUploadTimeoutMs || 0) || TTS_HARD_TIMEOUT_MS || 0;
+      return {
+        ok: false,
+        text: formatFailureText(`TTS upload timed out after ${Math.round(ms / 1000)}s.`),
+        afterText,
+        attachments,
+      };
+    }
+    return {
+      ok: false,
+      text: formatFailureText(`Failed to send Telegram voice message: ${String(uploadErr?.message || uploadErr)}`),
+      afterText,
+      attachments,
+    };
+  }
+
+  if (job?.skipResultText === true) {
+    return { ok: true, text: "", skipSendMessage: true, afterText, attachments };
+  }
+
+  if (TTS_SEND_TEXT) {
+    return { ok: true, text, afterText, attachments };
+  }
+
+  return { ok: true, text: "", skipSendMessage: true, afterText, attachments };
+  } finally {
+    if (slowNotifyTimer) {
+      clearTimeout(slowNotifyTimer);
+    }
+  }
+}
+
+async function runTtsBatchJob(job) {
+  let slowNotifyTimer = null;
+  const isVoiceReply = String(job?.source || "").trim().toLowerCase() === "voice-reply";
+  const afterText = String(job?.afterText || "").trim();
+  const attachments = Array.isArray(job?.attachments) ? job.attachments : [];
+  const jobAbortController = job?.abortController instanceof AbortController ? job.abortController : null;
+  const abortSignal = jobAbortController ? jobAbortController.signal : undefined;
+
+  const raw = Array.isArray(job?.texts) ? job.texts : [];
+  const texts = raw.map((t) => normalizeTtsText(t)).filter(Boolean);
+  const fullText = texts.join(" ").trim();
+
+  const formatFailureText = (errMsg, sentCount = 0) => {
+    const err = oneLine(String(errMsg || "").trim());
+    if (isVoiceReply && job?.skipResultText === true && fullText) {
+      const cap = err.length > 240 ? `${err.slice(0, 237)}...` : err;
+      if (Number.isFinite(sentCount) && sentCount > 0 && sentCount < texts.length) {
+        const remaining = texts.slice(sentCount).join(" ").trim();
+        if (!remaining) return cap ? `(Voice reply failed: ${cap})` : "Voice reply failed.";
+        return cap
+          ? `${remaining}\n\n(Voice reply failed after sending ${sentCount} voice message(s): ${cap})`
+          : `${remaining}\n\n(Voice reply failed after sending ${sentCount} voice message(s).)`;
+      }
+      return cap ? `${fullText}\n\n(Voice reply failed: ${cap})` : fullText;
+    }
+    return err;
+  };
+  try {
+  if (!TTS_ENABLED) {
+    return {
+      ok: false,
+      text: formatFailureText("TTS is disabled on this bot (TTS_ENABLED=0)."),
+      afterText,
+      attachments,
+    };
+  }
+  if (!fs.existsSync(AIDOLON_TTS_SCRIPT_PATH)) {
+    return {
+      ok: false,
+      text: formatFailureText(`TTS helper script missing: ${AIDOLON_TTS_SCRIPT_PATH}`),
+      afterText,
+      attachments,
+    };
+  }
+
+  if (!TTS_MODEL) {
+    return {
+      ok: false,
+      text: formatFailureText("TTS model is not configured. Set TTS_MODEL in .env."),
+      afterText,
+      attachments,
+    };
+  }
+  if (!TTS_REFERENCE_AUDIO) {
+    return {
+      ok: false,
+      text: formatFailureText("TTS reference audio is not configured. Set TTS_REFERENCE_AUDIO in .env."),
+      afterText,
+      attachments,
+    };
+  }
+
+  const pyBin = resolveTtsPythonBin();
+  if (!pyBin) {
+    return {
+      ok: false,
+      text: formatFailureText(
+        "Python not found for TTS. Set TTS_PYTHON or create a venv at TTS_VENV_PATH (default .tts-venv).",
+      ),
+      afterText,
+      attachments,
+    };
+  }
+
+  const ffmpegBin = resolveTtsFfmpegBin();
+  if (!ffmpegBin) {
+    return {
+      ok: false,
+      text: formatFailureText(
+        `ffmpeg not found ('${TTS_FFMPEG_BIN}'). Install ffmpeg or set TTS_FFMPEG_BIN.`,
+      ),
+      afterText,
+      attachments,
+    };
+  }
+
+  if (texts.length === 0) {
+    return { ok: false, text: formatFailureText("Empty TTS text."), afterText, attachments };
+  }
+
+  if (
+    TTS_VOICE_REPLY_NOTIFY_AFTER_SEC > 0 &&
+    String(job?.source || "").trim().toLowerCase() === "voice-reply"
+  ) {
+    slowNotifyTimer = setTimeout(() => {
+      if (shuttingDown) return;
+      if (currentJob !== job) return;
+      if (job.cancelRequested) return;
+      void sendMessage(
+        job.chatId,
+        "Still generating a voice reply. Use /stop to cancel if needed.",
+        { silent: true },
+      ).catch(() => {});
+    }, TTS_VOICE_REPLY_NOTIFY_AFTER_SEC * 1000);
+  }
+
+  const pad3 = (n) => String(n).padStart(3, "0");
+  const payload = `${texts.map((t) => JSON.stringify({ text: t })).join("\n")}\n`;
+
+  const maxStageAttempts = Math.max(1, 1 + Math.max(0, Number(TTS_TIMEOUT_RETRIES) || 0));
+  const resetTimeoutState = () => {
+    job.timedOut = false;
+    job.timedOutMs = 0;
+    job.timedOutStage = "";
+  };
+
+  let base = "";
+  let wavBase = "";
+  let wavPaths = [];
+
+  const cleanupWavs = () => {
+    for (const p of wavPaths) {
+      try {
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+      } catch {
+        // best effort
+      }
+    }
+  };
+
+  const runBatchSynthOnce = async (outWavBase) => {
+    const synthArgs = [
+      AIDOLON_TTS_SCRIPT_PATH,
+      "--batch-jsonl",
+      "--out-wav-base",
+      outWavBase,
+      "--model",
+      TTS_MODEL,
+      "--reference-audio",
+      TTS_REFERENCE_AUDIO,
+      "--sample-rate",
+      String(TTS_SAMPLE_RATE || 48000),
+    ];
+
+    return await new Promise((resolve) => {
+      let done = false;
+      const finish = (result) => {
+        if (done) return;
+        done = true;
+        resolve(result);
+      };
+
+      let child;
+      try {
+        child = spawn(pyBin, synthArgs, {
+          cwd: ROOT,
+          env: { ...process.env, PYTHONUNBUFFERED: "1" },
+          windowsHide: true,
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+      } catch (err) {
+        finish({ ok: false, text: `Failed to start TTS python: ${err.message || err}` });
+        return;
+      }
+
+      job.process = child;
+
+      try {
+        child.stdin.end(payload);
+      } catch {
+        // best effort
+      }
+
+      const timeoutMs = minPositive([TTS_TIMEOUT_MS, hardTimeoutRemainingMs(job, TTS_HARD_TIMEOUT_MS)]);
+      let timeoutForceFinish = null;
+      const timeout = timeoutMs > 0
+        ? setTimeout(() => {
+          job.timedOut = true;
+          job.timedOutMs = timeoutMs;
+          job.timedOutStage = "synth";
+          terminateChildTree(child, { forceAfterMs: 3000 });
+          // Fail-safe: if termination doesn't trigger a close event, finish anyway.
+          timeoutForceFinish = setTimeout(() => {
+            const tail = job.stderrTail.trim() || job.stdoutTail.trim();
+            finish({
+              ok: false,
+              text: `TTS timed out after ${Math.round(timeoutMs / 1000)}s.${tail ? `\n\n${tail}` : ""}`,
+            });
+          }, 10_000);
+        }, timeoutMs)
+        : null;
+
+      child.stdout.on("data", (buf) => {
+        const chunk = String(buf || "");
+        job.stdoutTail = appendTail(job.stdoutTail, chunk, 50000);
+        if (TTS_STREAM_OUTPUT_TO_TERMINAL) process.stdout.write(chunk);
+        if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
+      });
+      child.stderr.on("data", (buf) => {
+        const chunk = String(buf || "");
+        job.stderrTail = appendTail(job.stderrTail, chunk, 50000);
+        if (TTS_STREAM_OUTPUT_TO_TERMINAL) process.stderr.write(chunk);
+        if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
+      });
+      child.on("error", (err) => {
+        clearTimeout(timeout);
+        if (timeoutForceFinish) clearTimeout(timeoutForceFinish);
+        finish({ ok: false, text: `TTS python process error: ${err.message || err}` });
+      });
+      child.on("close", (code, signal) => {
+        clearTimeout(timeout);
+        if (timeoutForceFinish) clearTimeout(timeoutForceFinish);
+
+        if (job.cancelRequested) {
+          finish({ ok: false, text: "TTS canceled." });
+          return;
+        }
+        if (job.timedOut) {
+          const ms = Number(job.timedOutMs || 0) || timeoutMs || TTS_HARD_TIMEOUT_MS || 0;
+          const tail = job.stderrTail.trim() || job.stdoutTail.trim();
+          finish({
+            ok: false,
+            text: `TTS timed out after ${Math.round(ms / 1000)}s.${tail ? `\n\n${tail}` : ""}`,
+          });
+          return;
+        }
+        if (typeof code === "number" && code !== 0) {
+          const tail = job.stderrTail.trim() || job.stdoutTail.trim();
+          finish({
+            ok: false,
+            text: `TTS synthesis failed (exit ${code}${signal ? `, signal ${signal}` : ""}).${tail ? `\n\n${tail}` : ""}`,
+          });
+          return;
+        }
+
+        finish({ ok: true });
+      });
+    });
+  };
+
+  let synthOk = { ok: false, text: "TTS synthesis failed." };
+  for (let attempt = 1; attempt <= maxStageAttempts; attempt += 1) {
+    resetTimeoutState();
+    job.stdoutTail = "";
+    job.stderrTail = "";
+
+    base = `tts-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    wavBase = path.join(TTS_DIR, base);
+    wavPaths = texts.map((_, idx) => `${wavBase}-${pad3(idx)}.wav`);
+
+    synthOk = await runBatchSynthOnce(wavBase);
+    if (synthOk.ok) break;
+
+    cleanupWavs();
+
+    if (job.cancelRequested) {
+      return { ok: false, text: "TTS canceled." };
+    }
+
+    const timedOut = Boolean(job.timedOut && job.timedOutStage === "synth");
+    const hardRemaining = hardTimeoutRemainingMs(job, TTS_HARD_TIMEOUT_MS);
+    const canRetryTimeout = timedOut && attempt < maxStageAttempts && (hardRemaining === 0 || hardRemaining > 1);
+    if (canRetryTimeout) {
+      log(`TTS: synth attempt ${attempt}/${maxStageAttempts} timed out; retrying...`);
+      await sleep(250);
+      continue;
+    }
+
+    const canRetryFailure = !timedOut && attempt < maxStageAttempts && (hardRemaining === 0 || hardRemaining > 1);
+    if (canRetryFailure) {
+      log(`TTS: synth attempt ${attempt}/${maxStageAttempts} failed; retrying...`);
+      await sleep(350);
+      continue;
+    }
+
+    return { ok: false, text: formatFailureText(synthOk.text), afterText, attachments };
+  }
+
+  if (!synthOk.ok) {
+    cleanupWavs();
+    return { ok: false, text: formatFailureText(synthOk.text), afterText, attachments };
+  }
+
+  if (job.cancelRequested) {
+    cleanupWavs();
+    return { ok: false, text: "TTS canceled." };
+  }
+
+  for (const p of wavPaths) {
+    if (!fs.existsSync(p)) {
+      cleanupWavs();
+      return { ok: false, text: "TTS synthesis finished, but one or more WAV output files are missing." };
+    }
+  }
+
+  if (typeof job.onProgressChunk === "function") {
+    job.onProgressChunk("TTS: encoding voice messages...\n", "stderr");
+  }
+
+  const ttsFxGraph = buildTtsPostprocessFiltergraph(ffmpegBin);
+  const runEncodeOnce = async (inWavPath, outOggPath) => {
+    const ffArgs = [
+      "-y",
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      inWavPath,
+      ...(ttsFxGraph ? ["-af", ttsFxGraph] : []),
+      "-ac",
+      "1",
+      "-ar",
+      "48000",
+      "-c:a",
+      "libopus",
+      "-b:a",
+      `${TTS_OPUS_BITRATE_KBPS}k`,
+      "-vbr",
+      "on",
+      "-compression_level",
+      "10",
+      "-application",
+      "voip",
+      outOggPath,
+    ];
+
+    return await new Promise((resolve) => {
+      let done = false;
+      const finish = (result) => {
+        if (done) return;
+        done = true;
+        resolve(result);
+      };
+
+      let child;
+      try {
+        child = spawn(ffmpegBin, ffArgs, {
+          cwd: ROOT,
+          windowsHide: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch (err) {
+        finish({ ok: false, text: `Failed to start ffmpeg: ${err.message || err}` });
+        return;
+      }
+
+      job.process = child;
+
+      const timeoutMs = minPositive([TTS_ENCODE_TIMEOUT_MS, hardTimeoutRemainingMs(job, TTS_HARD_TIMEOUT_MS)]);
+      let timeoutForceFinish = null;
+      const timeout = timeoutMs > 0
+        ? setTimeout(() => {
+          job.timedOut = true;
+          job.timedOutMs = timeoutMs;
+          job.timedOutStage = "encode";
+          terminateChildTree(child, { forceAfterMs: 3000 });
+          // Fail-safe: if termination doesn't trigger a close event, finish anyway.
+          timeoutForceFinish = setTimeout(() => {
+            const tail = String(stderr || stdout || "").trim();
+            finish({
+              ok: false,
+              text: `TTS encoding timed out after ${Math.round(timeoutMs / 1000)}s.${tail ? `\n\n${tail}` : ""}`,
+            });
+          }, 10_000);
+        }, timeoutMs)
+        : null;
+
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (buf) => {
+        const chunk = String(buf || "");
+        stdout = appendTail(stdout, chunk, 50000);
+        if (TTS_STREAM_OUTPUT_TO_TERMINAL) process.stdout.write(chunk);
+        if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
+      });
+      child.stderr.on("data", (buf) => {
+        const chunk = String(buf || "");
+        stderr = appendTail(stderr, chunk, 50000);
+        if (TTS_STREAM_OUTPUT_TO_TERMINAL) process.stderr.write(chunk);
+        if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
+      });
+      child.on("error", (err) => {
+        clearTimeout(timeout);
+        if (timeoutForceFinish) clearTimeout(timeoutForceFinish);
+        finish({ ok: false, text: `ffmpeg error: ${err.message || err}` });
+      });
+      child.on("close", (code, signal) => {
+        clearTimeout(timeout);
+        if (timeoutForceFinish) clearTimeout(timeoutForceFinish);
+        if (job.cancelRequested) {
+          finish({ ok: false, text: "TTS canceled." });
+          return;
+        }
+        if (job.timedOut) {
+          const ms = Number(job.timedOutMs || 0) || timeoutMs || TTS_HARD_TIMEOUT_MS || 0;
+          const tail = String(stderr || stdout || "").trim();
+          finish({
+            ok: false,
+            text: `TTS encoding timed out after ${Math.round(ms / 1000)}s.${tail ? `\n\n${tail}` : ""}`,
+          });
+          return;
+        }
+        if (typeof code === "number" && code !== 0) {
+          const tail = String(stderr || stdout || "").trim();
+          finish({
+            ok: false,
+            text: `ffmpeg failed (exit ${code}${signal ? `, signal ${signal}` : ""}).${tail ? `\n\n${tail}` : ""}`,
+          });
+          return;
+        }
+        if (!fs.existsSync(outOggPath)) {
+          finish({ ok: false, text: "ffmpeg completed, but OGG output file is missing." });
+          return;
+        }
+        finish({ ok: true });
+      });
+    });
+  };
+
+  for (let idx = 0; idx < wavPaths.length; idx += 1) {
+    const wavPath = wavPaths[idx];
+
+    if (job.cancelRequested) {
+      cleanupWavs();
+      return { ok: false, text: "TTS canceled." };
+    }
+
+    let encodeOk = { ok: false, text: "TTS encoding failed." };
+    let oggPath = "";
+    for (let attempt = 1; attempt <= maxStageAttempts; attempt += 1) {
+      resetTimeoutState();
+      const outOgg = path.join(TTS_DIR, `${base}-${pad3(idx)}-enc${attempt}.ogg`);
+
+      encodeOk = await runEncodeOnce(wavPath, outOgg);
+      if (encodeOk.ok) {
+        oggPath = outOgg;
+        break;
+      }
+
+      try {
+        if (fs.existsSync(outOgg)) fs.unlinkSync(outOgg);
+      } catch {
+        // best effort
+      }
+
+      if (job.cancelRequested) break;
+
+      const timedOut = Boolean(job.timedOut && job.timedOutStage === "encode");
+      const hardRemaining = hardTimeoutRemainingMs(job, TTS_HARD_TIMEOUT_MS);
+      const canRetry = timedOut && attempt < maxStageAttempts && (hardRemaining === 0 || hardRemaining > 1);
+      if (canRetry) {
+        log(`TTS: encode attempt ${attempt}/${maxStageAttempts} timed out; retrying...`);
+        await sleep(250);
+        continue;
+      }
+
+      break;
+    }
+
+    if (!oggPath) {
+      cleanupWavs();
+      const sentCount = idx;
+      if (job.cancelRequested) {
+        return { ok: false, text: "TTS canceled." };
+      }
+      return { ok: false, text: formatFailureText(encodeOk.text, sentCount), afterText, attachments };
+    }
 
     try {
       if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
@@ -3419,24 +4123,39 @@ async function runTtsBatchJob(job) {
       // best effort
     }
 
-    if (!encodeOk.ok) {
-      try {
-        if (fs.existsSync(oggPath)) fs.unlinkSync(oggPath);
-      } catch {
-        // best effort
-      }
-      cleanupWavs();
-      return { ok: false, text: encodeOk.text };
-    }
-
     if (typeof job.onProgressChunk === "function") {
       job.onProgressChunk(`TTS: sending voice message ${idx + 1}/${wavPaths.length}...\n`, "stderr");
     }
 
+    let sentCount = idx;
+    let uploadErr = null;
+    let lastUploadTimeoutMs = 0;
     try {
-      await sendVoice(job.chatId, oggPath);
-    } catch (err) {
-      return { ok: false, text: `Failed to send Telegram voice message: ${String(err?.message || err)}` };
+      for (let attempt = 1; attempt <= maxStageAttempts; attempt += 1) {
+        const uploadTimeoutMs = minPositive([TTS_UPLOAD_TIMEOUT_MS, hardTimeoutRemainingMs(job, TTS_HARD_TIMEOUT_MS)]);
+        lastUploadTimeoutMs = uploadTimeoutMs;
+        try {
+          await sendVoice(job.chatId, oggPath, { timeoutMs: uploadTimeoutMs, signal: abortSignal });
+          sentCount = idx + 1;
+          uploadErr = null;
+          break;
+        } catch (err) {
+          uploadErr = err;
+          if (job.cancelRequested) break;
+
+          const isAbort = String(err?.name || "").trim() === "AbortError";
+          const canceledByCaller = Boolean(abortSignal && abortSignal.aborted);
+          const hardRemaining = hardTimeoutRemainingMs(job, TTS_HARD_TIMEOUT_MS);
+          const canRetry = isAbort && !canceledByCaller && attempt < maxStageAttempts && (hardRemaining === 0 || hardRemaining > 1);
+          if (canRetry) {
+            log(`TTS: upload attempt ${attempt}/${maxStageAttempts} timed out; retrying...`);
+            await sleep(350);
+            continue;
+          }
+
+          break;
+        }
+      }
     } finally {
       try {
         if (fs.existsSync(oggPath)) fs.unlinkSync(oggPath);
@@ -3444,35 +4163,44 @@ async function runTtsBatchJob(job) {
         // best effort
       }
     }
-  }
 
-  const afterText = String(job?.afterText || "").trim();
-  if (afterText) {
-    try {
-      await sendMessage(job.chatId, afterText);
-    } catch (err) {
-      log(`sendMessage(tts-afterText) failed: ${redactError(err?.message || err)}`);
-    }
-  }
-
-  const attachments = Array.isArray(job?.attachments) ? job.attachments : [];
-  if (attachments.length > 0) {
-    try {
-      await sendAttachments(job.chatId, attachments);
-    } catch (err) {
-      log(`sendAttachments(tts-batch) failed: ${redactError(err?.message || err)}`);
+    if (uploadErr) {
+      cleanupWavs();
+      if (job.cancelRequested) {
+        return { ok: false, text: "TTS canceled." };
+      }
+      if (String(uploadErr?.name || "").trim() === "AbortError") {
+        const ms = Number(lastUploadTimeoutMs || 0) || TTS_HARD_TIMEOUT_MS || 0;
+        return {
+          ok: false,
+          text: formatFailureText(`TTS upload timed out after ${Math.round(ms / 1000)}s.`, sentCount),
+          afterText,
+          attachments,
+        };
+      }
+      return {
+        ok: false,
+        text: formatFailureText(`Failed to send Telegram voice message: ${String(uploadErr?.message || uploadErr)}`, sentCount),
+        afterText,
+        attachments,
+      };
     }
   }
 
   if (job?.skipResultText === true) {
-    return { ok: true, text: "", skipSendMessage: true };
+    return { ok: true, text: "", skipSendMessage: true, afterText, attachments };
   }
 
   if (TTS_SEND_TEXT) {
-    return { ok: true, text: texts.join(" ") };
+    return { ok: true, text: texts.join(" "), afterText, attachments };
   }
 
-  return { ok: true, text: "", skipSendMessage: true };
+  return { ok: true, text: "", skipSendMessage: true, afterText, attachments };
+  } finally {
+    if (slowNotifyTimer) {
+      clearTimeout(slowNotifyTimer);
+    }
+  }
 }
 
 function truncateLine(text, maxChars = 220) {
@@ -3486,6 +4214,9 @@ function isProgressNoiseLine(line) {
   if (!s) return true;
   if (s === "--------" || /^-+$/.test(s)) return true;
   if (/^(user|assistant)$/i.test(s)) return true;
+  // Voice-mode response markers are not useful as "progress" messages.
+  if (/^spoken\s*:\s*$/i.test(s)) return true;
+  if (/^text[_ ]?only\s*:\s*$/i.test(s)) return true;
   // Suppress internal TTS progress lines if they ever leak into progress updates.
   if (/^tts:\s*/i.test(s)) return true;
   // Suppress typical structured log lines (Rust/Go style) that are noisy in Telegram chats.
@@ -3512,6 +4243,11 @@ function startJobProgressUpdates(job) {
   }
   // TTS jobs are intentionally noisy (model load, encode, ffmpeg). Don't stream that into Telegram.
   if (String(job?.kind || "") === "tts" || String(job?.kind || "") === "tts-batch") {
+    return () => {};
+  }
+  // For voice-note prompts that will be answered via voice notes, avoid sending text "progress" pings.
+  // Those pings are output-driven and can leak reply markers/content into the chat.
+  if (String(job?.source || "") === "voice" && TTS_REPLY_TO_VOICE && TTS_ENABLED) {
     return () => {};
   }
 
@@ -3742,17 +4478,24 @@ async function processQueue() {
     const job = queue.shift();
     currentJob = job;
     job.startedAt = Date.now();
+    // Allow cancellation to abort in-flight fetch() operations (Telegram uploads).
+    job.abortController = new AbortController();
     const stopProgressUpdates = startJobProgressUpdates(job);
 
     let result;
     try {
-      result = job.kind === "raw"
-        ? await runRawCodexJob(job)
-        : job.kind === "tts"
-          ? await runTtsJob(job)
-          : job.kind === "tts-batch"
-            ? await runTtsBatchJob(job)
-            : await runCodexJob(job);
+      try {
+        result = job.kind === "raw"
+          ? await runRawCodexJob(job)
+          : job.kind === "tts"
+            ? await runTtsJob(job)
+            : job.kind === "tts-batch"
+              ? await runTtsBatchJob(job)
+              : await runCodexJob(job);
+      } catch (err) {
+        const msg = String(err?.message || err || "").trim() || "Unknown error";
+        result = { ok: false, text: `Job #${job.id} failed unexpectedly: ${msg}` };
+      }
     } finally {
       stopProgressUpdates();
     }
@@ -3764,75 +4507,90 @@ async function processQueue() {
       }
     }
 
-    const attachParsed = extractAttachDirectives(String(result?.text || ""));
-    const attachments = Array.isArray(attachParsed.attachments) ? attachParsed.attachments : [];
-    if (result && typeof result === "object") {
-      result.text = attachParsed.text;
-    }
+    try {
+      const attachParsed = extractAttachDirectives(String(result?.text || ""));
+      const attachments = Array.isArray(attachParsed.attachments) ? attachParsed.attachments : [];
+      const resultAfterText = String(result?.afterText || "").trim();
+      const resultAttachments = Array.isArray(result?.attachments) ? result.attachments : [];
+      const allAttachments = [...attachments, ...resultAttachments];
+      if (result && typeof result === "object") {
+        result.text = attachParsed.text;
+      }
 
-    const shouldVoiceReply = Boolean(
-      result?.ok &&
-        job?.kind !== "tts" &&
-        job?.kind !== "tts-batch" &&
-        String(job?.source || "") === "voice" &&
-        TTS_REPLY_TO_VOICE &&
-        TTS_ENABLED &&
-        String(result?.text || "").trim(),
-    );
+      const shouldVoiceReply = Boolean(
+        result?.ok &&
+          job?.kind !== "tts" &&
+          job?.kind !== "tts-batch" &&
+          String(job?.source || "") === "voice" &&
+          TTS_REPLY_TO_VOICE &&
+          TTS_ENABLED &&
+          String(result?.text || "").trim(),
+      );
 
-    let voiceQueued = false;
-    if (shouldVoiceReply) {
-      try {
-        const parts = splitVoiceReplyParts(String(result.text || ""));
-        const spoken = makeSpeakableTextForTts(parts.spoken || String(result.text || ""));
-        const { chunks: spokenChunks, overflowText } = splitSpeakableTextIntoVoiceChunks(spoken);
-        const modelTextOnly = String(parts.textOnly || "").trim();
-        const extracted = modelTextOnly ? "" : extractNonSpeakableInfo(String(result.text || ""));
-        let afterText = modelTextOnly || (extracted ? `Text-only details:\n${extracted}` : "");
-        if (overflowText) {
-          const moved = `Moved from SPOKEN (too long for voice notes):\n${overflowText}`;
-          afterText = afterText ? `${afterText}\n\n${moved}` : moved;
+      let voiceQueued = false;
+      if (shouldVoiceReply) {
+        try {
+          const parts = splitVoiceReplyParts(String(result.text || ""));
+          const spoken = makeSpeakableTextForTts(parts.spoken || String(result.text || ""));
+          const { chunks: spokenChunks, overflowText } = splitSpeakableTextIntoVoiceChunks(spoken);
+          const modelTextOnly = String(parts.textOnly || "").trim();
+          const extracted = modelTextOnly ? "" : extractNonSpeakableInfo(String(result.text || ""));
+          let afterText = modelTextOnly || (extracted ? `Text-only details:\n${extracted}` : "");
+          if (overflowText) {
+            const moved = `Moved from SPOKEN (too long for voice notes):\n${overflowText}`;
+            afterText = afterText ? `${afterText}\n\n${moved}` : moved;
+          }
+
+          const chunks = spokenChunks.length > 0 ? spokenChunks : (spoken ? [spoken] : []);
+          voiceQueued = chunks.length > 1
+            ? await enqueueTtsBatch(job.chatId, chunks, "voice-reply", {
+              afterText,
+              // Even if TTS_SEND_TEXT=1 globally, don't duplicate the spoken content for voice replies.
+              skipResultText: true,
+              attachments,
+            })
+            : await enqueueTts(job.chatId, chunks[0] || spoken, "voice-reply", {
+              afterText,
+              // Even if TTS_SEND_TEXT=1 globally, don't duplicate the spoken content for voice replies.
+              skipResultText: true,
+              attachments,
+            });
+        } catch (err) {
+          // If voice enqueue fails, fall back to sending text so the user still gets an answer.
+          log(`enqueueTts(voice-reply) failed: ${redactError(err?.message || err)}`);
+          voiceQueued = false;
         }
-
-        const chunks = spokenChunks.length > 0 ? spokenChunks : (spoken ? [spoken] : []);
-        voiceQueued = chunks.length > 1
-          ? await enqueueTtsBatch(job.chatId, chunks, "voice-reply", {
-            afterText,
-            // Even if TTS_SEND_TEXT=1 globally, don't duplicate the spoken content for voice replies.
-            skipResultText: true,
-            attachments,
-          })
-          : await enqueueTts(job.chatId, chunks[0] || spoken, "voice-reply", {
-            afterText,
-            // Even if TTS_SEND_TEXT=1 globally, don't duplicate the spoken content for voice replies.
-            skipResultText: true,
-            attachments,
-          });
-      } catch (err) {
-        // If voice enqueue fails, fall back to sending text so the user still gets an answer.
-        log(`enqueueTts(voice-reply) failed: ${redactError(err?.message || err)}`);
-        voiceQueued = false;
       }
-    }
 
-    if (!result || (result.skipSendMessage !== true && !(shouldVoiceReply && voiceQueued))) {
-      try {
-        await sendMessage(job.chatId, normalizeResponse(result?.text));
-      } catch (err) {
-        log(`sendMessage(result) failed: ${redactError(err.message || err)}`);
+      if (!result || (result.skipSendMessage !== true && !(shouldVoiceReply && voiceQueued))) {
+        try {
+          await sendMessage(job.chatId, normalizeResponse(result?.text));
+        } catch (err) {
+          log(`sendMessage(result) failed: ${redactError(err.message || err)}`);
+        }
       }
-    }
 
-    // If we replied via voice, attachments will be sent by the TTS job(s) to keep ordering sane.
-    if (attachments.length > 0 && !(shouldVoiceReply && voiceQueued)) {
-      try {
-        await sendAttachments(job.chatId, attachments);
-      } catch (err) {
-        log(`sendAttachments(result) failed: ${redactError(err?.message || err)}`);
+      if (resultAfterText && !(shouldVoiceReply && voiceQueued)) {
+        try {
+          await sendMessage(job.chatId, resultAfterText);
+        } catch (err) {
+          log(`sendMessage(afterText) failed: ${redactError(err?.message || err)}`);
+        }
       }
-    }
 
-    currentJob = null;
+      // If we replied via voice, attachments will be sent by the TTS job(s) to keep ordering sane.
+      if (allAttachments.length > 0 && !(shouldVoiceReply && voiceQueued)) {
+        try {
+          await sendAttachments(job.chatId, allAttachments);
+        } catch (err) {
+          log(`sendAttachments(result) failed: ${redactError(err?.message || err)}`);
+        }
+      }
+    } catch (err) {
+      log(`processQueue(post) failed: ${redactError(err?.message || err)}`);
+    } finally {
+      currentJob = null;
+    }
   }
 }
 
@@ -3878,6 +4636,7 @@ async function transcribeAudioWithWhisper(audioPath) {
   return await new Promise((resolve, reject) => {
     const py = spawn(WHISPER_PYTHON, args, {
       cwd: ROOT,
+      env: { ...process.env, PYTHONUNBUFFERED: "1" },
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -3886,10 +4645,14 @@ async function transcribeAudioWithWhisper(audioPath) {
     let stderr = "";
 
     py.stdout.on("data", (buf) => {
-      stdout = appendTail(stdout, String(buf || ""), 20000);
+      const chunk = String(buf || "");
+      stdout = appendTail(stdout, chunk, 20000);
+      if (WHISPER_STREAM_OUTPUT_TO_TERMINAL) process.stdout.write(chunk);
     });
     py.stderr.on("data", (buf) => {
-      stderr = appendTail(stderr, String(buf || ""), 20000);
+      const chunk = String(buf || "");
+      stderr = appendTail(stderr, chunk, 20000);
+      if (WHISPER_STREAM_OUTPUT_TO_TERMINAL) process.stderr.write(chunk);
     });
     py.on("error", (err) => {
       reject(new Error(`Whisper process error: ${err.message || err}`));

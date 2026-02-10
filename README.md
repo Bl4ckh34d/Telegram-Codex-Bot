@@ -105,6 +105,10 @@ The bot can synthesize text into a Telegram voice message using MiraTTS:
 - Configure: `TTS_MODEL` (path to the local MiraTTS model directory)
 - Optional: `TTS_REFERENCE_AUDIO` (defaults to `assets\\reference.wav`, gitignored)
 - Optional: `TTS_SAMPLE_RATE` (defaults to `48000`)
+- Optional: `TTS_POSTPROCESS_ENABLED=1` to apply ffmpeg audio effects before sending.
+  - Preset: `TTS_POSTPROCESS_PRESET=audacity-stack` (best-effort approximation of an Audacity-like stack).
+  - Or set a raw ffmpeg filtergraph: `TTS_POSTPROCESS_FFMPEG_AF=...` (overrides preset).
+  - Pitch shifting in the preset uses ffmpeg's `rubberband` filter when available; otherwise pitch shift is skipped.
 - Optional: `TTS_REPLY_TO_VOICE=1` to auto-reply to incoming voice notes with a voice message (otherwise replies are text).
 - Optional (auto voice replies): split long `SPOKEN` into multiple voice notes with `TTS_VOICE_MAX_CHARS`, `TTS_VOICE_MAX_SENTENCES`, `TTS_VOICE_MAX_CHUNKS` (0 = unlimited; batch-synthesized for speed).
 - Run: `/tts <text>`
@@ -138,8 +142,13 @@ Config (in `.env`):
 ## Timeouts
 - `CODEX_TIMEOUT_MS` sets a hard wall-clock timeout for Codex jobs (default `0` = disabled).
 - `TTS_TIMEOUT_MS` sets a hard wall-clock timeout for TTS synthesis (default `0` = disabled).
-- `TELEGRAM_API_TIMEOUT_MS` sets a timeout for Telegram API JSON requests (default `0` = disabled).
-- `TELEGRAM_UPLOAD_TIMEOUT_MS` sets a timeout for Telegram API multipart uploads (default `0` = disabled).
+- `TTS_ENCODE_TIMEOUT_MS` sets a hard timeout for the ffmpeg encoding step (default `120000` ms).
+- `TTS_UPLOAD_TIMEOUT_MS` sets a hard timeout for Telegram voice uploads for TTS jobs (default `120000` ms, unless you set `TELEGRAM_UPLOAD_TIMEOUT_MS`).
+- `TTS_HARD_TIMEOUT_MS` is a safety net so a stuck TTS job can't wedge the queue forever (default `300000` ms).
+- `TTS_TIMEOUT_RETRIES` sets how many extra attempts to make when a TTS stage times out (default `2`). Synthesis failures may also be retried (best-effort).
+- `SUBPROCESS_PROBE_TIMEOUT_MS` sets a timeout for spawnSync-based probes (ffmpeg filters, `--version` checks). Default `5000` ms.
+- `TELEGRAM_API_TIMEOUT_MS` sets a timeout for Telegram API JSON requests (default `60000` ms; set `0` to disable).
+- `TELEGRAM_UPLOAD_TIMEOUT_MS` sets a timeout for Telegram API multipart uploads (default `120000` ms; set `0` to disable).
 
 ## Model picker
 - `/model` shows buttons to pick a model and a reasoning effort for the current chat.
@@ -149,6 +158,10 @@ Config (in `.env`):
 ## Terminal output
 - `CODEX_STREAM_OUTPUT_TO_TERMINAL=1` streams Codex stdout/stderr into the terminal running the bot (default is on).
 - Set `CODEX_STREAM_OUTPUT_TO_TERMINAL=0` to disable if it's too noisy.
+- `WHISPER_STREAM_OUTPUT_TO_TERMINAL=1` streams Whisper (STT) helper stdout/stderr into the same terminal (default is on).
+- Set `WHISPER_STREAM_OUTPUT_TO_TERMINAL=0` to disable if it's too noisy.
+- `TTS_STREAM_OUTPUT_TO_TERMINAL=1` streams TTS + ffmpeg stdout/stderr into the same terminal (default is on).
+- Set `TTS_STREAM_OUTPUT_TO_TERMINAL=0` to disable if it's too noisy.
 - `TERMINAL_COLORS=1` and `CHAT_LOG_USE_COLORS=1` colorize chat logs in the terminal (your messages vs bot replies).
 - Set `NO_COLOR=1` to force-disable ANSI colors.
 
