@@ -2345,7 +2345,6 @@ function getTelegramCommandList() {
     { command: "clear", description: "clear queued prompts" },
     { command: "screenshot", description: "send a screenshot image" },
     { command: "sendfile", description: "send a file attachment" },
-    { command: "attachtest", description: "send test file attachments" },
     { command: "resume", description: "resume a codex session" },
     { command: "new", description: "clear active resumed session" },
     { command: "compress", description: "compress active session context" },
@@ -2740,83 +2739,6 @@ async function handleScreenshotCommand(chatId) {
   }
 }
 
-async function handleAttachTestCommand(chatId, options = {}) {
-  const requestedWorkerId = String(options.workerId || "").trim();
-  const routeWorkerId = requestedWorkerId || getActiveWorkerForChat(chatId) || ORCH_GENERAL_WORKER_ID;
-  const worker = routeWorkerId ? getCodexWorker(routeWorkerId) : null;
-
-  const token = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  const stamp = nowIso();
-
-  const writeTestFile = (dir, fileName, content) => {
-    ensureDir(dir);
-    const full = path.join(dir, fileName);
-    fs.writeFileSync(full, content, "utf8");
-    return fileName;
-  };
-
-  const attachments = [];
-
-  // Always test the global attachment root.
-  const globalName = writeTestFile(
-    ATTACH_ROOT,
-    `attachtest-global-${token}.md`,
-    [
-      "# AIDOLON attachment test",
-      "",
-      `- time: ${stamp}`,
-      `- worker: ${routeWorkerId}`,
-      `- attach_root: (redacted)`,
-      "",
-      "If you received this as a Telegram document, attachments are working.",
-      "",
-    ].join("\n"),
-  );
-  attachments.push({ path: globalName, caption: `Attach test (global, bare) ${stamp}` });
-
-  // Only test "runtime/out/..." when ATTACH_ROOT is the default runtime/out.
-  const defaultOutDir = path.join(ROOT, "runtime", "out");
-  let canTestRuntimeOutPrefix = false;
-  try {
-    canTestRuntimeOutPrefix = path.resolve(ATTACH_ROOT) === path.resolve(defaultOutDir);
-  } catch {
-    canTestRuntimeOutPrefix = false;
-  }
-  if (canTestRuntimeOutPrefix) {
-    attachments.push({ path: `runtime/out/${globalName}`, caption: `Attach test (global, runtime/out) ${stamp}` });
-  }
-
-  // If we're routing to a repo worker, also test that worker's workdir/runtime/out.
-  const workerOutDir = worker && worker.kind === "repo" && worker.workdir
-    ? path.join(worker.workdir, "runtime", "out")
-    : "";
-  if (workerOutDir) {
-    const safeWorkerTag = String(routeWorkerId || "worker").replace(/[^a-zA-Z0-9_-]+/g, "-").slice(0, 32) || "worker";
-    const workerName = writeTestFile(
-      workerOutDir,
-      `attachtest-${safeWorkerTag}-${token}.md`,
-      [
-        "# AIDOLON attachment test (repo worker)",
-        "",
-        `- time: ${stamp}`,
-        `- worker: ${routeWorkerId}`,
-        "",
-        "If you received this as a Telegram document, worker-scoped attachments are working.",
-        "",
-      ].join("\n"),
-    );
-    attachments.push({ path: workerName, caption: `Attach test (worker, bare) ${stamp}` });
-    attachments.push({ path: `runtime/out/${workerName}`, caption: `Attach test (worker, runtime/out) ${stamp}` });
-  }
-
-  await sendMessage(
-    chatId,
-    `Attachment test: sending ${attachments.length} file(s) for worker ${routeWorkerId}.`,
-    { routeWorkerId },
-  );
-  await sendAttachments(chatId, attachments, { routeWorkerId });
-}
-
 function parseCommand(text) {
   let t = String(text || "").trim();
   if (!t) return null;
@@ -2858,7 +2780,6 @@ async function sendHelp(chatId) {
     "/clear - clear queued prompts",
     "/screenshot - capture and send screenshot(s) (all monitors when available)",
     "/sendfile <path> [caption] - send a file attachment (from ATTACH_ROOT)",
-    "/attachtest [worker_id] - send a couple small test attachments (debugging)",
     "/resume - list recent AIDOLON sessions with prefill buttons",
     "/resume <session_id> [text] - resume a session, optionally with text",
     "/new - clear active resumed session",
@@ -3464,20 +3385,6 @@ async function handleCommand(chatId, text) {
         return true;
       }
       await sendAttachments(chatId, [{ path: relPath, caption }]);
-      return true;
-    }
-    case "/attachtest": {
-      const arg = String(parsed.arg || "").trim();
-      let wid = getActiveWorkerForChat(chatId) || ORCH_GENERAL_WORKER_ID;
-      if (arg) {
-        const resolved = resolveWorkerIdFromUserInput(arg);
-        if (!resolved) {
-          await sendMessage(chatId, `Unknown worker: ${arg}\nUse /workers to list workers.`);
-          return true;
-        }
-        wid = resolved;
-      }
-      await handleAttachTestCommand(chatId, { workerId: wid });
       return true;
     }
     case "/cmd": {
