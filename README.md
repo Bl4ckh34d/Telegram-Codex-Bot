@@ -1,175 +1,188 @@
-# AIDOLON
+# Telegram-Codex-Bot (AIDOLON) 🤖🎙️🧠
 
-Minimal Telegram <-> AIDOLON (Codex CLI) bridge with basic hardening and stability controls.
+Talk to the Codex CLI from Telegram. Text in, text out. Voice in, voice out. Screenshots. Attachments. Multi-repo routing so you’re not stuck waiting on one giant job. ✨
 
-## Features
-- Long-polling Telegram bot listener
-- Chat allowlist enforcement (`TELEGRAM_CHAT_ID` + optional `TELEGRAM_ALLOWED_CHAT_IDS`)
-- Single-instance lock (`runtime/bot.lock`)
-- Startup stale-update skip (prevents old messages from being re-run)
-- FIFO queue with size limits
-- Short progress updates while Codex is running (configurable interval)
-- Cancel active run (`/cancel` or `/stop`)
-- Restart bot process from Telegram (`/restart`)
-- Safe Codex invocation via `spawn`; Windows `.cmd` shims use shell mode when required
-- Default model/reasoning set to `gpt-5.3-codex` + `xhigh`
-- Full-access Codex mode enabled by default (`--dangerously-bypass-approvals-and-sandbox`)
-- Optional WSL fallback when `codex` is not on Windows PATH (`CODEX_USE_WSL=auto`, optional `CODEX_WSL_BIN`)
-- Voice note transcription via local Whisper venv (`setup-whisper-venv.cmd`)
-- Optional persistent Whisper worker (`WHISPER_KEEP_LOADED=1`) to keep the model loaded between voice notes
-- Session resume workflow with Telegram prefill buttons (`/resume`)
-- Active-session mode (plain text continues in resumed session until `/new`)
-- Codex command control menu (`/codex`) with staged command confirmation flow
-- Per-chat model + reasoning picker (`/model`)
-- Stream Codex stdout/stderr into the bot terminal (`CODEX_STREAM_OUTPUT_TO_TERMINAL=1`)
+This project is built for personal use on your own machine: it runs as a long-polling Telegram bot and executes the Codex CLI locally.
 
-## Files
-- `bot.js` - main bridge process
-- `.env` - runtime config
-- `.env.example` - template
-- `start.cmd` - launcher for Windows CMD
-- `ensure-codex-path.ps1` - adds `%APPDATA%\npm` to user PATH when needed
-- `setup-whisper-venv.cmd` - creates `.venv` and installs `openai-whisper`
-- `whisper_transcribe.py` - small transcription helper called by bot
-- `aidolon_tts_synthesize.py` - small TTS helper (MiraTTS -> WAV)
-- `aidolon_tts_worker.py` - optional persistent TTS worker process
-- `aidolon_whisper_worker.py` - optional persistent Whisper worker process
-- `setup-tts.cmd` - installs bot-local TTS deps (auto-run by `start.cmd` when `TTS_ENABLED=1`)
-- `codex_prompt.txt` - base (system) prompt preamble
-- `codex_prompt_voice.txt` - voice/TTS-friendly prompt preamble used for voice-note transcripts
-- `runtime/` - state, lock, and output files
+## What You Get (The Fun Parts) 😎
 
-## Run
-From CMD:
+- 🧠 Codex-in-Telegram: send a message, get an answer
+- 🎙️ Voice notes: Whisper transcribes them locally, then Codex handles the prompt
+- 🔊 Optional voice replies: auto-reply to voice notes with TTS voice messages
+- 🖼️ Vision: ask about images you send, or screenshots the bot captures
+- 🖥️ Multi-monitor screenshots: `/screenshot` grabs every monitor if you have more than one
+- 🧵 Multi-worker orchestration: separate “workspaces” per repo so long jobs don’t block everything
+- 🔁 Session resume + compress: keep long work going without constantly re-explaining yourself
+- 🧰 Attachments: the assistant can generate files and send them to you in chat
+- 🔒 A few safety rails: chat allowlist, single-instance lock, stale-update skip
+
+## Quickstart 🚀
+
+1. Create a Telegram bot and grab the token.
+2. Find your Telegram chat id.
+3. Copy `.env.example` to `.env` and fill in the basics:
+   - `TELEGRAM_BOT_TOKEN`
+   - `TELEGRAM_CHAT_ID`
+4. Start the bot.
+
+Notes:
+- Windows is the “first-class” environment here (screenshot capture is Windows-only).
+- Voice notes need Whisper installed locally (the repo includes a setup script).
+- TTS needs ffmpeg available (or configured).
+
+## Run It (For Real) 🏁
+
+Requirements:
+- Node.js 18+ (recommended)
+- Codex CLI installed and logged in
+
+Windows (recommended):
 
 ```bat
-cd C:\Users\ROG\Desktop\AIDOLON
+copy .env.example .env
 start.cmd
 ```
 
-Whisper setup (optional one-time):
+Whisper (voice note transcription):
 
 ```bat
-cd C:\Users\ROG\Desktop\AIDOLON
 setup-whisper-venv.cmd
 ```
 
-By default, `start.cmd` will try to bootstrap `uv` (unless `UV_ENABLED=0`) and will auto-run `setup-whisper-venv.cmd` when `WHISPER_ENABLED=1`. Control with `UV_ENABLED=auto|1|0` and `WHISPER_ENABLED=0|1` in `.env`.
+TTS:
+- Enable `TTS_ENABLED=1` in `.env`
+- The Windows launcher will try to bootstrap TTS deps automatically when needed
 
-## Telegram commands
-- `/help` - command help
-- `/status` - current worker and queue status
-- `/queue` - preview queued prompts
-- `/codex` or `/commands` - show command menu
-- `/cmd <args>` - stage raw Codex CLI command
-- `/confirm` (or `/run`) - run staged `/cmd`
-- `/reject` (or `/deny`) - cancel staged `/cmd`
-- `/cancel` or `/stop` - stop the active Codex run
-- `/clear` - clear queued prompts
-- `/screenshot` - capture and send the primary display as an image
-- `/sendfile <path> [caption]` - send a file attachment (from `ATTACH_ROOT`)
-- `/ask <question>` - analyze the last image you sent (requires `VISION_ENABLED=1`)
-- `/see <question>` - take a screenshot and analyze it (requires `VISION_ENABLED=1`)
-- `/imgclear` - clear the last image context (so plain text goes back to Codex)
-- `/model` - pick the model + reasoning effort for this chat
-- `/tts <text>` - synthesize TTS and send a Telegram voice message (requires `TTS_ENABLED=1`)
-- `/resume` - list recent local sessions with prefill buttons
-- `/resume <session_id> [prompt]` - activate/resume a session
-- `/new` - clear active resumed session
-- `/compress [hint]` - ask Codex to compress/summarize active session context
+Non-Windows:
+
+```bash
+node bot.js
+```
+
+## Commands (The Greatest Hits) 🎛️
+
+Basics:
+- `/help` - help text
+- `/status` - worker + queue status
+- `/cancel` - stop active run(s) for this chat
 - `/restart` - restart the bot process
-- Voice notes are transcribed and queued as prompts
 
-### Telegram slash suggestions
-Telegram's command autocomplete is driven by `setMyCommands`:
-- Make sure `TELEGRAM_SET_COMMANDS=1`
-- Configure `TELEGRAM_COMMAND_SCOPE` (supports comma-separated scopes like `default,all_private_chats,all_group_chats`)
-- If Telegram doesn't show newly added commands yet, restart the bot
+Workspaces (multi-repo, parallel workers):
+- `/workers` - list your workspaces
+- `/use <worker>` - switch active workspace
+- `/spawn <path> [title]` - create a new repo workspace
+- `/retire <worker>` - remove a workspace
 
-## Image analysis (vision)
-If enabled, the bot can answer questions about images you send in Telegram:
-- Send an image with a caption: the caption is used as the question.
-- Send an image without a caption, then send a question as text (it will analyze the last image).
-- Use `/ask <question>` explicitly to analyze the last image.
-- Use `/see <question>` to take a screenshot on the host machine and analyze it.
+Vision:
+- Send an image with a caption: caption becomes the question
+- Send an image without caption, then ask a question as plain text (it uses the last image)
+- `/ask <question>` - force “use the last image”
+- `/see <question>` - take screenshot(s), then analyze them
 
-Config (in `.env`):
-- `VISION_ENABLED=1`
-- Requires Codex CLI image support (`codex exec --image`) and an authenticated `codex` login
-- Uses `CODEX_MODEL` for vision (make sure it supports images)
-- Optional: `VISION_MAX_FILE_MB`, `VISION_AUTO_FOLLOWUP_SEC`
+TTS:
+- `/tts <text>` - force a voice note reply
 
-## TTS (voice messages)
-The bot can synthesize text into a Telegram voice message using MiraTTS:
-- Enable: `TTS_ENABLED=1`
-- Configure: `TTS_MODEL` (path to the local MiraTTS model directory)
-- Optional: `TTS_REFERENCE_AUDIO` (defaults to `assets\\reference.wav`, gitignored)
-- Optional: `TTS_SAMPLE_RATE` (defaults to `48000`)
-- Optional: `TTS_POSTPROCESS_ENABLED=1` to apply ffmpeg audio effects before sending.
-  - Preset: `TTS_POSTPROCESS_PRESET=audacity-stack` (best-effort approximation of an Audacity-like stack).
-  - Or set a raw ffmpeg filtergraph: `TTS_POSTPROCESS_FFMPEG_AF=...` (overrides preset).
-  - Pitch shifting in the preset uses ffmpeg's `rubberband` filter when available; otherwise pitch shift is skipped.
-- Optional: `TTS_REPLY_TO_VOICE=1` to auto-reply to incoming voice notes with a voice message (otherwise replies are text).
-- Optional (auto voice replies): split long `SPOKEN` into multiple voice notes with `TTS_VOICE_MAX_CHARS`, `TTS_VOICE_MAX_SENTENCES`, `TTS_VOICE_MAX_CHUNKS` (0 = unlimited; batch-synthesized for speed).
-- Run: `/tts <text>`
-- Requires `ffmpeg` on PATH (or set `TTS_FFMPEG_BIN`).
-- `start.cmd` will automatically run `setup-tts.cmd` to create `TTS_VENV_PATH` (default `.tts-venv`) and install MiraTTS deps for this repo.
+Sessions:
+- `/resume` - list sessions
+- `/resume <id> [text]` - resume a session (optionally with a prompt)
+- `/new` - clear active resumed session
+- `/compress [hint]` - ask Codex to compress/summarize the active session
 
-## Base prompt (system prompt)
-The preamble sent to Codex before each user message is loaded from `codex_prompt.txt` (set `CODEX_PROMPT_FILE` to change the path).
+Attachments:
+- `/sendfile <path> [caption]` - send a file from `ATTACH_ROOT`
 
-For voice-note transcripts (incoming Telegram voice messages), the bot can use a separate “spoken” prompt preamble from `codex_prompt_voice.txt` (set `CODEX_VOICE_PROMPT_FILE` to change the path). This is useful when `TTS_REPLY_TO_VOICE=1` so responses are TTS-friendly (no commands, paths, or other symbol-heavy text).
+## Workspaces + Router (Why This Bot Feels Snappy) 🧵
 
-## File attachments
-The bot can send local files as Telegram document attachments.
+The big workflow problem with a single Codex loop is head-of-line blocking: one long job and everything else queues behind it.
 
-- Manual: `/sendfile <path> [caption]` (path is resolved relative to `ATTACH_ROOT`)
-- Assistant-driven: include one or more lines in a reply:
+This bot runs multiple Codex “workers” in parallel:
+- One worker = one Codex session lane + one working directory (“workspace”)
+- Each worker runs one job at a time
+- Different workers run at the same time
+
+Routing:
+- The bot uses an LLM router to pick the best worker for each message
+- If you reply to a previous bot message, that acts as a strong hint to keep the same worker
+- The router only proposes creating a new repo worker when you include an explicit local path
+
+Hard cap:
+- By default you get 5 Codex workers max (configurable)
+- If the cap is hit and a new workspace is needed, the bot asks you to retire one (button click), then continues
+
+Tip:
+- On startup, the bot will usually create a dedicated workspace for its own repo (so it can self-edit fast). You can retire it if you don’t want it.
+
+## Voice Notes (Whisper) 🎙️
+
+When you send a voice note:
+1. The bot downloads it
+2. Local Whisper transcribes it
+3. The transcript is routed like any normal message
+
+This runs in its own lane so voice transcription doesn’t block other bot work.
+
+## Voice Replies (TTS) 🔊
+
+If enabled, the bot can reply to voice notes with a Telegram voice message (instead of a wall of text).
+
+It uses a “voice-style” prompt so answers stay TTS-friendly. The preferred output format is:
+- SPOKEN: short, clean, easy to listen to
+- TEXT_ONLY: details that should not be spoken aloud (commands, paths, long lists, etc)
+
+## Screenshots + Vision 🖼️🖥️
+
+- `/screenshot` sends one screenshot per monitor (primary first).
+- `/see <question>` captures screenshots and includes them in the vision prompt.
+
+## Attachments 📎
+
+The assistant can send you files in two ways:
+
+1. Manual:
+- `/sendfile <relative-path> [caption]` (relative to `ATTACH_ROOT`)
+
+2. Assistant-driven:
+- The assistant can include lines like:
   - `ATTACH: relative/path.ext | optional caption`
-  - The bot uploads the file(s) and removes these `ATTACH:` lines from the displayed message.
+  - The bot uploads the files and strips those lines from the visible message
 
-Config (in `.env`):
-- `ATTACH_ENABLED=1`
-- `ATTACH_ROOT` (defaults to `runtime/out`)
-- `ATTACH_MAX_FILE_MB`
-- `ATTACH_UPLOAD_TIMEOUT_MS`
+## Configuration (The Stuff You Actually Touch) ⚙️
 
-## Progress updates
-- `PROGRESS_UPDATES_ENABLED=1` enables short in-chat progress pings while a job is running (default is off)
-- `PROGRESS_FIRST_UPDATE_SEC=0` minimum runtime before sending progress messages (set >0 to suppress updates for short runs)
-- `PROGRESS_UPDATE_INTERVAL_SEC=30` minimum seconds between progress messages (updates are output-driven, not a fixed timer)
+Minimum required:
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
 
-## Timeouts
-- `CODEX_TIMEOUT_MS` sets a hard wall-clock timeout for Codex jobs (default `0` = disabled).
-- `TTS_TIMEOUT_MS` sets a hard wall-clock timeout for TTS synthesis (default `0` = disabled).
-- `TTS_ENCODE_TIMEOUT_MS` sets a hard timeout for the ffmpeg encoding step (default `120000` ms).
-- `TTS_UPLOAD_TIMEOUT_MS` sets a hard timeout for Telegram voice uploads for TTS jobs (default `120000` ms, unless you set `TELEGRAM_UPLOAD_TIMEOUT_MS`).
-- `TTS_HARD_TIMEOUT_MS` is a safety net so a stuck TTS job can't wedge the queue forever (default `300000` ms).
-- `TTS_TIMEOUT_RETRIES` sets how many extra attempts to make when a TTS stage times out (default `2`). Synthesis failures may also be retried (best-effort).
-- `SUBPROCESS_PROBE_TIMEOUT_MS` sets a timeout for spawnSync-based probes (ffmpeg filters, `--version` checks). Default `5000` ms.
-- `TELEGRAM_API_TIMEOUT_MS` sets a timeout for Telegram API JSON requests (default `60000` ms; set `0` to disable).
-- `TELEGRAM_UPLOAD_TIMEOUT_MS` sets a timeout for Telegram API multipart uploads (default `120000` ms; set `0` to disable).
+Most-used toggles:
+- `WHISPER_ENABLED` - voice note transcription on/off
+- `TTS_ENABLED` and `TTS_REPLY_TO_VOICE` - voice replies
+- `VISION_ENABLED` - image + screenshot analysis
+- `ORCH_MAX_CODEX_WORKERS` and `ORCH_ROUTER_ENABLED` - multi-worker routing
 
-## Model picker
-- `/model` shows buttons to pick a model and a reasoning effort for the current chat.
-- Configure the button list with `CODEX_MODEL_CHOICES` (comma-separated).
-- Optionally set `CODEX_REASONING_EFFORT_CHOICES` (comma-separated). Default is low, medium, high, xhigh.
+Prompts:
+- `codex_prompt.txt` - normal text mode
+- `codex_prompt_voice.txt` - voice replies (TTS-friendly)
+- `codex_prompt_router.txt` - routing decisions (do not do work, only choose a worker)
 
-## Terminal output
-- `CODEX_STREAM_OUTPUT_TO_TERMINAL=1` streams Codex stdout/stderr into the terminal running the bot (default is on).
-- Set `CODEX_STREAM_OUTPUT_TO_TERMINAL=0` to disable if it's too noisy.
-- `WHISPER_STREAM_OUTPUT_TO_TERMINAL=1` streams Whisper (STT) helper stdout/stderr into the same terminal (default is on).
-- Set `WHISPER_STREAM_OUTPUT_TO_TERMINAL=0` to disable if it's too noisy.
-- `TTS_STREAM_OUTPUT_TO_TERMINAL=1` streams TTS + ffmpeg stdout/stderr into the same terminal (default is on).
-- Set `TTS_STREAM_OUTPUT_TO_TERMINAL=0` to disable if it's too noisy.
-- `TERMINAL_COLORS=1` and `CHAT_LOG_USE_COLORS=1` colorize chat logs in the terminal (your messages vs bot replies).
-- Set `NO_COLOR=1` to force-disable ANSI colors.
+## Privacy + Safety Notes 🔒
 
-## Telegram formatting
-By default, the bot renders `**bold**` as Telegram bold. Disable with `TELEGRAM_FORMAT_BOLD=0`.
+This bot is designed to run on a personal machine, for a small allowlisted set of chats.
 
-## Security notes
-- By default, only `TELEGRAM_CHAT_ID` is accepted.
-- Group chats are blocked unless `ALLOW_GROUP_CHAT=1`.
-- Default policy is full-access (`CODEX_DANGEROUS_FULL_ACCESS=1`).
-- If token/chat ID were exposed, rotate token in `@BotFather` and update `.env`.
+- `.env` is gitignored (keep it that way)
+- `runtime/` is gitignored (logs, chat logs, screenshots, outputs, state)
+- By default, only the configured chat id is allowed
+- Group chats are blocked unless you opt in
+
+Important: by default this bot runs Codex in full-access mode. That’s the point for a personal automation bot, but you should treat it like “giving shell access to an assistant.” Use it in an environment you trust.
+
+## Troubleshooting 🧯
+
+- “poll error: fetch failed”
+  - Usually a transient network/Telegram hiccup. The bot retries automatically.
+- Telegram command autocomplete not updating
+  - Make sure set-commands is enabled, then restart the bot.
+- “unexpected argument …”
+  - Often means an older bot window/process is still running. Stop old instances and restart.
+
+## License
+
+Whatever license is in this repo applies. If there isn’t one yet and you want one, say the word and I’ll add it.
