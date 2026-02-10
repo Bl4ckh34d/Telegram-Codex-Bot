@@ -3743,23 +3743,75 @@ function _isPathInside(rootDir, candidatePath) {
   return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
-function resolveAttachPath(inputPath) {
+function resolveAttachPath(inputPath, options = {}) {
   const raw = String(inputPath || "").trim();
   if (!raw) throw new Error("empty path");
 
-  const resolved = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(ATTACH_ROOT, raw);
-  if (!_isPathInside(ATTACH_ROOT, resolved)) {
-    throw new Error("path is outside ATTACH_ROOT");
+  const workerId = String(options?.workerId || "").trim();
+  const worker = workerId ? getCodexWorker(workerId) : null;
+  const workerOutDir = worker && worker.kind === "repo" && worker.workdir
+    ? path.join(worker.workdir, "runtime", "out")
+    : "";
+
+  const allowedRoots = [ATTACH_ROOT, workerOutDir]
+    .map((p) => String(p || "").trim())
+    .filter(Boolean)
+    .map((p) => {
+      try {
+        return path.resolve(p);
+      } catch {
+        return p;
+      }
+    });
+
+  const baseDirs = [ATTACH_ROOT, ROOT, worker?.workdir || "", workerOutDir]
+    .map((p) => String(p || "").trim())
+    .filter(Boolean);
+
+  const candidates = [];
+  if (path.isAbsolute(raw)) {
+    candidates.push(path.resolve(raw));
+  } else {
+    for (const base of baseDirs) {
+      try {
+        candidates.push(path.resolve(base, raw));
+      } catch {
+        // best effort
+      }
+    }
   }
-  if (!fs.existsSync(resolved)) throw new Error("file does not exist");
-  const st = fs.statSync(resolved);
-  if (!st.isFile()) throw new Error("not a file");
-  const limMb = Number(ATTACH_MAX_FILE_MB);
-  const maxBytes = Number.isFinite(limMb) && limMb > 0 ? limMb * 1024 * 1024 : Infinity;
-  if (Number.isFinite(maxBytes) && st.size > maxBytes) {
-    throw new Error(`file too large (${Math.round(st.size / (1024 * 1024))}MB > ${ATTACH_MAX_FILE_MB}MB)`);
+
+  const uniqueCandidates = [];
+  const seen = new Set();
+  for (const c of candidates) {
+    const key = String(c || "").trim();
+    if (!key) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    uniqueCandidates.push(key);
   }
-  return resolved;
+
+  const isAllowed = (p) => allowedRoots.some((root) => _isPathInside(root, p));
+
+  let hadAllowedCandidate = false;
+  for (const resolved of uniqueCandidates) {
+    if (!isAllowed(resolved)) continue;
+    hadAllowedCandidate = true;
+    if (!fs.existsSync(resolved)) continue;
+    const st = fs.statSync(resolved);
+    if (!st.isFile()) continue;
+    const limMb = Number(ATTACH_MAX_FILE_MB);
+    const maxBytes = Number.isFinite(limMb) && limMb > 0 ? limMb * 1024 * 1024 : Infinity;
+    if (Number.isFinite(maxBytes) && st.size > maxBytes) {
+      throw new Error(`file too large (${Math.round(st.size / (1024 * 1024))}MB > ${ATTACH_MAX_FILE_MB}MB)`);
+    }
+    return resolved;
+  }
+
+  if (!hadAllowedCandidate) {
+    throw new Error("path is outside allowed attachment roots");
+  }
+  throw new Error("file does not exist");
 }
 
 function extractAttachDirectives(text) {
@@ -3797,9 +3849,13 @@ async function sendAttachments(chatId, attachments, options = {}) {
     if (!rawPath) continue;
     let resolved;
     try {
-      resolved = resolveAttachPath(rawPath);
+      resolved = resolveAttachPath(rawPath, { workerId: routeWorkerId });
     } catch (err) {
-      await sendMessage(chatId, `Attachment skipped: ${rawPath} (${String(err?.message || err)})`);
+      const msg = String(err?.message || err);
+      const hint = msg === "file does not exist"
+        ? " (Tip: ATTACH paths are relative to ATTACH_ROOT; don't include runtime/out/ twice.)"
+        : "";
+      await sendMessage(chatId, `Attachment skipped: ${rawPath} (${msg})${hint}`);
       continue;
     }
 
