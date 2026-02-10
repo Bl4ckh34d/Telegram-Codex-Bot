@@ -2622,20 +2622,117 @@ async function capturePrimaryScreenshot(filePath) {
   }
 }
 
+async function captureAllScreenshots(outputDir, prefix = "screenshot") {
+  if (process.platform !== "win32") {
+    throw new Error("Screenshot capture is only configured for Windows in this bot.");
+  }
+
+  const dir = String(outputDir || "").trim();
+  if (!dir) {
+    throw new Error("Screenshot output directory is required.");
+  }
+  ensureDir(dir);
+
+  const safePrefix = String(prefix || "screenshot").trim() || "screenshot";
+  const psScript = [
+    "Add-Type -AssemblyName System.Windows.Forms",
+    "Add-Type -AssemblyName System.Drawing",
+    "$dir = $env:TG_SCREENSHOT_DIR",
+    "$prefix = $env:TG_SCREENSHOT_PREFIX",
+    "if ([string]::IsNullOrWhiteSpace($dir)) { throw 'Missing TG_SCREENSHOT_DIR' }",
+    "if ([string]::IsNullOrWhiteSpace($prefix)) { $prefix = 'screenshot' }",
+    "if (!(Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }",
+    "$primaryName = [System.Windows.Forms.Screen]::PrimaryScreen.DeviceName",
+    "$screens = [System.Windows.Forms.Screen]::AllScreens | Sort-Object @{Expression={ $_.DeviceName -ne $primaryName }; Ascending=$true}, DeviceName",
+    "$idx = 0",
+    "foreach ($s in $screens) {",
+    "  $idx = $idx + 1",
+    "  $bounds = $s.Bounds",
+    "  $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height",
+    "  $gfx = [System.Drawing.Graphics]::FromImage($bmp)",
+    "  try {",
+    "    $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)",
+    "    $outPath = Join-Path $dir (\"{0}-{1}.png\" -f $prefix, $idx)",
+    "    $bmp.Save($outPath, [System.Drawing.Imaging.ImageFormat]::Png)",
+    "    Write-Output $outPath",
+    "  } finally {",
+    "    $gfx.Dispose()",
+    "    $bmp.Dispose()",
+    "  }",
+    "}",
+  ].join("; ");
+
+  const stdout = await new Promise((resolve, reject) => {
+    const proc = spawn(
+      "powershell.exe",
+      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psScript],
+      {
+        cwd: ROOT,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          TG_SCREENSHOT_DIR: dir,
+          TG_SCREENSHOT_PREFIX: safePrefix,
+        },
+      },
+    );
+
+    let out = "";
+    let stderr = "";
+    proc.stdout.on("data", (buf) => {
+      out = appendTail(out, String(buf || ""), 32_000);
+    });
+    proc.stderr.on("data", (buf) => {
+      stderr = appendTail(stderr, String(buf || ""), 12_000);
+    });
+    proc.on("error", (err) => {
+      reject(new Error(`Failed to start PowerShell: ${err.message || err}`));
+    });
+    proc.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(stderr.trim() || `PowerShell failed with exit ${code}`));
+        return;
+      }
+      resolve(out);
+    });
+  });
+
+  const files = String(stdout || "")
+    .split(/\r?\n/)
+    .map((s) => String(s || "").trim())
+    .filter(Boolean);
+
+  const existing = [];
+  for (const p of files) {
+    if (p && fs.existsSync(p)) existing.push(p);
+  }
+  if (existing.length === 0) {
+    throw new Error("No screenshots were created.");
+  }
+
+  return existing;
+}
+
 async function handleScreenshotCommand(chatId) {
-  const screenshotPath = path.join(
-    OUT_DIR,
-    `screenshot-${Date.now()}-${Math.random().toString(36).slice(2)}.png`,
-  );
+  const prefix = `screenshot-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const created = [];
 
   try {
-    await capturePrimaryScreenshot(screenshotPath);
-    await sendPhoto(chatId, screenshotPath, {
-      caption: `Screenshot ${nowIso()}`,
-    });
+    const paths = await captureAllScreenshots(OUT_DIR, prefix);
+    created.push(...paths);
+    const stamp = nowIso();
+    for (let i = 0; i < paths.length; i += 1) {
+      const label = i === 0 ? "Primary" : `Screen ${i + 1}`;
+      await sendPhoto(chatId, paths[i], {
+        caption: `Screenshot ${stamp} (${label})`,
+      });
+    }
   } finally {
     try {
-      if (fs.existsSync(screenshotPath)) fs.unlinkSync(screenshotPath);
+      for (const p of created) {
+        if (p && fs.existsSync(p)) fs.unlinkSync(p);
+      }
     } catch {
       // best effort
     }
@@ -2681,7 +2778,7 @@ async function sendHelp(chatId) {
     "/queue - show pending prompts",
     "/cancel - stop current AIDOLON run",
     "/clear - clear queued prompts",
-    "/screenshot - capture and send primary screen",
+    "/screenshot - capture and send screenshot(s) (all monitors when available)",
     "/sendfile <path> [caption] - send a file attachment (from ATTACH_ROOT)",
     "/resume - list recent AIDOLON sessions with prefill buttons",
     "/resume <session_id> [text] - resume a session, optionally with text",
@@ -3420,18 +3517,19 @@ async function handleCommand(chatId, text) {
         return true;
       }
 
-      const screenshotPath = path.join(
-        IMAGE_DIR,
-        `screenshot-${Date.now()}-${Math.random().toString(36).slice(2)}.png`,
-      );
+      const prefix = `see-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       try {
         await sendMessage(chatId, "Taking screenshot...");
-        await capturePrimaryScreenshot(screenshotPath);
-        setLastImageForChat(chatId, { path: screenshotPath, mime: "image/png", name: path.basename(screenshotPath) });
+        const paths = await captureAllScreenshots(IMAGE_DIR, prefix);
+        // Keep the primary screenshot as the "last image" context.
+        const primaryPath = String(paths[0] || "").trim();
+        if (primaryPath) {
+          setLastImageForChat(chatId, { path: primaryPath, mime: "image/png", name: path.basename(primaryPath) });
+        }
         const activeSession = getActiveSessionForChat(chatId);
         await enqueuePrompt(chatId, q, "see-screenshot", {
           resumeSessionId: activeSession || "",
-          imagePaths: [screenshotPath],
+          imagePaths: paths,
         });
       } catch (err) {
         await sendMessage(chatId, `Screenshot vision failed: ${String(err?.message || err)}`);
