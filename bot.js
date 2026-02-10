@@ -550,6 +550,8 @@ const WHISPER_PYTHON = process.platform === "win32"
   : path.join(WHISPER_VENV_PATH, "bin", "python");
 const WHISPER_MODEL = String(process.env.WHISPER_MODEL || "base").trim();
 const WHISPER_LANGUAGE = String(process.env.WHISPER_LANGUAGE || "auto").trim();
+// 0 disables the size cap (Telegram still enforces its own limits).
+const WHISPER_MAX_FILE_MB = toInt(process.env.WHISPER_MAX_FILE_MB, 20);
 const WHISPER_STREAM_OUTPUT_TO_TERMINAL = toBool(
   process.env.WHISPER_STREAM_OUTPUT_TO_TERMINAL,
   true,
@@ -2759,37 +2761,55 @@ function parseCommand(text) {
   };
 }
 
+function fmtBold(text) {
+  const t = String(text || "");
+  return TELEGRAM_FORMAT_BOLD ? `**${t}**` : t;
+}
+
 async function sendHelp(chatId) {
   const lines = [
-    "AIDOLON is online.",
+    `${fmtBold("AIDOLON")} is online.`,
     "",
-    "Send plain text (or a voice message) to prompt AIDOLON.",
-    "Commands:",
-    "/help - this help",
-    "/codex or /commands - show AIDOLON command menu",
-    "/cmd <args> - stage a raw AIDOLON CLI command (needs /confirm)",
-    "/confirm - run pending /cmd command",
-    "/reject - cancel pending /cmd command",
-    "/status - worker status",
-    "/workers - list workspaces/workers",
-    "/use <worker_id> - switch active workspace",
-    "/spawn <path> [title] - create a new repo workspace",
-    "/retire <worker_id> - remove a workspace",
-    "/queue - show pending prompts",
-    "/cancel - stop current AIDOLON run",
-    "/clear - clear queued prompts",
-    "/screenshot - capture and send screenshot(s) (all monitors when available)",
-    "/sendfile <path> [caption] - send a file attachment (from ATTACH_ROOT)",
-    "/resume - list recent AIDOLON sessions with prefill buttons",
-    "/resume <session_id> [text] - resume a session, optionally with text",
-    "/new - clear active resumed session",
-    "/compress [hint] - summarize/compress active session context",
-    "/ask <question> - analyze your last sent image",
-    "/see <question> - take a screenshot and analyze it",
-    "/imgclear - clear the last image context (so plain text goes back to AIDOLON)",
-    "/model - pick the model + reasoning effort for this chat",
-    "/tts <text> - send a TTS voice message (requires TTS_ENABLED=1)",
-    "/restart - restart the bot process",
+    fmtBold("Quick start"),
+    "- Send plain text (or a voice message) to prompt AIDOLON.",
+    "- Use /codex for a menu, or stage a CLI command with /cmd then run it with /confirm.",
+    "",
+    fmtBold("Core"),
+    "- /status - worker + queue status",
+    "- /workers - list workspaces/workers",
+    "- /use <worker_id or title> - switch active workspace",
+    "- /queue - show queued prompts",
+    "- /cancel - stop current AIDOLON run",
+    "- /clear - clear queued prompts",
+    "",
+    fmtBold("CLI flow"),
+    "- /cmd <args> - stage a raw AIDOLON CLI command",
+    "- /confirm - run staged /cmd command",
+    "- /reject - cancel staged /cmd command",
+    "",
+    fmtBold("Workspaces"),
+    "- /spawn <path> [title] - create a new repo workspace",
+    "- /retire <worker_id> - remove a workspace",
+    "",
+    fmtBold("Sessions"),
+    "- /resume - list recent sessions (prefill buttons)",
+    "- /resume <session_id> [text] - resume a session",
+    "- /new - clear active resumed session",
+    "- /compress [hint] - summarize/compress active session context",
+    "",
+    fmtBold("Media"),
+    "- /screenshot - capture and send screenshot(s) (all monitors when available)",
+    "- /see <question> - take a screenshot and analyze it",
+    "- /ask <question> - analyze your last sent image",
+    "- /imgclear - clear the last image context",
+    "- /tts <text> - send a TTS voice message (requires TTS_ENABLED=1)",
+    "- /sendfile <path> [caption] - send a file attachment (from ATTACH_ROOT)",
+    "",
+    fmtBold("Other"),
+    "- /codex or /commands - show AIDOLON command menu",
+    "- /model - pick the model + reasoning effort for this chat",
+    "- /restart - restart the bot process",
+    "- /help - show this help",
   ];
   await sendMessage(chatId, lines.join("\n"));
 }
@@ -2798,6 +2818,7 @@ async function sendStatus(chatId) {
   const queueCap = MAX_QUEUE_SIZE > 0 ? String(MAX_QUEUE_SIZE) : "unlimited";
   const queued = totalQueuedJobs();
   const activeWorkerId = getActiveWorkerForChat(chatId);
+  const activeWorkerLabel = activeWorkerId || "(none)";
   const activeSession = getActiveSessionForChat(chatId, activeWorkerId);
   const prefs = getChatPrefs(chatId);
   const effectiveModel = String(prefs.model || CODEX_MODEL || "").trim() || "(default)";
@@ -2809,38 +2830,64 @@ async function sendStatus(chatId) {
   const routerReasoning = String(ORCH_ROUTER_REASONING_EFFORT || "").trim() || "(default)";
 
   const lines = [
-    "Bot status",
-    `- workers: ${codexWorkers.length}/${ORCH_MAX_CODEX_WORKERS}`,
-    `- active_worker: ${activeWorkerId}`,
-    `- queue: ${queued}/${queueCap}`,
+    fmtBold("Status"),
+    "",
+    fmtBold("Chat"),
+    `- active_worker: ${activeWorkerLabel}`,
     `- active_session: ${activeSession ? shortSessionId(activeSession) : "(none)"}`,
-    `- exec_mode: ${codexMode.mode}`,
-    `- router: ${ORCH_ROUTER_ENABLED ? "enabled" : "disabled"} (model=${routerModel}, reasoning=${routerReasoning})`,
     `- model: ${effectiveModel}${prefs.model ? " (chat override)" : ""}`,
     `- reasoning: ${effectiveReasoning}${prefs.reasoning ? " (chat override)" : ""}`,
+    "",
+    fmtBold("Orchestrator"),
+    `- workers: ${codexWorkers.length}/${ORCH_MAX_CODEX_WORKERS}`,
+    `- queue: ${queued}/${queueCap}`,
+    `- exec_mode: ${codexMode.mode}`,
+    `- router: ${ORCH_ROUTER_ENABLED ? "enabled" : "disabled"} (model=${routerModel}, reasoning=${routerReasoning})`,
+    `- whisper: ${WHISPER_ENABLED ? "enabled" : "disabled"}`,
+    `- tts_lane: ${ttsLane?.currentJob ? "busy" : "idle"} (queued=${ttsLane?.queue?.length || 0})`,
+    `- whisper_lane: ${whisperLane?.currentJob ? "busy" : "idle"} (queued=${whisperLane?.queue?.length || 0})`,
+    "",
+    fmtBold("Config"),
     `- full_access: ${CODEX_DANGEROUS_FULL_ACCESS}`,
     `- sandbox: ${CODEX_SANDBOX}`,
     `- approval: ${CODEX_APPROVAL_POLICY}`,
-    `- whisper: ${WHISPER_ENABLED ? "enabled" : "disabled"}`,
     `- general_workdir: ${String(getCodexWorker(ORCH_GENERAL_WORKER_ID)?.workdir || CODEX_WORKDIR)}`,
-    `- tts: ${ttsLane?.currentJob ? "busy" : "idle"} (queued=${ttsLane?.queue?.length || 0})`,
-    `- whisper_lane: ${whisperLane?.currentJob ? "busy" : "idle"} (queued=${whisperLane?.queue?.length || 0})`,
     `- time: ${nowIso()}`,
   ];
 
   if (codexWorkers.length > 0) {
-    lines.push("", "Workers:");
-    for (const w of codexWorkers) {
+    lines.push("", fmtBold("Workers"));
+    const workersToShow = activeWorkerId
+      ? [...codexWorkers].sort((a, b) => {
+        if (a.id === activeWorkerId && b.id !== activeWorkerId) return -1;
+        if (b.id === activeWorkerId && a.id !== activeWorkerId) return 1;
+        return 0;
+      })
+      : codexWorkers;
+    for (const w of workersToShow) {
       const lane = getLane(w.id);
-      const busy = Boolean(lane?.currentJob);
+      const job = lane?.currentJob || null;
+      const busy = Boolean(job);
       const queuedCount = lane?.queue?.length || 0;
-      const cur = busy && lane?.currentJob
-        ? `#${lane.currentJob.id} ${Math.floor((Date.now() - lane.currentJob.startedAt) / 1000)}s`
-        : "none";
+      const activeTag = w.id === activeWorkerId ? " (active)" : "";
+
+      let state = busy ? "busy" : "idle";
+      if (busy && job) {
+        const secs = job.startedAt ? Math.floor((Date.now() - job.startedAt) / 1000) : 0;
+        const kind = String(job.kind || "").trim();
+        const parts = [];
+        if (kind) parts.push(kind);
+        if (Number.isFinite(job.id)) parts.push(`#${job.id}`);
+        if (Number.isFinite(secs) && secs >= 0) parts.push(`${secs}s`);
+        const summary = parts.join(" ");
+        if (summary) state = `${state} ${summary}`;
+      }
+
       const sessionId = getSessionForChatWorker(chatId, w.id);
-      const sessionShort = sessionId ? shortSessionId(sessionId) : "(none)";
+      const sessionShort = sessionId ? shortSessionId(sessionId) : "-";
+      const wid = w.id === activeWorkerId ? fmtBold(w.id) : w.id;
       lines.push(
-        `- ${w.id}: ${w.title} (${w.kind}) busy=${busy} current=${cur} queued=${queuedCount} session=${sessionShort}`,
+        `- ${wid}${activeTag}: ${w.title} (${w.kind}) | ${state} | q=${queuedCount} | session=${sessionShort}`,
       );
     }
   }
@@ -2853,8 +2900,8 @@ async function sendWorkers(chatId) {
   const workers = listCodexWorkers();
 
   const lines = [
-    `Workers (${workers.length}/${ORCH_MAX_CODEX_WORKERS})`,
-    `- active: ${activeWorkerId}`,
+    `${fmtBold("Workers")} (${workers.length}/${ORCH_MAX_CODEX_WORKERS})`,
+    `- active: ${activeWorkerId || "(none)"}`,
   ];
 
   if (workers.length === 0) {
@@ -2863,20 +2910,21 @@ async function sendWorkers(chatId) {
     return;
   }
 
-  lines.push("", "List:");
+  lines.push("", fmtBold("List"));
   for (const w of workers) {
     const lane = getLane(w.id);
     const busy = Boolean(lane?.currentJob);
     const queued = lane?.queue?.length || 0;
-    const marker = w.id === activeWorkerId ? "*" : "-";
+    const marker = "-";
+    const wid = w.id === activeWorkerId ? fmtBold(w.id) : w.id;
     lines.push(
-      `${marker} ${w.id}: ${w.title} (${w.kind}) busy=${busy} queued=${queued} workdir=${String(w.workdir || "").replace(/\\/g, "/")}`,
+      `${marker} ${wid}: ${w.title} (${w.kind}) | busy=${busy} | queued=${queued} | workdir=${String(w.workdir || "").replace(/\\/g, "/")}`,
     );
   }
 
   lines.push(
     "",
-    "Commands:",
+    fmtBold("Commands"),
     "/use <worker_id or title> - switch active workspace",
     "/spawn <local-path> [title] - create a new repo workspace",
     "/retire <worker_id> - remove a workspace",
@@ -2924,12 +2972,12 @@ async function sendModelPicker(chatId) {
   const effectiveReasoning = String(prefs.reasoning || CODEX_REASONING_EFFORT || "").trim() || "(default)";
 
   const lines = [
-    "Model settings (this chat)",
+    fmtBold("Model settings (this chat)"),
     `- model: ${effectiveModel}${prefs.model ? " (override)" : ""}`,
     `- reasoning: ${effectiveReasoning}${prefs.reasoning ? " (override)" : ""}`,
     "",
-    "Pick a model:",
-    "Pick a reasoning effort:",
+    fmtBold("Pick a model"),
+    fmtBold("Pick a reasoning effort"),
   ];
 
   const keyboard = [];
@@ -2965,10 +3013,10 @@ async function sendModelPicker(chatId) {
 async function sendQueue(chatId) {
   const items = listQueuedJobsForChat(chatId);
   if (items.length === 0) {
-    await sendMessage(chatId, "Queue is empty.");
+    await sendMessage(chatId, `${fmtBold("Queue")} is empty.`);
     return;
   }
-  const lines = ["Queued prompts:"];
+  const lines = [fmtBold("Queued prompts")];
   for (const entry of items.slice(0, 10)) {
     const item = entry.job;
     const laneId = String(entry.laneId || "").trim();
@@ -3000,7 +3048,7 @@ async function sendQueue(chatId) {
 async function sendResumePicker(chatId) {
   const sessions = listRecentCodexSessions(RESUME_LIST_LIMIT);
   if (sessions.length === 0) {
-    await sendMessage(chatId, `No local AIDOLON sessions found in:\n${CODEX_SESSIONS_DIR}`);
+    await sendMessage(chatId, `${fmtBold("Resume")}\nNo local AIDOLON sessions found in:\n${CODEX_SESSIONS_DIR}`);
     return;
   }
 
@@ -3018,7 +3066,7 @@ async function sendResumePicker(chatId) {
     ]);
   }
 
-  await sendMessage(chatId, "Select a session:", {
+  await sendMessage(chatId, `${fmtBold("Resume")}\nSelect a session:`, {
     replyMarkup: { inline_keyboard: keyboard },
   });
 }
@@ -3026,7 +3074,7 @@ async function sendResumePicker(chatId) {
 async function sendCodexCommandMenu(chatId) {
   const commands = getCodexTopCommands();
   const lines = [
-    "AIDOLON command menu",
+    fmtBold("AIDOLON command menu"),
     "Tap a command to prefill `/cmd <command> ...` in this chat.",
     "",
     `Detected commands: ${commands.join(", ")}`,
@@ -6563,7 +6611,7 @@ process.on("unhandledRejection", (err) => {
     await skipStaleUpdates();
 
     if (STARTUP_MESSAGE) {
-      await sendMessage(PRIMARY_CHAT_ID, "AIDOLON online. Use /help.");
+      await sendMessage(PRIMARY_CHAT_ID, `${fmtBold("AIDOLON")} online. Use /help.`);
     }
 
     await pollLoop();
