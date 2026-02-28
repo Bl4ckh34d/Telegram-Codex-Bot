@@ -64,6 +64,8 @@ node bot.js
 Basics:
 - `/help` - help text
 - `/status` - worker + queue status
+- `/wmstatus` - WorldMonitor monitor status + last alert snapshot
+- `/wmcheck [force]` - run a WorldMonitor risk check immediately
 - `/cancel` - stop active run(s) for this chat
 - `/restart` - restart the bot process
 
@@ -112,6 +114,31 @@ Hard cap:
 Tip:
 - On startup, the bot will usually create a dedicated workspace for its own repo (so it can self-edit fast). You can retire it if you don’t want it.
 
+## WorldMonitor Alerts 🌍
+
+This bot now supports a native WorldMonitor-style feed engine, so you do not need to run the WorldMonitor app in the browser.
+
+How it works:
+- Loads feed sources from `worldmonitor_native_feeds.json` (generated snapshot of free WorldMonitor feeds)
+- Fetches RSS/Atom feeds on interval, stores headline/link/timestamps in local runtime history
+- Deep-ingests full article pages, builds compact article summaries, and stores them as report context
+- Builds risk scores and Taiwan-focused context from accumulated history
+- Adds non-paid telemetry snapshots into context:
+  - market/FX/commodity snapshots (Yahoo public chart endpoint)
+  - crypto snapshots (CoinGecko public endpoint)
+  - seismic activity snapshots (USGS public feed)
+  - ADS-B theater posture proxy (OpenSky public states endpoint, Asia theater windows)
+  - disaster/humanitarian pressure snapshot (GDACS RSS feed)
+  - maritime warning pressure snapshot (NGA broadcast warnings API)
+  - critical service health snapshot (major public status pages)
+  - macro risk regime snapshot (Yahoo + Alternative.me + mempool.space)
+  - prediction-market uncertainty snapshot (Polymarket Gamma API)
+  - infrastructure stress proxies from headline clusters (ports, pipelines, subsea cables)
+- Forwards only alert-level headlines you choose (for example `critical`)
+- Triggers only on threshold/cooldown/dedupe rules
+- Queues a Codex prompt on a dedicated WorldMonitor worker when possible
+- Sends the resulting alert summary directly in Telegram chat (text + optional short TTS voice)
+
 ## Voice Notes (Whisper) 🎙️
 
 When you send a voice note:
@@ -157,6 +184,25 @@ Most-used toggles:
 - `TTS_ENABLED` and `TTS_REPLY_TO_VOICE` - voice replies
 - `VISION_ENABLED` - image + screenshot analysis
 - `ORCH_MAX_CODEX_WORKERS` and `ORCH_ROUTER_ENABLED` - multi-worker routing
+- `WORLDMONITOR_MONITOR_ENABLED` - background WorldMonitor polling
+- `WORLDMONITOR_NATIVE_FEEDS_PATH` - feed manifest used in native mode
+- `WORLDMONITOR_NATIVE_FEED_TIMEOUT_MS`, `WORLDMONITOR_NATIVE_FEED_FETCH_CONCURRENCY` - native fetch behavior
+- `WORLDMONITOR_NATIVE_STORE_MAX_ITEMS`, `WORLDMONITOR_NATIVE_STORE_MAX_AGE_DAYS` - local history retention
+- `WORLDMONITOR_NATIVE_SIGNAL_TIMEOUT_MS` - timeout for non-news signal fetchers
+- `WORLDMONITOR_NATIVE_SIGNALS_REFRESH_MIN_INTERVAL_SEC`, `WORLDMONITOR_NATIVE_SEISMIC_REFRESH_MIN_INTERVAL_SEC`, `WORLDMONITOR_NATIVE_ADSB_REFRESH_MIN_INTERVAL_SEC`, `WORLDMONITOR_NATIVE_DISASTER_REFRESH_MIN_INTERVAL_SEC`, `WORLDMONITOR_NATIVE_MARITIME_REFRESH_MIN_INTERVAL_SEC`, `WORLDMONITOR_NATIVE_SERVICE_REFRESH_MIN_INTERVAL_SEC`, `WORLDMONITOR_NATIVE_MACRO_REFRESH_MIN_INTERVAL_SEC`, `WORLDMONITOR_NATIVE_PREDICTION_REFRESH_MIN_INTERVAL_SEC` - signal refresh cadence
+- `WORLDMONITOR_NATIVE_SIGNALS_MAX_AGE_DAYS` - signal history retention
+- `WORLDMONITOR_DEEP_INGEST_ENABLED` - enable full-article scraping/summarization context
+- `WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS`, `WORLDMONITOR_DEEP_INGEST_CONCURRENCY` - deep ingest fetch behavior
+- `WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE`, `WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS` - enrichment bounds (`0` means no hard cap / full retained window)
+- `WORLDMONITOR_DEEP_INGEST_RETRY_COOLDOWN_SEC`, `WORLDMONITOR_DEEP_INGEST_MAX_TEXT_CHARS`, `WORLDMONITOR_DEEP_INGEST_SUMMARY_MAX_WORDS`, `WORLDMONITOR_DEEP_INGEST_SUMMARY_MAX_CHARS` - summary quality/cost controls
+- `WORLDMONITOR_WORKDIR` - repo path for dedicated WorldMonitor worker
+- `WORLDMONITOR_MONITOR_INTERVAL_SEC` and `WORLDMONITOR_ALERT_COOLDOWN_SEC` - check cadence + anti-spam cooldown
+- `WORLDMONITOR_ALERT_VOICE_ENABLED` and `WORLDMONITOR_ALERT_VOICE_MAX_CHARS` - optional voice alert output tuning
+- `WORLDMONITOR_FEED_ALERTS_ENABLED` - forward WorldMonitor feed `ALERT` headlines/links to Telegram
+- `WORLDMONITOR_FEED_ALERTS_MIN_LEVEL` - minimum feed alert severity to forward (`critical`, `high`, ...)
+- `WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC` - feed alert relay cadence
+- `WORLDMONITOR_FEED_ALERTS_MAX_PER_CYCLE`, `WORLDMONITOR_FEED_ALERTS_CHAT_ID` - throughput and destination chat controls
+- `WORLDMONITOR_CHECK_LOOKBACK_HOURS`, `WORLDMONITOR_CHECK_MAX_HEADLINES`, `WORLDMONITOR_CHECK_TAIWAN_COUNTRY_CODE` - `/wmcheck` comprehensive report scope (global + Taiwan)
 
 Prompts:
 - `codex_prompt.txt` - normal text mode
@@ -174,10 +220,17 @@ This bot is designed to run on a personal machine, for a small allowlisted set o
 
 Important: by default this bot runs Codex in full-access mode. That’s the point for a personal automation bot, but you should treat it like “giving shell access to an assistant.” Use it in an environment you trust.
 
+Foreground behavior:
+- By default, `BOT_REQUIRE_TTY=1` so the bot refuses to start without an interactive terminal.
+- If you intentionally want headless/background mode, set `BOT_REQUIRE_TTY=0`.
+
 ## Troubleshooting 🧯
 
 - “poll error: fetch failed”
   - Usually a transient network/Telegram hiccup. The bot retries automatically.
+- “Fatal startup error: TypeError: fetch failed” on `getMe`
+  - On some Windows networks, IPv6 resolution can time out. Keep `TELEGRAM_DNS_RESULT_ORDER=auto` (or set `ipv4first`) in `.env`.
+  - Startup now retries `getMe`, but persistent failures still indicate network/proxy/firewall issues.
 - Telegram command autocomplete not updating
   - Make sure set-commands is enabled, then restart the bot.
 - “unexpected argument …”

@@ -2,6 +2,7 @@
 "use strict";
 
 const fs = require("fs");
+const dns = require("dns");
 const os = require("os");
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
@@ -18,6 +19,8 @@ const TTS_DIR = path.join(RUNTIME_DIR, "tts");
 const STATE_PATH = path.join(RUNTIME_DIR, "state.json");
 const LOCK_PATH = path.join(RUNTIME_DIR, "bot.lock");
 const CHAT_LOG_PATH = path.join(RUNTIME_DIR, "chat.log");
+const WORLDMONITOR_NATIVE_STORE_PATH = path.join(RUNTIME_DIR, "worldmonitor-native-store.json");
+const WORLDMONITOR_NATIVE_SIGNALS_PATH = path.join(RUNTIME_DIR, "worldmonitor-native-signals.json");
 const RESTART_REASON_PATH = path.join(RUNTIME_DIR, "restart.reason");
 const WHISPER_SCRIPT_PATH = path.join(ROOT, "whisper_transcribe.py");
 const WHISPER_SERVER_SCRIPT_PATH = path.join(ROOT, "whisper_transcribe_server.py");
@@ -390,6 +393,8 @@ const NATURAL_COMMAND_ALIASES = Object.freeze({
   tts: "/tts",
   wipe: "/wipe",
   restart: "/restart",
+  wmstatus: "/wmstatus",
+  wmcheck: "/wmcheck",
 });
 
 const NATURAL_NO_ARG_COMMANDS = new Set([
@@ -413,6 +418,7 @@ const NATURAL_NO_ARG_COMMANDS = new Set([
   "/imgclear",
   "/model",
   "/wipe",
+  "/wmstatus",
 ]);
 
 const NATURAL_PREFIX_REQUIRED_COMMANDS = new Set([
@@ -451,6 +457,8 @@ const NATURAL_DIRECT_COMMANDS = new Set([
   "/model",
   "/wipe",
   "/restart",
+  "/wmstatus",
+  "/wmcheck",
 ]);
 
 function senderLabel(msg) {
@@ -718,6 +726,16 @@ function log(msg) {
   console.log(`[${nowIso()}] ${msg}`);
 }
 
+function normalizeDnsResultOrder(rawValue) {
+  const raw = String(rawValue || "").trim().toLowerCase();
+  if (!raw || raw === "auto") {
+    return process.platform === "win32" ? "ipv4first" : "";
+  }
+  if (["off", "none", "disabled", "0", "false", "no"].includes(raw)) return "";
+  if (["ipv4first", "ipv6first", "verbatim"].includes(raw)) return raw;
+  return "";
+}
+
 loadEnv(ENV_PATH);
 const requiredStartupDirsReady = [
   ensureDirSafe(RUNTIME_DIR, { label: "runtime", required: true }),
@@ -739,6 +757,10 @@ const POLL_TIMEOUT_SEC = toInt(process.env.TELEGRAM_POLL_TIMEOUT_SEC, 20);
 // Telegram API request timeouts: 0 disables abort-based timeouts entirely.
 const TELEGRAM_API_TIMEOUT_MS = toTimeoutMs(process.env.TELEGRAM_API_TIMEOUT_MS, 60_000);
 const TELEGRAM_UPLOAD_TIMEOUT_MS = toTimeoutMs(process.env.TELEGRAM_UPLOAD_TIMEOUT_MS, 120_000);
+const TELEGRAM_DNS_RESULT_ORDER = normalizeDnsResultOrder(process.env.TELEGRAM_DNS_RESULT_ORDER || "auto");
+const TELEGRAM_STARTUP_MAX_ATTEMPTS = toInt(process.env.TELEGRAM_STARTUP_MAX_ATTEMPTS, 8, 1, 120);
+const TELEGRAM_STARTUP_RETRY_BASE_MS = toInt(process.env.TELEGRAM_STARTUP_RETRY_BASE_MS, 1500, 100, 120_000);
+const TELEGRAM_STARTUP_RETRY_MAX_MS = toInt(process.env.TELEGRAM_STARTUP_RETRY_MAX_MS, 15_000, 500, 180_000);
 // Per-message chunk size for Telegram sendMessage(). 0 disables chunking (not recommended).
 const TELEGRAM_MESSAGE_MAX_CHARS = toInt(process.env.TELEGRAM_MESSAGE_MAX_CHARS, 3800);
 const STARTUP_MESSAGE = toBool(process.env.STARTUP_MESSAGE, true);
@@ -755,6 +777,7 @@ const TELEGRAM_CHAT_ACTION_VOICE = normalizeTelegramChatAction(
   process.env.TELEGRAM_CHAT_ACTION_VOICE || "record_voice",
   TELEGRAM_CHAT_ACTION_DEFAULT,
 );
+const BOT_REQUIRE_TTY = toBool(process.env.BOT_REQUIRE_TTY, true);
 const CHAT_LOG_TO_TERMINAL = toBool(process.env.CHAT_LOG_TO_TERMINAL, true);
 const CHAT_LOG_TO_FILE = toBool(process.env.CHAT_LOG_TO_FILE, true);
 const TERMINAL_COLORS = toBool(process.env.TERMINAL_COLORS, true);
@@ -973,6 +996,95 @@ const REDDIT_DIGEST_MAX_DAYS = toInt(process.env.REDDIT_DIGEST_MAX_DAYS, 3, 1, 7
 const REDDIT_DIGEST_TOP_POSTS = toInt(process.env.REDDIT_DIGEST_TOP_POSTS, 10, 1, 25);
 const REDDIT_DIGEST_LOOKBACK_DAYS = toInt(process.env.REDDIT_DIGEST_LOOKBACK_DAYS, 7, 1, 365);
 const REDDIT_FETCH_TIMEOUT_MS = toTimeoutMs(process.env.REDDIT_FETCH_TIMEOUT_MS, 20_000, 0, MAX_TIMEOUT_MS);
+const WORLDMONITOR_MONITOR_ENABLED = toBool(process.env.WORLDMONITOR_MONITOR_ENABLED, false);
+const WORLDMONITOR_NATIVE_FEEDS_PATH = resolveMaybeRelativePath(
+  process.env.WORLDMONITOR_NATIVE_FEEDS_PATH || path.join(ROOT, "worldmonitor_native_feeds.json"),
+);
+const WORLDMONITOR_MONITOR_INTERVAL_SEC = toInt(process.env.WORLDMONITOR_MONITOR_INTERVAL_SEC, 300, 30, 3600);
+const WORLDMONITOR_STARTUP_DELAY_SEC = toInt(process.env.WORLDMONITOR_STARTUP_DELAY_SEC, 25, 0, 600);
+const WORLDMONITOR_NATIVE_FEED_TIMEOUT_MS = toTimeoutMs(process.env.WORLDMONITOR_NATIVE_FEED_TIMEOUT_MS, 9_000, 0, MAX_TIMEOUT_MS);
+const WORLDMONITOR_NATIVE_FEED_FETCH_CONCURRENCY = toInt(process.env.WORLDMONITOR_NATIVE_FEED_FETCH_CONCURRENCY, 10, 2, 40);
+const WORLDMONITOR_NATIVE_FEED_ITEMS_PER_SOURCE = toInt(process.env.WORLDMONITOR_NATIVE_FEED_ITEMS_PER_SOURCE, 24, 4, 120);
+const WORLDMONITOR_NATIVE_STORE_MAX_ITEMS = toInt(process.env.WORLDMONITOR_NATIVE_STORE_MAX_ITEMS, 16_000, 500, 100_000);
+const WORLDMONITOR_NATIVE_STORE_MAX_AGE_DAYS = toInt(process.env.WORLDMONITOR_NATIVE_STORE_MAX_AGE_DAYS, 30, 2, 365);
+const WORLDMONITOR_NATIVE_REFRESH_MIN_INTERVAL_SEC = toInt(process.env.WORLDMONITOR_NATIVE_REFRESH_MIN_INTERVAL_SEC, 240, 30, 3600);
+const WORLDMONITOR_NATIVE_SIGNAL_TIMEOUT_MS = toTimeoutMs(process.env.WORLDMONITOR_NATIVE_SIGNAL_TIMEOUT_MS, 10_000, 0, MAX_TIMEOUT_MS);
+const WORLDMONITOR_NATIVE_SIGNALS_MAX_AGE_DAYS = toInt(process.env.WORLDMONITOR_NATIVE_SIGNALS_MAX_AGE_DAYS, 90, 7, 365);
+const WORLDMONITOR_NATIVE_SIGNALS_REFRESH_MIN_INTERVAL_SEC = toInt(process.env.WORLDMONITOR_NATIVE_SIGNALS_REFRESH_MIN_INTERVAL_SEC, 300, 60, 3600);
+const WORLDMONITOR_NATIVE_SEISMIC_REFRESH_MIN_INTERVAL_SEC = toInt(process.env.WORLDMONITOR_NATIVE_SEISMIC_REFRESH_MIN_INTERVAL_SEC, 900, 120, 7200);
+const WORLDMONITOR_NATIVE_ADSB_REFRESH_MIN_INTERVAL_SEC = toInt(process.env.WORLDMONITOR_NATIVE_ADSB_REFRESH_MIN_INTERVAL_SEC, 600, 120, 7200);
+const WORLDMONITOR_NATIVE_DISASTER_REFRESH_MIN_INTERVAL_SEC = toInt(process.env.WORLDMONITOR_NATIVE_DISASTER_REFRESH_MIN_INTERVAL_SEC, 1800, 300, 21600);
+const WORLDMONITOR_NATIVE_MARITIME_REFRESH_MIN_INTERVAL_SEC = toInt(process.env.WORLDMONITOR_NATIVE_MARITIME_REFRESH_MIN_INTERVAL_SEC, 1800, 300, 21600);
+const WORLDMONITOR_NATIVE_SERVICE_REFRESH_MIN_INTERVAL_SEC = toInt(process.env.WORLDMONITOR_NATIVE_SERVICE_REFRESH_MIN_INTERVAL_SEC, 1800, 300, 21600);
+const WORLDMONITOR_NATIVE_MACRO_REFRESH_MIN_INTERVAL_SEC = toInt(process.env.WORLDMONITOR_NATIVE_MACRO_REFRESH_MIN_INTERVAL_SEC, 900, 180, 7200);
+const WORLDMONITOR_NATIVE_PREDICTION_REFRESH_MIN_INTERVAL_SEC = toInt(process.env.WORLDMONITOR_NATIVE_PREDICTION_REFRESH_MIN_INTERVAL_SEC, 1200, 180, 7200);
+const WORLDMONITOR_DEEP_INGEST_ENABLED = toBool(process.env.WORLDMONITOR_DEEP_INGEST_ENABLED, true);
+const WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS = toTimeoutMs(process.env.WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS, 15_000, 0, MAX_TIMEOUT_MS);
+const WORLDMONITOR_DEEP_INGEST_CONCURRENCY = toInt(process.env.WORLDMONITOR_DEEP_INGEST_CONCURRENCY, 4, 1, 24);
+const WORLDMONITOR_DEEP_INGEST_RETRY_COOLDOWN_SEC = toInt(process.env.WORLDMONITOR_DEEP_INGEST_RETRY_COOLDOWN_SEC, 43_200, 60, 604_800);
+const WORLDMONITOR_DEEP_INGEST_MAX_TEXT_CHARS = toInt(process.env.WORLDMONITOR_DEEP_INGEST_MAX_TEXT_CHARS, 18_000, 1_200, 120_000);
+const WORLDMONITOR_DEEP_INGEST_SUMMARY_MAX_WORDS = toInt(process.env.WORLDMONITOR_DEEP_INGEST_SUMMARY_MAX_WORDS, 140, 40, 500);
+const WORLDMONITOR_DEEP_INGEST_SUMMARY_MAX_CHARS = toInt(process.env.WORLDMONITOR_DEEP_INGEST_SUMMARY_MAX_CHARS, 900, 180, 5000);
+const WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE_RAW = Number(process.env.WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE);
+const WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE = Number.isFinite(WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE_RAW)
+  ? Math.max(0, Math.trunc(WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE_RAW))
+  : 0;
+const WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS_RAW = Number(process.env.WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS);
+const WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS = Number.isFinite(WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS_RAW)
+  ? Math.max(0, Math.trunc(WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS_RAW))
+  : 0;
+const WORLDMONITOR_ALERT_COOLDOWN_SEC = toInt(process.env.WORLDMONITOR_ALERT_COOLDOWN_SEC, 300, 30, 86400);
+const WORLDMONITOR_MIN_GLOBAL_RISK_SCORE = toInt(process.env.WORLDMONITOR_MIN_GLOBAL_RISK_SCORE, 60, 0, 100);
+const WORLDMONITOR_MIN_COUNTRY_RISK_SCORE = toInt(process.env.WORLDMONITOR_MIN_COUNTRY_RISK_SCORE, 75, 0, 100);
+const WORLDMONITOR_MIN_GLOBAL_DELTA = toInt(process.env.WORLDMONITOR_MIN_GLOBAL_DELTA, 12, 1, 100);
+const WORLDMONITOR_TOP_COUNTRIES = toInt(process.env.WORLDMONITOR_TOP_COUNTRIES, 5, 1, 12);
+const WORLDMONITOR_ALERT_CHAT_ID = String(process.env.WORLDMONITOR_ALERT_CHAT_ID || PRIMARY_CHAT_ID).trim() || PRIMARY_CHAT_ID;
+const WORLDMONITOR_WORKDIR = resolveMaybeRelativePath(process.env.WORLDMONITOR_WORKDIR || "");
+const WORLDMONITOR_WORKER_TITLE = String(process.env.WORLDMONITOR_WORKER_TITLE || "WorldMonitor Intel").trim() || "WorldMonitor Intel";
+const WORLDMONITOR_SUMMARY_MODEL = String(process.env.WORLDMONITOR_SUMMARY_MODEL || "").trim();
+const WORLDMONITOR_SUMMARY_REASONING = String(process.env.WORLDMONITOR_SUMMARY_REASONING || "low").trim();
+const WORLDMONITOR_NOTIFY_ERRORS = toBool(process.env.WORLDMONITOR_NOTIFY_ERRORS, false);
+const WORLDMONITOR_ALERT_VOICE_ENABLED = toBool(process.env.WORLDMONITOR_ALERT_VOICE_ENABLED, true);
+const WORLDMONITOR_ALERT_VOICE_MAX_CHARS = toInt(process.env.WORLDMONITOR_ALERT_VOICE_MAX_CHARS, 480, 80, 4000);
+const WORLDMONITOR_FEED_ALERTS_ENABLED = toBool(process.env.WORLDMONITOR_FEED_ALERTS_ENABLED, true);
+const WORLDMONITOR_FEED_ALERTS_MIN_LEVEL = String(
+  process.env.WORLDMONITOR_FEED_ALERTS_MIN_LEVEL || "critical",
+).trim().toLowerCase() || "critical";
+const WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC = toInt(process.env.WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC, 300, 15, 3600);
+const WORLDMONITOR_FEED_ALERTS_MAX_PER_CYCLE = toInt(process.env.WORLDMONITOR_FEED_ALERTS_MAX_PER_CYCLE, 20, 1, 200);
+const WORLDMONITOR_FEED_ALERTS_CHAT_ID = String(
+  process.env.WORLDMONITOR_FEED_ALERTS_CHAT_ID || WORLDMONITOR_ALERT_CHAT_ID,
+).trim() || WORLDMONITOR_ALERT_CHAT_ID;
+const WORLDMONITOR_FEED_ALERTS_REQUIRE_TAIWAN_WELLBEING = toBool(
+  process.env.WORLDMONITOR_FEED_ALERTS_REQUIRE_TAIWAN_WELLBEING,
+  true,
+);
+const WORLDMONITOR_FEED_ALERTS_MAX_ARTICLE_AGE_HOURS = toInt(
+  process.env.WORLDMONITOR_FEED_ALERTS_MAX_ARTICLE_AGE_HOURS,
+  120,
+  6,
+  24 * 30,
+);
+const WORLDMONITOR_FEED_ALERTS_SKIP_AGGREGATOR_LINKS = toBool(
+  process.env.WORLDMONITOR_FEED_ALERTS_SKIP_AGGREGATOR_LINKS,
+  true,
+);
+const WORLDMONITOR_FEED_ALERTS_SKIP_DOCUMENT_LINKS = toBool(
+  process.env.WORLDMONITOR_FEED_ALERTS_SKIP_DOCUMENT_LINKS,
+  true,
+);
+const WORLDMONITOR_FEED_ALERTS_REQUIRE_CONTEXT_QUALITY = toBool(
+  process.env.WORLDMONITOR_FEED_ALERTS_REQUIRE_CONTEXT_QUALITY,
+  true,
+);
+const WORLDMONITOR_CHECK_LOOKBACK_HOURS = toInt(process.env.WORLDMONITOR_CHECK_LOOKBACK_HOURS, 48, 6, 168);
+const WORLDMONITOR_CHECK_MAX_HEADLINES = toInt(process.env.WORLDMONITOR_CHECK_MAX_HEADLINES, 16, 4, 60);
+const WORLDMONITOR_CHECK_TAIWAN_COUNTRY_CODE = String(
+  process.env.WORLDMONITOR_CHECK_TAIWAN_COUNTRY_CODE || "TW",
+).trim().toUpperCase() || "TW";
+const WORLDMONITOR_CHECK_ANNOUNCE_QUEUED = toBool(process.env.WORLDMONITOR_CHECK_ANNOUNCE_QUEUED, false);
+const WORLDMONITOR_CHECK_VOICE_ENABLED = toBool(process.env.WORLDMONITOR_CHECK_VOICE_ENABLED, true);
+const WORLDMONITOR_CHECK_VOICE_MAX_CHARS = toInt(process.env.WORLDMONITOR_CHECK_VOICE_MAX_CHARS, 340, 120, 1200);
 const NATURAL_NEWS_FOLLOWUP_TTL_MS = 5 * 60 * 1000;
 const NATURAL_SAFE_COMMAND_INTENT_THRESHOLD_RAW = Number(process.env.NATURAL_SAFE_COMMAND_INTENT_THRESHOLD);
 const NATURAL_SAFE_COMMAND_INTENT_THRESHOLD = Number.isFinite(NATURAL_SAFE_COMMAND_INTENT_THRESHOLD_RAW)
@@ -991,8 +1103,21 @@ const REDDIT_USER_AGENT = String(
   process.env.REDDIT_USER_AGENT || "AIDOLON-Telegram-Bot/0.1 (+https://github.com/)",
 ).trim();
 
+if (TELEGRAM_DNS_RESULT_ORDER) {
+  try {
+    dns.setDefaultResultOrder(TELEGRAM_DNS_RESULT_ORDER);
+  } catch (err) {
+    console.error(`[startup] Failed to set DNS result order (${TELEGRAM_DNS_RESULT_ORDER}): ${err?.message || err}`);
+  }
+}
+
 if (!TOKEN || !PRIMARY_CHAT_ID) {
   console.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in .env");
+  process.exit(1);
+}
+
+if (BOT_REQUIRE_TTY && !process.stdout?.isTTY && !process.stderr?.isTTY) {
+  console.error("Refusing to start without an interactive terminal (BOT_REQUIRE_TTY=1).");
   process.exit(1);
 }
 
@@ -1071,6 +1196,7 @@ const state = readJson(STATE_PATH, {
   lastImages: {},
   chatPrefs: {},
   redditDigest: {},
+  worldMonitorMonitor: {},
   orch: {},
 });
 let lastUpdateId = Number(state.lastUpdateId || 0);
@@ -1083,6 +1209,198 @@ const chatPrefs = state && typeof state.chatPrefs === "object" && state.chatPref
 const redditDigest = state && typeof state.redditDigest === "object" && state.redditDigest
   ? { ...state.redditDigest }
   : {};
+const worldMonitorMonitorRaw = state && typeof state.worldMonitorMonitor === "object" && state.worldMonitorMonitor
+  ? state.worldMonitorMonitor
+  : {};
+const worldMonitorMonitor = {
+  workerId: String(worldMonitorMonitorRaw.workerId || "").trim(),
+  lastRunAt: Number(worldMonitorMonitorRaw.lastRunAt || 0) || 0,
+  lastRunSource: String(worldMonitorMonitorRaw.lastRunSource || "").trim(),
+  lastErrorAt: Number(worldMonitorMonitorRaw.lastErrorAt || 0) || 0,
+  lastError: String(worldMonitorMonitorRaw.lastError || "").trim(),
+  lastAlertAt: Number(worldMonitorMonitorRaw.lastAlertAt || 0) || 0,
+  lastAlertReason: String(worldMonitorMonitorRaw.lastAlertReason || "").trim(),
+  lastAlertFingerprint: String(worldMonitorMonitorRaw.lastAlertFingerprint || "").trim(),
+  lastObservedGlobalScore: Number(worldMonitorMonitorRaw.lastObservedGlobalScore || 0) || 0,
+  lastObservedFingerprint: String(worldMonitorMonitorRaw.lastObservedFingerprint || "").trim(),
+  lastSnapshotSummary: String(worldMonitorMonitorRaw.lastSnapshotSummary || "").trim(),
+  lastNotifiedErrorAt: Number(worldMonitorMonitorRaw.lastNotifiedErrorAt || 0) || 0,
+  feedAlertsLastRunAt: Number(worldMonitorMonitorRaw.feedAlertsLastRunAt || 0) || 0,
+  feedAlertsLastSeenAt: Number(worldMonitorMonitorRaw.feedAlertsLastSeenAt || 0) || 0,
+  feedAlertsLastErrorAt: Number(worldMonitorMonitorRaw.feedAlertsLastErrorAt || 0) || 0,
+  feedAlertsLastError: String(worldMonitorMonitorRaw.feedAlertsLastError || "").trim(),
+  feedAlertsSentKeys: Array.isArray(worldMonitorMonitorRaw.feedAlertsSentKeys)
+    ? worldMonitorMonitorRaw.feedAlertsSentKeys
+      .map((k) => String(k || "").trim())
+      .filter(Boolean)
+      .slice(-1200)
+    : [],
+  feedAlertsSentTitleKeys: Array.isArray(worldMonitorMonitorRaw.feedAlertsSentTitleKeys)
+    ? worldMonitorMonitorRaw.feedAlertsSentTitleKeys
+      .map((k) => String(k || "").trim())
+      .filter(Boolean)
+      .slice(-1200)
+    : [],
+  nativeLastRefreshAt: Number(worldMonitorMonitorRaw.nativeLastRefreshAt || 0) || 0,
+  nativeLastRefreshDurationMs: Number(worldMonitorMonitorRaw.nativeLastRefreshDurationMs || 0) || 0,
+  nativeLastRefreshErrorAt: Number(worldMonitorMonitorRaw.nativeLastRefreshErrorAt || 0) || 0,
+  nativeLastRefreshError: String(worldMonitorMonitorRaw.nativeLastRefreshError || "").trim(),
+  nativeLastRefreshStats: worldMonitorMonitorRaw.nativeLastRefreshStats
+    && typeof worldMonitorMonitorRaw.nativeLastRefreshStats === "object"
+    ? { ...worldMonitorMonitorRaw.nativeLastRefreshStats }
+    : {},
+  nativeSignalsLastRefreshAt: Number(worldMonitorMonitorRaw.nativeSignalsLastRefreshAt || 0) || 0,
+  nativeSignalsLastRefreshDurationMs: Number(worldMonitorMonitorRaw.nativeSignalsLastRefreshDurationMs || 0) || 0,
+  nativeSignalsLastRefreshErrorAt: Number(worldMonitorMonitorRaw.nativeSignalsLastRefreshErrorAt || 0) || 0,
+  nativeSignalsLastRefreshError: String(worldMonitorMonitorRaw.nativeSignalsLastRefreshError || "").trim(),
+  nativeSignalsLastRefreshStats: worldMonitorMonitorRaw.nativeSignalsLastRefreshStats
+    && typeof worldMonitorMonitorRaw.nativeSignalsLastRefreshStats === "object"
+    ? { ...worldMonitorMonitorRaw.nativeSignalsLastRefreshStats }
+    : {},
+  nativeDeepIngestLastRunAt: Number(worldMonitorMonitorRaw.nativeDeepIngestLastRunAt || 0) || 0,
+  nativeDeepIngestLastDurationMs: Number(worldMonitorMonitorRaw.nativeDeepIngestLastDurationMs || 0) || 0,
+  nativeDeepIngestLastErrorAt: Number(worldMonitorMonitorRaw.nativeDeepIngestLastErrorAt || 0) || 0,
+  nativeDeepIngestLastError: String(worldMonitorMonitorRaw.nativeDeepIngestLastError || "").trim(),
+  nativeDeepIngestLastStats: worldMonitorMonitorRaw.nativeDeepIngestLastStats
+    && typeof worldMonitorMonitorRaw.nativeDeepIngestLastStats === "object"
+    ? { ...worldMonitorMonitorRaw.nativeDeepIngestLastStats }
+    : {},
+};
+const worldMonitorFeedAlertSentKeySet = new Set(worldMonitorMonitor.feedAlertsSentKeys);
+const worldMonitorFeedAlertSentTitleKeySet = new Set(worldMonitorMonitor.feedAlertsSentTitleKeys);
+const worldMonitorNativeStoreRaw = readJson(WORLDMONITOR_NATIVE_STORE_PATH, { version: 1, items: [] });
+const worldMonitorNativeNewsItems = Array.isArray(worldMonitorNativeStoreRaw?.items)
+  ? worldMonitorNativeStoreRaw.items
+    .map((x) => (x && typeof x === "object" ? { ...x } : null))
+    .filter(Boolean)
+    .slice(-WORLDMONITOR_NATIVE_STORE_MAX_ITEMS)
+  : [];
+const worldMonitorNativeSignalsRaw = readJson(WORLDMONITOR_NATIVE_SIGNALS_PATH, {
+  version: 1,
+  marketSeries: [],
+  cryptoSeries: [],
+  seismicSeries: [],
+  infrastructureSeries: [],
+  adsbSeries: [],
+  disasterSeries: [],
+  maritimeSeries: [],
+  serviceSeries: [],
+  macroSeries: [],
+  predictionSeries: [],
+});
+const worldMonitorNativeSignals = {
+  marketSeries: Array.isArray(worldMonitorNativeSignalsRaw?.marketSeries)
+    ? worldMonitorNativeSignalsRaw.marketSeries
+      .map((x) => (x && typeof x === "object" ? { ...x } : null))
+      .filter(Boolean)
+    : [],
+  cryptoSeries: Array.isArray(worldMonitorNativeSignalsRaw?.cryptoSeries)
+    ? worldMonitorNativeSignalsRaw.cryptoSeries
+      .map((x) => (x && typeof x === "object" ? { ...x } : null))
+      .filter(Boolean)
+    : [],
+  seismicSeries: Array.isArray(worldMonitorNativeSignalsRaw?.seismicSeries)
+    ? worldMonitorNativeSignalsRaw.seismicSeries
+      .map((x) => (x && typeof x === "object" ? { ...x } : null))
+      .filter(Boolean)
+    : [],
+  infrastructureSeries: Array.isArray(worldMonitorNativeSignalsRaw?.infrastructureSeries)
+    ? worldMonitorNativeSignalsRaw.infrastructureSeries
+      .map((x) => (x && typeof x === "object" ? { ...x } : null))
+      .filter(Boolean)
+    : [],
+  adsbSeries: Array.isArray(worldMonitorNativeSignalsRaw?.adsbSeries)
+    ? worldMonitorNativeSignalsRaw.adsbSeries
+      .map((x) => (x && typeof x === "object" ? { ...x } : null))
+      .filter(Boolean)
+    : [],
+  disasterSeries: Array.isArray(worldMonitorNativeSignalsRaw?.disasterSeries)
+    ? worldMonitorNativeSignalsRaw.disasterSeries
+      .map((x) => (x && typeof x === "object" ? { ...x } : null))
+      .filter(Boolean)
+    : [],
+  maritimeSeries: Array.isArray(worldMonitorNativeSignalsRaw?.maritimeSeries)
+    ? worldMonitorNativeSignalsRaw.maritimeSeries
+      .map((x) => (x && typeof x === "object" ? { ...x } : null))
+      .filter(Boolean)
+    : [],
+  serviceSeries: Array.isArray(worldMonitorNativeSignalsRaw?.serviceSeries)
+    ? worldMonitorNativeSignalsRaw.serviceSeries
+      .map((x) => (x && typeof x === "object" ? { ...x } : null))
+      .filter(Boolean)
+    : [],
+  macroSeries: Array.isArray(worldMonitorNativeSignalsRaw?.macroSeries)
+    ? worldMonitorNativeSignalsRaw.macroSeries
+      .map((x) => (x && typeof x === "object" ? { ...x } : null))
+      .filter(Boolean)
+    : [],
+  predictionSeries: Array.isArray(worldMonitorNativeSignalsRaw?.predictionSeries)
+    ? worldMonitorNativeSignalsRaw.predictionSeries
+      .map((x) => (x && typeof x === "object" ? { ...x } : null))
+      .filter(Boolean)
+    : [],
+};
+let worldMonitorNativeFeedManifest = [];
+
+function persistWorldMonitorNativeStore() {
+  try {
+    writeJsonAtomic(WORLDMONITOR_NATIVE_STORE_PATH, {
+      version: 1,
+      updatedAt: Date.now(),
+      items: worldMonitorNativeNewsItems.slice(-WORLDMONITOR_NATIVE_STORE_MAX_ITEMS),
+    });
+  } catch {
+    // best effort
+  }
+}
+
+function persistWorldMonitorNativeSignalsStore() {
+  try {
+    writeJsonAtomic(WORLDMONITOR_NATIVE_SIGNALS_PATH, {
+      version: 1,
+      updatedAt: Date.now(),
+      marketSeries: Array.isArray(worldMonitorNativeSignals.marketSeries) ? worldMonitorNativeSignals.marketSeries : [],
+      cryptoSeries: Array.isArray(worldMonitorNativeSignals.cryptoSeries) ? worldMonitorNativeSignals.cryptoSeries : [],
+      seismicSeries: Array.isArray(worldMonitorNativeSignals.seismicSeries) ? worldMonitorNativeSignals.seismicSeries : [],
+      infrastructureSeries: Array.isArray(worldMonitorNativeSignals.infrastructureSeries) ? worldMonitorNativeSignals.infrastructureSeries : [],
+      adsbSeries: Array.isArray(worldMonitorNativeSignals.adsbSeries) ? worldMonitorNativeSignals.adsbSeries : [],
+      disasterSeries: Array.isArray(worldMonitorNativeSignals.disasterSeries) ? worldMonitorNativeSignals.disasterSeries : [],
+      maritimeSeries: Array.isArray(worldMonitorNativeSignals.maritimeSeries) ? worldMonitorNativeSignals.maritimeSeries : [],
+      serviceSeries: Array.isArray(worldMonitorNativeSignals.serviceSeries) ? worldMonitorNativeSignals.serviceSeries : [],
+      macroSeries: Array.isArray(worldMonitorNativeSignals.macroSeries) ? worldMonitorNativeSignals.macroSeries : [],
+      predictionSeries: Array.isArray(worldMonitorNativeSignals.predictionSeries) ? worldMonitorNativeSignals.predictionSeries : [],
+    });
+  } catch {
+    // best effort
+  }
+}
+
+pruneWorldMonitorNativeStore(Date.now());
+pruneWorldMonitorNativeSignals(Date.now());
+
+function rememberWorldMonitorFeedAlertKey(key) {
+  const clean = String(key || "").trim();
+  if (!clean) return;
+  worldMonitorFeedAlertSentKeySet.add(clean);
+  while (worldMonitorFeedAlertSentKeySet.size > 1200) {
+    const oldest = worldMonitorFeedAlertSentKeySet.values().next().value;
+    if (!oldest) break;
+    worldMonitorFeedAlertSentKeySet.delete(oldest);
+  }
+  worldMonitorMonitor.feedAlertsSentKeys = [...worldMonitorFeedAlertSentKeySet];
+}
+
+function rememberWorldMonitorFeedAlertTitleKey(key) {
+  const clean = String(key || "").trim();
+  if (!clean) return;
+  worldMonitorFeedAlertSentTitleKeySet.add(clean);
+  while (worldMonitorFeedAlertSentTitleKeySet.size > 1200) {
+    const oldest = worldMonitorFeedAlertSentTitleKeySet.values().next().value;
+    if (!oldest) break;
+    worldMonitorFeedAlertSentTitleKeySet.delete(oldest);
+  }
+  worldMonitorMonitor.feedAlertsSentTitleKeys = [...worldMonitorFeedAlertSentTitleKeySet];
+}
 
 const ORCH_GENERAL_WORKER_ID = "general";
 const ORCH_TTS_LANE_ID = "tts";
@@ -1238,6 +1556,24 @@ const pendingCommandsById = new Map();
 const pendingCommandIdByChat = new Map();
 const backgroundCommandChainByChat = new Map();
 const pendingNaturalNewsByChat = new Map(); // chatId -> { at }
+const worldMonitorRuntime = {
+  timer: null,
+  inFlight: false,
+};
+const worldMonitorComprehensiveRuntime = {
+  inFlight: false,
+  lastStartedAt: 0,
+};
+const worldMonitorFeedAlertsRuntime = {
+  timer: null,
+  inFlight: false,
+};
+const worldMonitorNativeRuntime = {
+  inFlight: false,
+  refreshPromise: null,
+  signalsPromise: null,
+  deepIngestPromise: null,
+};
 let pendingRestartRequest = null; // { requestedAt, chatIds:Set<string> }
 let restartTriggerInFlight = false;
 const updateFailureCounts = new Map(); // update_id -> consecutive handler failures
@@ -1391,6 +1727,7 @@ function persistState() {
       lastImages,
       chatPrefs,
       redditDigest,
+      worldMonitorMonitor,
       orch: {
         version: 1,
         workers: orchWorkers,
@@ -2127,14 +2464,44 @@ function ensureWhisperLane() {
   return lane;
 }
 
+function resolveFallbackWorkdir() {
+  if (CODEX_WORKDIR && fs.existsSync(CODEX_WORKDIR)) return CODEX_WORKDIR;
+  return ROOT;
+}
+
+function resolveUsableWorkdir(preferredWorkdir) {
+  const preferred = String(preferredWorkdir || "").trim();
+  if (preferred && fs.existsSync(preferred)) return preferred;
+  return resolveFallbackWorkdir();
+}
+
+function refreshLaneWorkdir(lane, { logPrefix = "" } = {}) {
+  if (!lane || typeof lane !== "object") return resolveFallbackWorkdir();
+  const current = String(lane.workdir || "").trim();
+  if (current && fs.existsSync(current)) return current;
+  const worker = getCodexWorker(String(lane.id || "").trim());
+  const next = resolveUsableWorkdir(worker?.workdir || current);
+  lane.workdir = next;
+  if (current !== next) {
+    const prefix = String(logPrefix || "").trim();
+    log(
+      `${prefix ? `${prefix} ` : ""}worker ${String(lane.id || "").trim() || "unknown"} workdir unavailable: ${current || "(empty)"}; using ${next}.`,
+    );
+  }
+  return next;
+}
+
 function ensureWorkerLane(workerId) {
   const wid = String(workerId || "").trim();
   if (!wid) return null;
   const existing = getLane(wid);
-  if (existing) return existing;
+  if (existing) {
+    refreshLaneWorkdir(existing, { logPrefix: "[orch]" });
+    return existing;
+  }
   const w = getCodexWorker(wid);
   if (!w) return null;
-  const workdir = w.workdir && fs.existsSync(w.workdir) ? w.workdir : CODEX_WORKDIR;
+  const workdir = resolveUsableWorkdir(w.workdir);
   return makeLane({
     id: wid,
     type: "codex",
@@ -4272,6 +4639,77 @@ async function telegramApiMultipart(method, formData, timeoutMs = TELEGRAM_UPLOA
   }
 }
 
+function parseTelegramStatusFromError(err) {
+  const message = String(err?.message || err || "");
+  const match = message.match(/Telegram\s+\S+\s+failed:\s*(\d{3})\b/i);
+  const status = Number(match?.[1] || 0);
+  return Number.isFinite(status) ? status : 0;
+}
+
+function isRetryableTelegramStartupError(err) {
+  const status = parseTelegramStatusFromError(err);
+  if (status > 0) {
+    return status === 429 || status >= 500;
+  }
+
+  const code = String(err?.cause?.code || err?.code || "").trim().toUpperCase();
+  if ([
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_HEADERS_TIMEOUT",
+    "UND_ERR_SOCKET",
+    "ABORT_ERR",
+    "ETIMEDOUT",
+    "ECONNRESET",
+    "ECONNREFUSED",
+    "ENETUNREACH",
+    "EHOSTUNREACH",
+    "EAI_AGAIN",
+  ].includes(code)) {
+    return true;
+  }
+
+  const message = String(err?.message || err || "").toLowerCase();
+  return (
+    message.includes("fetch failed")
+    || message.includes("network")
+    || message.includes("timed out")
+    || message.includes("timeout")
+    || message.includes("socket hang up")
+  );
+}
+
+async function getTelegramIdentityWithRetry() {
+  const attempts = Math.max(1, TELEGRAM_STARTUP_MAX_ATTEMPTS);
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await telegramApi("getMe");
+    } catch (err) {
+      lastError = err;
+      if (!isRetryableTelegramStartupError(err) || attempt >= attempts) {
+        throw err;
+      }
+
+      const waitMs = computeExponentialBackoffMs(
+        attempt,
+        TELEGRAM_STARTUP_RETRY_BASE_MS,
+        TELEGRAM_STARTUP_RETRY_MAX_MS,
+        0.2,
+      );
+      const code = String(err?.cause?.code || err?.code || "").trim().toUpperCase();
+      const detail = oneLine(redactError(err?.message || err));
+      const waitSec = Math.max(1, Math.round(waitMs / 1000));
+      log(
+        `Telegram getMe failed (attempt ${attempt}/${attempts})${code ? ` [${code}]` : ""}: ${detail}. Retrying in ${waitSec}s...`,
+      );
+      await sleep(waitMs);
+    }
+  }
+
+  throw lastError || new Error("Telegram getMe failed");
+}
+
 async function fetchJsonUrl(url, { headers = {}, timeoutMs = 0, signal } = {}) {
   const controller = new AbortController();
   const ms = Number(timeoutMs);
@@ -4746,6 +5184,8 @@ function getTelegramCommandList() {
     { command: "retire", description: "remove a workspace" },
     { command: "queue", description: "show queued prompts" },
     { command: "news", description: "voice digest from Reddit top posts" },
+    { command: "wmstatus", description: "worldmonitor monitor status" },
+    { command: "wmcheck", description: "worldmonitor global+taiwan AI check" },
     { command: "codex", description: "show codex command menu" },
     { command: "commands", description: "show codex command menu" },
     { command: "cmd", description: "stage a raw codex CLI command" },
@@ -5445,6 +5885,8 @@ const BACKGROUND_LOCAL_COMMANDS = new Set([
   "/screenshot",
   "/sendfile",
   "/model",
+  "/wmstatus",
+  "/wmcheck",
   "/imgclear",
   "/wipe",
 ]);
@@ -5504,6 +5946,8 @@ async function sendHelp(chatId) {
     "- /queue - show queued prompts",
     "- /news [days|reset] - Reddit top-post digest with missed-day catch-up",
     "- Say \"give me the news\" - bot asks for day count then runs /news",
+    "- /wmstatus - show WorldMonitor monitor state and last alerts",
+    "- /wmcheck [force|raw] - comprehensive WorldMonitor AI check (global + Taiwan)",
     "- /cancel - stop current AIDOLON run",
     "- /clear - clear queued prompts",
     "- /wipe - wipe runtime files and reset this chat context",
@@ -6043,6 +6487,3981 @@ async function handleNewsCommand(chatId, argText) {
   }
 }
 
+async function fetchTextUrl(url, { headers = {}, timeoutMs = 0, signal } = {}) {
+  const controller = new AbortController();
+  const ms = Number(timeoutMs);
+  const useTimeout = Number.isFinite(ms) && ms > 0;
+  const timer = useTimeout ? setTimeout(() => controller.abort(), ms) : null;
+  const combined = combineAbortSignals([controller.signal, signal]);
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      headers,
+      signal: combined.signal,
+    });
+    const text = await res.text().catch(() => "");
+    if (!res.ok) {
+      throw new Error(`${res.status} ${String(res.statusText || "request failed").trim()}`.trim());
+    }
+    return {
+      status: Number(res.status || 0) || 0,
+      text: String(text || ""),
+      contentType: String(res.headers.get("content-type") || "").trim().toLowerCase(),
+      finalUrl: String(res.url || url || "").trim(),
+    };
+  } finally {
+    combined.cleanup();
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function formatRelativeAge(timestampMs) {
+  const n = Number(timestampMs || 0);
+  if (!Number.isFinite(n) || n <= 0) return "never";
+  let deltaMs = Date.now() - n;
+  if (!Number.isFinite(deltaMs) || deltaMs < 0) deltaMs = 0;
+  const sec = Math.floor(deltaMs / 1000);
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  return `${day}d ago`;
+}
+
+const WORLDMONITOR_ALERT_KEYWORDS = [
+  "war", "invasion", "military", "nuclear", "sanctions", "missile",
+  "airstrike", "drone strike", "troops deployed", "armed conflict", "bombing", "casualties",
+  "ceasefire", "peace treaty", "nato", "coup", "martial law",
+  "assassination", "terrorist", "terror attack", "cyber attack", "hostage", "evacuation order",
+];
+const WORLDMONITOR_ALERT_EXCLUSIONS = [
+  "protein", "couples", "relationship", "dating", "diet", "fitness",
+  "recipe", "cooking", "shopping", "fashion", "celebrity", "movie",
+  "tv show", "sports", "game", "concert", "festival", "wedding",
+  "vacation", "travel tips", "life hack", "self-care", "wellness",
+];
+const WORLDMONITOR_CRITICAL_KEYWORDS = [
+  "invasion", "airstrike", "missile", "martial law", "coup",
+  "troops deployed", "armed conflict", "drone strike", "evacuation order",
+  "nuclear strike", "nuclear attack", "nuclear detonation", "nuclear weapon use",
+];
+const WORLDMONITOR_HIGH_KEYWORDS = [
+  "war", "military", "sanctions", "bombing", "casualties", "nuclear",
+  "terror attack", "hostage", "cyber attack", "ceasefire",
+];
+const WORLDMONITOR_TAIWAN_KEYWORDS = [
+  "taiwan", "taipei", "taiwan strait", "strait", "pla", "prc", "beijing", "china",
+  "kinmen", "matsu", "penghu", "south china sea", "east china sea",
+];
+const WORLDMONITOR_TAIWAN_WELLBEING_GLOBAL_CRITICAL_KEYWORDS = [
+  "nuclear attack",
+  "nuclear strike",
+  "nuclear detonation",
+  "world war",
+  "icbm",
+  "ballistic missile",
+  "strait closure",
+  "south china sea blockade",
+  "major cyber attack",
+];
+const WORLDMONITOR_MAJOR_WORLD_EVENT_KEYWORDS = [
+  "iran",
+  "israel",
+  "russia",
+  "ukraine",
+  "china",
+  "united states",
+  "u.s.",
+  "taiwan strait",
+  "south china sea",
+  "east china sea",
+  "strait of hormuz",
+  "suez canal",
+  "nuclear",
+  "icbm",
+  "ballistic missile",
+  "global recession",
+  "oil shock",
+  "pandemic",
+  "ceasefire collapse",
+];
+const WORLDMONITOR_COUNTRY_PATTERNS = Object.freeze([
+  { code: "TW", patterns: ["taiwan", "taipei", "kinmen", "matsu", "penghu"] },
+  { code: "CN", patterns: ["china", "beijing", "pla", "prc"] },
+  { code: "US", patterns: ["united states", "u.s.", "washington", "pentagon", "white house", "american"] },
+  { code: "RU", patterns: ["russia", "moscow", "kremlin"] },
+  { code: "UA", patterns: ["ukraine", "kyiv", "kiev"] },
+  { code: "IL", patterns: ["israel", "israeli", "tel aviv"] },
+  { code: "IR", patterns: ["iran", "tehran"] },
+  { code: "SY", patterns: ["syria", "damascus"] },
+  { code: "YE", patterns: ["yemen", "houthi"] },
+  { code: "KP", patterns: ["north korea", "pyongyang"] },
+  { code: "KR", patterns: ["south korea", "seoul"] },
+  { code: "JP", patterns: ["japan", "tokyo"] },
+  { code: "PH", patterns: ["philippines", "manila"] },
+  { code: "VN", patterns: ["vietnam", "hanoi"] },
+  { code: "IN", patterns: ["india", "new delhi"] },
+  { code: "PK", patterns: ["pakistan", "islamabad"] },
+  { code: "SA", patterns: ["saudi arabia", "riyadh"] },
+  { code: "AE", patterns: ["united arab emirates", "uae", "abu dhabi", "dubai"] },
+  { code: "TR", patterns: ["turkey", "ankara"] },
+  { code: "DE", patterns: ["germany", "berlin"] },
+  { code: "FR", patterns: ["france", "paris"] },
+  { code: "GB", patterns: ["united kingdom", "uk", "britain", "london"] },
+  { code: "PL", patterns: ["poland", "warsaw"] },
+  { code: "VE", patterns: ["venezuela", "caracas"] },
+  { code: "MM", patterns: ["myanmar", "burma"] },
+]);
+
+function decodeWorldMonitorXmlText(raw) {
+  const text = String(raw || "");
+  const withoutCdata = text.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1");
+  return withoutCdata
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&quot;/gi, "\"")
+    .replace(/&apos;/gi, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">");
+}
+
+function stripWorldMonitorHtml(raw) {
+  const text = decodeWorldMonitorXmlText(raw);
+  return text
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeWorldMonitorTitleForKey(raw) {
+  return String(raw || "")
+    .toLowerCase()
+    .replace(/\s+[|]\s+[\p{L}\p{N} .,&'()/-]{2,50}$/u, "")
+    .replace(/\s+-\s+[\p{L}\p{N} .,&'()/-]{2,50}$/u, "")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
+}
+
+function normalizeWorldMonitorLink(rawUrl) {
+  const raw = String(rawUrl || "").trim();
+  if (!/^https?:\/\//i.test(raw)) return "";
+  try {
+    const u = new URL(raw);
+    const dropKeys = ["utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "gclid", "fbclid", "ocid"];
+    for (const k of dropKeys) {
+      if (u.searchParams.has(k)) u.searchParams.delete(k);
+    }
+    u.hash = "";
+    return u.toString();
+  } catch {
+    return raw;
+  }
+}
+
+function worldMonitorThreatLevelForTitle(title) {
+  const lower = String(title || "").trim().toLowerCase();
+  if (!lower) return "low";
+  for (const ex of WORLDMONITOR_ALERT_EXCLUSIONS) {
+    if (ex && lower.includes(ex)) return "low";
+  }
+  let hits = 0;
+  for (const kw of WORLDMONITOR_ALERT_KEYWORDS) {
+    if (kw && lower.includes(kw)) hits += 1;
+  }
+  if (WORLDMONITOR_CRITICAL_KEYWORDS.some((kw) => lower.includes(kw))) return "critical";
+  if (WORLDMONITOR_HIGH_KEYWORDS.some((kw) => lower.includes(kw))) return "high";
+  if (hits >= 2) return "high";
+  if (hits === 1) return "medium";
+  return "low";
+}
+
+function worldMonitorTaiwanRelevanceScore(title) {
+  const lower = String(title || "").trim().toLowerCase();
+  if (!lower) return 0;
+  let score = 0;
+  for (const kw of WORLDMONITOR_TAIWAN_KEYWORDS) {
+    if (!kw) continue;
+    if (lower.includes(kw)) score += (kw === "taiwan" || kw === "taipei" || kw === "taiwan strait") ? 3 : 1;
+  }
+  return score;
+}
+
+function worldMonitorSourceWeight(sourceName, feedSection) {
+  const lower = String(sourceName || "").toLowerCase();
+  if (!lower) return 1;
+  if (lower.includes("reuters") || lower.includes("ap news") || lower.includes("bbc") || lower.includes("pentagon")) {
+    return 1.35;
+  }
+  if (String(feedSection || "").toLowerCase() === "intel") return 1.25;
+  return 1;
+}
+
+function escapeRegExp(text) {
+  return String(text || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function worldMonitorExtractCountryCodes(title) {
+  const lower = String(title || "").toLowerCase();
+  if (!lower) return [];
+  const out = new Set();
+  for (const item of WORLDMONITOR_COUNTRY_PATTERNS) {
+    if (!item?.code || !Array.isArray(item.patterns)) continue;
+    for (const raw of item.patterns) {
+      const token = String(raw || "").trim().toLowerCase();
+      if (!token) continue;
+      const has = token.endsWith(" ")
+        ? lower.includes(token)
+        : new RegExp(`\\b${escapeRegExp(token)}\\b`, "i").test(lower);
+      if (has) {
+        out.add(item.code);
+        break;
+      }
+    }
+  }
+  return [...out];
+}
+
+function worldMonitorExtractFirstXmlTag(block, tagNames) {
+  const names = Array.isArray(tagNames) ? tagNames : [tagNames];
+  for (const rawName of names) {
+    const name = String(rawName || "").trim();
+    if (!name) continue;
+    const re = new RegExp(`<(?:[A-Za-z0-9_-]+:)?${name}\\b[^>]*>([\\s\\S]*?)<\\/(?:[A-Za-z0-9_-]+:)?${name}>`, "i");
+    const m = String(block || "").match(re);
+    if (m && m[1]) {
+      const text = stripWorldMonitorHtml(m[1]);
+      if (text) return text;
+    }
+  }
+  return "";
+}
+
+function worldMonitorExtractLinkFromItem(block) {
+  const src = String(block || "");
+  let m = src.match(/<link\b[^>]*\bhref=["']([^"']+)["'][^>]*>/i);
+  if (m && m[1]) return normalizeWorldMonitorLink(m[1]);
+  m = src.match(/<link\b[^>]*>([\s\S]*?)<\/link>/i);
+  if (m && m[1]) {
+    const inline = stripWorldMonitorHtml(m[1]);
+    if (inline && /^https?:\/\//i.test(inline)) return normalizeWorldMonitorLink(inline);
+  }
+  m = src.match(/<guid\b[^>]*>([\s\S]*?)<\/guid>/i);
+  if (m && m[1]) {
+    const guid = stripWorldMonitorHtml(m[1]);
+    if (guid && /^https?:\/\//i.test(guid)) return normalizeWorldMonitorLink(guid);
+  }
+  m = src.match(/<id\b[^>]*>([\s\S]*?)<\/id>/i);
+  if (m && m[1]) {
+    const id = stripWorldMonitorHtml(m[1]);
+    if (id && /^https?:\/\//i.test(id)) return normalizeWorldMonitorLink(id);
+  }
+  return "";
+}
+
+function parseWorldMonitorFeedXml(xmlText, feed, fetchedAt) {
+  const src = String(xmlText || "");
+  if (!src) return [];
+  const items = [];
+  const blocks = [];
+  const itemMatches = src.matchAll(/<item\b[\s\S]*?<\/item>/gi);
+  for (const m of itemMatches) blocks.push(m[0]);
+  const entryMatches = src.matchAll(/<entry\b[\s\S]*?<\/entry>/gi);
+  for (const m of entryMatches) blocks.push(m[0]);
+  if (blocks.length === 0) return items;
+
+  for (const block of blocks) {
+    const title = worldMonitorExtractFirstXmlTag(block, ["title"]);
+    const link = worldMonitorExtractLinkFromItem(block);
+    if (!title || !link) continue;
+    const publishedRaw = worldMonitorExtractFirstXmlTag(block, ["pubDate", "published", "updated", "dc:date", "date"]);
+    const publishedAt = Number(Date.parse(publishedRaw)) || Number(fetchedAt || Date.now());
+    const articleKey = normalizeWorldMonitorLink(link)
+      || `${String(feed?.name || "").toLowerCase()}|${normalizeWorldMonitorTitleForKey(title)}|${utcDayKeyFromMs(publishedAt)}`;
+    const threatLevel = worldMonitorThreatLevelForTitle(title);
+    const taiwanScore = worldMonitorTaiwanRelevanceScore(title);
+    const countries = worldMonitorExtractCountryCodes(title);
+    items.push({
+      articleKey,
+      source: String(feed?.name || "Unknown").trim() || "Unknown",
+      feedSection: String(feed?.section || "").trim().toLowerCase(),
+      feedCategory: String(feed?.category || "").trim().toLowerCase(),
+      title: String(title || "").trim(),
+      link: normalizeWorldMonitorLink(link),
+      publishedAt,
+      firstSeenAt: Number(fetchedAt || Date.now()),
+      lastSeenAt: Number(fetchedAt || Date.now()),
+      threatLevel,
+      taiwanScore,
+      countries,
+    });
+  }
+
+  const dedup = new Map();
+  for (const item of items) {
+    const key = String(item.articleKey || "").trim();
+    if (!key) continue;
+    const prev = dedup.get(key);
+    if (!prev) {
+      dedup.set(key, item);
+      continue;
+    }
+    if (Number(item.publishedAt || 0) > Number(prev.publishedAt || 0)) dedup.set(key, item);
+  }
+  return [...dedup.values()].slice(0, WORLDMONITOR_NATIVE_FEED_ITEMS_PER_SOURCE);
+}
+
+function decodeWorldMonitorHtmlEntities(raw) {
+  const text = decodeWorldMonitorXmlText(raw);
+  return text
+    .replace(/&#x([0-9a-f]+);/gi, (_m, hex) => {
+      const code = Number.parseInt(String(hex || ""), 16);
+      return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : " ";
+    })
+    .replace(/&#([0-9]+);/g, (_m, dec) => {
+      const code = Number.parseInt(String(dec || ""), 10);
+      return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : " ";
+    });
+}
+
+function parseWorldMonitorHtmlMetaMap(htmlText) {
+  const src = String(htmlText || "");
+  const out = {};
+  const tags = src.match(/<meta\b[^>]*>/gi) || [];
+  for (const tag of tags) {
+    const attrs = {};
+    const re = /([a-zA-Z_:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/g;
+    let m;
+    while ((m = re.exec(tag)) !== null) {
+      const key = String(m[1] || "").trim().toLowerCase();
+      const value = decodeWorldMonitorHtmlEntities(String(m[2] || m[3] || m[4] || "").trim());
+      if (!key || !value) continue;
+      attrs[key] = value;
+    }
+    const metaKey = String(attrs.property || attrs.name || "").trim().toLowerCase();
+    const content = String(attrs.content || "").trim();
+    if (!metaKey || !content) continue;
+    if (!(metaKey in out)) out[metaKey] = content;
+  }
+  return out;
+}
+
+function parseWorldMonitorJsonSafe(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    // Some publishers wrap JSON-LD in invalid trailing markers; apply minimal cleanup.
+  }
+  const cleaned = text
+    .replace(/^\s*<!--/, "")
+    .replace(/-->\s*$/, "")
+    .trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    return null;
+  }
+}
+
+function appendWorldMonitorJsonLdNodes(target, node) {
+  if (!node) return;
+  if (Array.isArray(node)) {
+    for (const x of node) appendWorldMonitorJsonLdNodes(target, x);
+    return;
+  }
+  if (typeof node !== "object") return;
+  const graph = node["@graph"];
+  if (Array.isArray(graph) && graph.length > 0) {
+    for (const x of graph) appendWorldMonitorJsonLdNodes(target, x);
+  }
+  target.push(node);
+}
+
+function parseWorldMonitorJsonLdNodes(htmlText) {
+  const src = String(htmlText || "");
+  const nodes = [];
+  const matches = src.matchAll(/<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi);
+  for (const m of matches) {
+    const parsed = parseWorldMonitorJsonSafe(m && m[1] ? m[1] : "");
+    appendWorldMonitorJsonLdNodes(nodes, parsed);
+  }
+  return nodes;
+}
+
+function extractWorldMonitorAuthorName(raw) {
+  if (!raw) return "";
+  if (typeof raw === "string") return oneLine(raw);
+  if (Array.isArray(raw)) {
+    for (const x of raw) {
+      const name = extractWorldMonitorAuthorName(x);
+      if (name) return name;
+    }
+    return "";
+  }
+  if (typeof raw === "object") {
+    const name = oneLine(String(raw.name || raw.alternateName || ""));
+    if (name) return name;
+  }
+  return "";
+}
+
+function extractWorldMonitorArticleMetaFromJsonLd(nodes) {
+  const list = Array.isArray(nodes) ? nodes : [];
+  let best = null;
+  for (const node of list) {
+    if (!node || typeof node !== "object") continue;
+    const typeRaw = node["@type"];
+    const types = Array.isArray(typeRaw) ? typeRaw : [typeRaw];
+    const joined = types.map((x) => String(x || "").toLowerCase()).join("|");
+    if (!joined.includes("article") && !joined.includes("news") && !joined.includes("report")) continue;
+    const body = decodeWorldMonitorHtmlEntities(String(node.articleBody || node.text || "")).replace(/\s+/g, " ").trim();
+    const headline = oneLine(String(node.headline || node.name || ""));
+    const description = oneLine(String(node.description || ""));
+    const dateRaw = String(node.datePublished || node.dateCreated || node.uploadDate || "");
+    const publishedAt = Number(Date.parse(dateRaw)) || 0;
+    const siteName = oneLine(String(node?.publisher?.name || node?.isPartOf?.name || ""));
+    const author = extractWorldMonitorAuthorName(node.author);
+    const score = (body.length * 2) + (headline.length > 0 ? 300 : 0) + description.length;
+    if (!best || score > best.score) {
+      best = {
+        score,
+        headline,
+        description,
+        body,
+        publishedAt,
+        siteName,
+        author,
+      };
+    }
+  }
+  return best;
+}
+
+function extractWorldMonitorLargestTagBlock(htmlText, tagNames) {
+  const src = String(htmlText || "");
+  const tags = Array.isArray(tagNames) ? tagNames : [tagNames];
+  let best = "";
+  for (const rawTag of tags) {
+    const tag = String(rawTag || "").trim();
+    if (!tag) continue;
+    const re = new RegExp(`<${tag}\\b[^>]*>[\\s\\S]*?<\\/${tag}>`, "gi");
+    const matches = src.match(re) || [];
+    for (const block of matches) {
+      if (String(block || "").length > best.length) best = String(block || "");
+    }
+  }
+  return best;
+}
+
+function isWorldMonitorBoilerplateLine(line) {
+  const lower = String(line || "").trim().toLowerCase();
+  if (!lower) return true;
+  if (lower.length < 30) return true;
+  return (
+    lower.startsWith("subscribe ")
+    || lower.startsWith("sign up ")
+    || lower.startsWith("all rights reserved")
+    || lower.startsWith("copyright ")
+    || lower.startsWith("advertisement")
+    || lower.startsWith("read more")
+    || lower.startsWith("related")
+    || lower.startsWith("recommended")
+    || lower.startsWith("follow us")
+    || lower.startsWith("cookie ")
+    || lower.startsWith("privacy ")
+    || lower.startsWith("terms ")
+  );
+}
+
+function extractWorldMonitorTextFromHtml(htmlText) {
+  const src = String(htmlText || "");
+  if (!src) return "";
+  const articleBlock = extractWorldMonitorLargestTagBlock(src, ["article"]);
+  const mainBlock = extractWorldMonitorLargestTagBlock(src, ["main"]);
+  const bodyBlock = extractWorldMonitorLargestTagBlock(src, ["body"]);
+  let block = articleBlock || mainBlock || bodyBlock || src;
+  block = block
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript\b[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<svg\b[\s\S]*?<\/svg>/gi, " ")
+    .replace(/<iframe\b[\s\S]*?<\/iframe>/gi, " ")
+    .replace(/<(br|\/p|\/div|\/section|\/article|\/main|\/li|\/h[1-6]|\/tr|\/td|\/blockquote)\b[^>]*>/gi, "\n")
+    .replace(/<li\b[^>]*>/gi, "\n")
+    .replace(/<[^>]+>/g, " ");
+
+  const raw = decodeWorldMonitorHtmlEntities(block);
+  const lines = raw.split(/\n+/).map((x) => oneLine(x)).filter(Boolean);
+  const dedup = new Set();
+  const kept = [];
+  for (const line of lines) {
+    if (isWorldMonitorBoilerplateLine(line)) continue;
+    const key = normalizeWorldMonitorTitleForKey(line);
+    if (!key || dedup.has(key)) continue;
+    dedup.add(key);
+    kept.push(line);
+  }
+  return kept.join(" ").replace(/\s+/g, " ").trim();
+}
+
+function trimWorldMonitorWords(text, maxWords) {
+  const src = String(text || "").trim();
+  if (!src) return "";
+  const limit = Math.max(1, Math.trunc(Number(maxWords || 1)));
+  const words = src.split(/\s+/).filter(Boolean);
+  if (words.length <= limit) return src;
+  return words.slice(0, limit).join(" ");
+}
+
+function buildWorldMonitorArticleKeywords(item, title, description) {
+  const raw = [
+    String(item?.title || ""),
+    String(title || ""),
+    String(description || ""),
+    ...WORLDMONITOR_ALERT_KEYWORDS,
+    ...WORLDMONITOR_TAIWAN_KEYWORDS,
+  ].join(" ");
+  const tokens = normalizeWorldMonitorTitleForKey(raw)
+    .split(/\s+/)
+    .map((x) => String(x || "").trim())
+    .filter((x) => x.length >= 4);
+  const stop = new Set([
+    "with", "from", "that", "this", "were", "have", "into", "after", "before", "about",
+    "their", "there", "which", "while", "where", "over", "more", "than", "when", "what",
+    "said", "says", "will", "would", "could", "should", "news", "report", "reports", "today",
+  ]);
+  const out = [];
+  for (const t of tokens) {
+    if (stop.has(t)) continue;
+    if (out.includes(t)) continue;
+    out.push(t);
+    if (out.length >= 28) break;
+  }
+  return out;
+}
+
+function scoreWorldMonitorSummarySentence(sentence, keywords) {
+  const text = String(sentence || "").trim();
+  if (!text) return -100;
+  const lower = text.toLowerCase();
+  if (isWorldMonitorBoilerplateLine(text)) return -100;
+  let score = 0;
+  if (text.length >= 50 && text.length <= 260) score += 3;
+  else if (text.length >= 35 && text.length <= 340) score += 1;
+  if (/\b\d{2,}\b/.test(text)) score += 1;
+  if (/(said|announced|reported|warned|confirmed|deployed|launched|sanction|ceasefire|exercise)/i.test(text)) score += 1.3;
+  if (/(taiwan|china|beijing|strait|south china sea|east china sea|military|missile|naval)/i.test(lower)) score += 1.2;
+  for (const kw of keywords) {
+    if (!kw) continue;
+    if (lower.includes(kw)) score += 0.35;
+  }
+  return score;
+}
+
+function summarizeWorldMonitorArticleText(item, title, description, articleText) {
+  const text = String(articleText || "").replace(/\s+/g, " ").trim();
+  const desc = oneLine(String(description || ""));
+  const merged = [desc, text].filter(Boolean).join(" ");
+  const sentences = splitIntoSentencesBestEffort(merged)
+    .map((x) => oneLine(x))
+    .filter((x) => x.length >= 35);
+  const keywords = buildWorldMonitorArticleKeywords(item, title, description);
+  const scored = [];
+  for (let i = 0; i < sentences.length; i += 1) {
+    const sentence = sentences[i];
+    const score = scoreWorldMonitorSummarySentence(sentence, keywords);
+    if (score <= -10) continue;
+    scored.push({ sentence, score, idx: i });
+  }
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return a.idx - b.idx;
+  });
+
+  const selected = [];
+  const seen = new Set();
+  for (const row of scored) {
+    const key = normalizeWorldMonitorTitleForKey(row.sentence);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    selected.push(row.sentence);
+    if (selected.length >= 5) break;
+  }
+
+  let summary = selected.join(" ").trim();
+  if (!summary) {
+    summary = desc || text || oneLine(String(title || item?.title || ""));
+  }
+  summary = trimWorldMonitorWords(summary, WORLDMONITOR_DEEP_INGEST_SUMMARY_MAX_WORDS);
+  summary = summary.slice(0, WORLDMONITOR_DEEP_INGEST_SUMMARY_MAX_CHARS).trim();
+
+  const keyPoints = selected
+    .slice(0, 3)
+    .map((x) => x.slice(0, 260).trim())
+    .filter(Boolean);
+  return {
+    summary,
+    keyPoints,
+  };
+}
+
+async function fetchAndSummarizeWorldMonitorArticle(item, options = {}) {
+  const link = normalizeWorldMonitorLink(item?.link || "");
+  if (!/^https?:\/\//i.test(link)) {
+    throw new Error("invalid article link");
+  }
+  const timeoutMs = Number(options?.timeoutMs || 0);
+  const resp = await fetchTextUrl(link, {
+    timeoutMs,
+    headers: {
+      "User-Agent": REDDIT_USER_AGENT,
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Cache-Control": "no-cache",
+    },
+  });
+  const html = String(resp?.text || "");
+  if (!html) {
+    throw new Error("empty html");
+  }
+  const meta = parseWorldMonitorHtmlMetaMap(html);
+  const jsonLdNodes = parseWorldMonitorJsonLdNodes(html);
+  const articleMeta = extractWorldMonitorArticleMetaFromJsonLd(jsonLdNodes);
+  const title = oneLine(
+    String(
+      articleMeta?.headline
+      || meta["og:title"]
+      || meta["twitter:title"]
+      || worldMonitorExtractFirstXmlTag(html, ["title"])
+      || item?.title
+      || "",
+    ),
+  );
+  const description = oneLine(
+    String(
+      articleMeta?.description
+      || meta["og:description"]
+      || meta["twitter:description"]
+      || meta.description
+      || "",
+    ),
+  );
+  const articleBody = String(articleMeta?.body || "").trim();
+  const bodyFromHtml = extractWorldMonitorTextFromHtml(html);
+  let text = articleBody.length >= 280 ? articleBody : [description, bodyFromHtml].filter(Boolean).join(" ");
+  text = text.replace(/\s+/g, " ").trim();
+  if (text.length > WORLDMONITOR_DEEP_INGEST_MAX_TEXT_CHARS) {
+    text = text.slice(0, WORLDMONITOR_DEEP_INGEST_MAX_TEXT_CHARS).trim();
+  }
+  if (text.length < 220 && description) {
+    text = [description, text].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+  }
+  if (text.length < 120) {
+    throw new Error("article text too short");
+  }
+
+  const lang = String(
+    meta["og:locale"]
+    || (String(html.match(/<html\b[^>]*\blang=["']([^"']+)["']/i)?.[1] || "").trim())
+    || "",
+  ).trim().toLowerCase();
+  const publishedAt = Number(articleMeta?.publishedAt || 0)
+    || Number(Date.parse(String(meta["article:published_time"] || meta["og:published_time"] || "")))
+    || 0;
+  const siteName = oneLine(
+    String(articleMeta?.siteName || meta["og:site_name"] || meta["application-name"] || ""),
+  );
+  const author = oneLine(String(articleMeta?.author || meta.author || ""));
+  const summaryPack = summarizeWorldMonitorArticleText(item, title, description, text);
+  const textWords = text.split(/\s+/).filter(Boolean).length;
+
+  return {
+    status: "ok",
+    fetchedAt: Date.now(),
+    finalUrl: String(resp?.finalUrl || link || "").trim(),
+    contentType: String(resp?.contentType || "").trim(),
+    articleTitle: title || oneLine(String(item?.title || "")),
+    description: description || "",
+    summary: String(summaryPack.summary || "").trim(),
+    keyPoints: Array.isArray(summaryPack.keyPoints) ? summaryPack.keyPoints : [],
+    articlePublishedAt: publishedAt > 0 ? publishedAt : 0,
+    siteName: siteName || "",
+    author: author || "",
+    lang: lang || "",
+    textChars: text.length,
+    textWords,
+  };
+}
+
+function getWorldMonitorItemArticleContext(item) {
+  return item && typeof item.articleContext === "object" && item.articleContext
+    ? item.articleContext
+    : null;
+}
+
+function buildWorldMonitorDeepIngestCandidates(options = {}) {
+  const force = options?.force === true;
+  const now = Date.now();
+  const retryCooldownMs = Math.max(0, Number(WORLDMONITOR_DEEP_INGEST_RETRY_COOLDOWN_SEC || 0) * 1000);
+  const lookbackHours = Math.max(0, Number(WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS || 0));
+  const lookbackMs = lookbackHours > 0 ? (lookbackHours * 60 * 60 * 1000) : 0;
+  const seedSet = new Set(
+    (Array.isArray(options?.seedKeys) ? options.seedKeys : [])
+      .map((x) => String(x || "").trim())
+      .filter(Boolean),
+  );
+  const candidates = [];
+  for (const item of worldMonitorNativeNewsItems) {
+    const link = normalizeWorldMonitorLink(item?.link || "");
+    if (!/^https?:\/\//i.test(link)) continue;
+    const ts = Number(item?.publishedAt || item?.firstSeenAt || item?.lastSeenAt || 0) || 0;
+    if (lookbackMs > 0 && ts > 0 && (now - ts) > lookbackMs) continue;
+    const ctx = getWorldMonitorItemArticleContext(item);
+    if (!force && ctx && String(ctx.status || "").toLowerCase() === "ok" && String(ctx.summary || "").trim()) {
+      continue;
+    }
+    if (
+      !force
+      && ctx
+      && String(ctx.status || "").toLowerCase() === "error"
+      && Number(ctx.fetchedAt || 0) > 0
+      && (now - Number(ctx.fetchedAt || 0)) < retryCooldownMs
+    ) {
+      continue;
+    }
+
+    let score = 0;
+    const articleKey = String(item?.articleKey || "").trim();
+    if (articleKey && seedSet.has(articleKey)) score += 200;
+    score += worldMonitorFeedAlertLevelRank(item?.threatLevel || "low") * 30;
+    score += Math.min(36, Math.max(0, Number(item?.taiwanScore || 0)) * 8);
+    if (String(item?.feedSection || "").toLowerCase() === "intel") score += 10;
+    if (String(item?.feedCategory || "").toLowerCase().includes("middleeast")) score += 2;
+    if (String(item?.feedCategory || "").toLowerCase().includes("asia")) score += 4;
+    const ageH = ts > 0 ? ((now - ts) / (60 * 60 * 1000)) : 9999;
+    if (Number.isFinite(ageH) && ageH >= 0) {
+      score += Math.max(0, (72 - ageH) / 3);
+    }
+    if (!ctx || !ctx.fetchedAt) score += 8;
+    candidates.push({ item, score, ts });
+  }
+  candidates.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return Number(b.ts || 0) - Number(a.ts || 0);
+  });
+  const cap = Math.max(0, Number(WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE || 0));
+  return cap > 0 ? candidates.slice(0, cap) : candidates;
+}
+
+function buildWorldMonitorDeepIngestStatsBase() {
+  return {
+    enabled: WORLDMONITOR_DEEP_INGEST_ENABLED,
+    timeout_ms: WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS,
+    concurrency: WORLDMONITOR_DEEP_INGEST_CONCURRENCY,
+    max_per_cycle: WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE,
+    lookback_hours: WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS,
+    summary_max_words: WORLDMONITOR_DEEP_INGEST_SUMMARY_MAX_WORDS,
+    scanned: 0,
+    completed: 0,
+    errors: 0,
+    remaining_pending: 0,
+    sample_errors: [],
+  };
+}
+
+async function runWorldMonitorNativeDeepIngest(options = {}) {
+  if (!WORLDMONITOR_DEEP_INGEST_ENABLED) {
+    const stats = buildWorldMonitorDeepIngestStatsBase();
+    stats.skipped = "disabled";
+    return { ok: true, skipped: "disabled", stats };
+  }
+  if (worldMonitorNativeRuntime.deepIngestPromise) {
+    return worldMonitorNativeRuntime.deepIngestPromise;
+  }
+
+  const promise = (async () => {
+    const startedAt = Date.now();
+    const stats = buildWorldMonitorDeepIngestStatsBase();
+    const candidates = buildWorldMonitorDeepIngestCandidates(options);
+    stats.scanned = candidates.length;
+    if (candidates.length <= 0) {
+      worldMonitorMonitor.nativeDeepIngestLastRunAt = Date.now();
+      worldMonitorMonitor.nativeDeepIngestLastDurationMs = Date.now() - startedAt;
+      worldMonitorMonitor.nativeDeepIngestLastErrorAt = 0;
+      worldMonitorMonitor.nativeDeepIngestLastError = "";
+      worldMonitorMonitor.nativeDeepIngestLastStats = stats;
+      persistState();
+      return {
+        ok: true,
+        refreshedAt: worldMonitorMonitor.nativeDeepIngestLastRunAt,
+        durationMs: worldMonitorMonitor.nativeDeepIngestLastDurationMs,
+        stats,
+      };
+    }
+
+    let cursor = 0;
+    const concurrency = Math.max(1, Number(WORLDMONITOR_DEEP_INGEST_CONCURRENCY || 1));
+    async function workerLoop() {
+      for (;;) {
+        const idx = cursor;
+        cursor += 1;
+        if (idx >= candidates.length) break;
+        const candidate = candidates[idx];
+        const item = candidate && candidate.item ? candidate.item : null;
+        if (!item) continue;
+        try {
+          const packed = await fetchAndSummarizeWorldMonitorArticle(item, {
+            timeoutMs: WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS,
+          });
+          item.articleContext = packed;
+          stats.completed += 1;
+        } catch (err) {
+          stats.errors += 1;
+          const message = String(err?.message || err || "deep ingest failed").trim() || "deep ingest failed";
+          item.articleContext = {
+            status: "error",
+            fetchedAt: Date.now(),
+            error: message.slice(0, 220),
+          };
+          if (stats.sample_errors.length < 12) {
+            const src = oneLine(String(item?.source || "Unknown"));
+            const title = oneLine(String(item?.title || "")).slice(0, 80);
+            stats.sample_errors.push(`${src}: ${title || "untitled"} (${message})`);
+          }
+        }
+      }
+    }
+    const workers = [];
+    for (let i = 0; i < concurrency; i += 1) workers.push(workerLoop());
+    await Promise.all(workers);
+
+    const pendingNow = buildWorldMonitorDeepIngestCandidates({ force: false, seedKeys: [] }).length;
+    stats.remaining_pending = pendingNow;
+
+    worldMonitorMonitor.nativeDeepIngestLastRunAt = Date.now();
+    worldMonitorMonitor.nativeDeepIngestLastDurationMs = Date.now() - startedAt;
+    worldMonitorMonitor.nativeDeepIngestLastErrorAt = 0;
+    worldMonitorMonitor.nativeDeepIngestLastError = "";
+    worldMonitorMonitor.nativeDeepIngestLastStats = stats;
+    persistState();
+
+    return {
+      ok: true,
+      refreshedAt: Number(worldMonitorMonitor.nativeDeepIngestLastRunAt || Date.now()) || Date.now(),
+      durationMs: Number(worldMonitorMonitor.nativeDeepIngestLastDurationMs || 0) || 0,
+      stats,
+    };
+  })().catch((err) => {
+    const message = String(err?.message || err || "native deep ingest failed").trim() || "native deep ingest failed";
+    worldMonitorMonitor.nativeDeepIngestLastErrorAt = Date.now();
+    worldMonitorMonitor.nativeDeepIngestLastError = message;
+    persistState();
+    return { ok: false, error: message, refreshedAt: Date.now(), stats: buildWorldMonitorDeepIngestStatsBase() };
+  }).finally(() => {
+    worldMonitorNativeRuntime.deepIngestPromise = null;
+  });
+
+  worldMonitorNativeRuntime.deepIngestPromise = promise;
+  return promise;
+}
+
+function loadWorldMonitorNativeFeedManifest() {
+  if (Array.isArray(worldMonitorNativeFeedManifest) && worldMonitorNativeFeedManifest.length > 0) {
+    return worldMonitorNativeFeedManifest;
+  }
+  const raw = readJson(WORLDMONITOR_NATIVE_FEEDS_PATH, []);
+  const list = Array.isArray(raw) ? raw : [];
+  const dedup = new Map();
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    const url = normalizeWorldMonitorLink(String(item.url || "").trim());
+    const name = String(item.name || "").trim();
+    if (!name || !url) continue;
+    const key = url.toLowerCase();
+    if (dedup.has(key)) continue;
+    dedup.set(key, {
+      name,
+      url,
+      section: String(item.section || "").trim().toLowerCase(),
+      category: String(item.category || "").trim().toLowerCase(),
+    });
+  }
+  worldMonitorNativeFeedManifest = [...dedup.values()];
+  return worldMonitorNativeFeedManifest;
+}
+
+function pruneWorldMonitorNativeStore(nowMs = Date.now()) {
+  const maxAgeMs = Math.max(1, Number(WORLDMONITOR_NATIVE_STORE_MAX_AGE_DAYS || 30)) * 24 * 60 * 60 * 1000;
+  const minTime = Number(nowMs || Date.now()) - maxAgeMs;
+  const kept = [];
+  for (const item of worldMonitorNativeNewsItems) {
+    const lastSeen = Number(item?.lastSeenAt || item?.firstSeenAt || item?.publishedAt || 0) || 0;
+    if (lastSeen < minTime) continue;
+    kept.push(item);
+  }
+  kept.sort((a, b) => Number(a.lastSeenAt || 0) - Number(b.lastSeenAt || 0));
+  while (kept.length > WORLDMONITOR_NATIVE_STORE_MAX_ITEMS) kept.shift();
+  worldMonitorNativeNewsItems.length = 0;
+  worldMonitorNativeNewsItems.push(...kept);
+}
+
+const WORLDMONITOR_MARKET_SYMBOLS = Object.freeze({
+  "^GSPC": "SP500",
+  "^IXIC": "NASDAQ",
+  "^DJI": "DOW",
+  "^TWII": "TWSE",
+  "^HSI": "HANG_SENG",
+  "000001.SS": "SSE_COMPOSITE",
+  "^N225": "NIKKEI225",
+  "CL=F": "WTI_OIL",
+  "GC=F": "GOLD",
+  "DX-Y.NYB": "DOLLAR_INDEX",
+  "TWD=X": "USD_TWD",
+  "CNY=X": "USD_CNY",
+  "JPY=X": "USD_JPY",
+});
+
+const WORLDMONITOR_NATIVE_ADSB_REGION = Object.freeze({
+  lamin: 4,
+  lamax: 44,
+  lomin: 104,
+  lomax: 133,
+});
+
+const WORLDMONITOR_NATIVE_ADSB_THEATERS = Object.freeze([
+  {
+    id: "taiwan_strait",
+    name: "Taiwan Strait",
+    bounds: { north: 30, south: 18, east: 130, west: 115 },
+  },
+  {
+    id: "south_china_sea",
+    name: "South China Sea",
+    bounds: { north: 25, south: 5, east: 121, west: 105 },
+  },
+  {
+    id: "east_china_sea",
+    name: "East China Sea",
+    bounds: { north: 33, south: 24, east: 132, west: 122 },
+  },
+  {
+    id: "korean_peninsula",
+    name: "Korean Peninsula",
+    bounds: { north: 43, south: 33, east: 132, west: 124 },
+  },
+]);
+
+const WORLDMONITOR_MILITARY_CALLSIGN_PREFIXES = Object.freeze([
+  "RCH", "REACH", "MOOSE", "EVAC", "DUSTOFF", "PEDRO",
+  "DUKE", "HAVOC", "KNIFE", "WARHAWK", "VIPER", "RAGE", "FURY",
+  "SHELL", "TEXACO", "ARCO", "ESSO", "PETRO",
+  "SENTRY", "AWACS", "MAGIC", "DISCO", "DARKSTAR",
+  "COBRA", "PYTHON", "RAPTOR", "EAGLE", "HAWK", "TALON",
+  "NATO", "RAF", "USAF", "USMC", "USCG",
+  "RSAF", "UAEAF", "QAF", "KAF", "IRIAF", "IRGC", "TAF",
+  "VKS", "RUSAF", "PLAAF", "PLA", "CNV",
+]);
+
+const WORLDMONITOR_COMMERCIAL_CALLSIGN_PREFIXES = new Set([
+  "AAL", "DAL", "UAL", "SWA", "JBU", "FFT", "ACA", "WJA",
+  "BAW", "AFR", "DLH", "KLM", "AUA", "SAS", "FIN", "LOT",
+  "CPA", "SIA", "JAL", "ANA", "KAL", "EVA", "CAL", "CCA",
+]);
+
+const WORLDMONITOR_NATIVE_SERVICE_SOURCES = Object.freeze([
+  { id: "openai", name: "OpenAI", url: "https://status.openai.com/api/v2/status.json" },
+  { id: "cloudflare", name: "Cloudflare", url: "https://www.cloudflarestatus.com/api/v2/status.json" },
+  { id: "github", name: "GitHub", url: "https://www.githubstatus.com/api/v2/status.json" },
+  { id: "discord", name: "Discord", url: "https://discordstatus.com/api/v2/status.json" },
+  { id: "zoom", name: "Zoom", url: "https://www.zoomstatus.com/api/v2/status.json" },
+  { id: "twilio", name: "Twilio", url: "https://status.twilio.com/api/v2/status.json" },
+]);
+
+const WORLDMONITOR_NATIVE_MACRO_SYMBOLS = Object.freeze({
+  "BTC-USD": "BTC",
+  "QQQ": "QQQ",
+  "XLP": "XLP",
+  "JPY=X": "USD_JPY",
+});
+
+const WORLDMONITOR_NATIVE_PREDICTION_TAIWAN_PATTERN = /(taiwan|taipei|taiwan strait|formosa|china[-\s]?taiwan|south china sea|east china sea)/i;
+
+const WORLDMONITOR_NATIVE_MARITIME_REGION_PATTERNS = Object.freeze([
+  { id: "taiwan_strait", name: "Taiwan Strait", regex: /(taiwan strait|formosa strait)/i },
+  { id: "south_china_sea", name: "South China Sea", regex: /(south china sea|spratly|paracel)/i },
+  { id: "east_china_sea", name: "East China Sea", regex: /(east china sea|senkaku|diaoyu)/i },
+  { id: "red_sea", name: "Red Sea", regex: /(red sea|bab el[-\s]?mandeb|gulf of aden)/i },
+  { id: "persian_gulf", name: "Persian Gulf", regex: /(persian gulf|strait of hormuz|gulf of oman)/i },
+  { id: "suez", name: "Suez", regex: /(suez canal)/i },
+  { id: "panama", name: "Panama Canal", regex: /(panama canal)/i },
+]);
+
+function worldMonitorNonEmptyObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function worldMonitorLatestSeriesItem(series) {
+  if (!Array.isArray(series) || series.length <= 0) return null;
+  return series[series.length - 1] || null;
+}
+
+function worldMonitorIsLikelyMilitaryCallsign(callsign) {
+  const clean = String(callsign || "").toUpperCase().trim();
+  if (!clean) return false;
+  for (const prefix of WORLDMONITOR_MILITARY_CALLSIGN_PREFIXES) {
+    if (clean.startsWith(prefix)) return true;
+  }
+  if (/^[A-Z]{4,}\d{1,3}$/.test(clean)) return true;
+  if (/^[A-Z]{3}\d{1,2}$/.test(clean)) {
+    if (!WORLDMONITOR_COMMERCIAL_CALLSIGN_PREFIXES.has(clean.slice(0, 3))) return true;
+  }
+  return false;
+}
+
+function worldMonitorAdsbAircraftClass(callsign) {
+  const clean = String(callsign || "").toUpperCase().trim();
+  if (!clean) return "unknown";
+  if (/^(SHELL|TEXACO|ARCO|ESSO|PETRO|KC|STRAT)/.test(clean)) return "tanker";
+  if (/^(SENTRY|AWACS|MAGIC|DISCO|DARKSTAR|E3|E8|E6)/.test(clean)) return "awacs";
+  if (/^(RCH|REACH|MOOSE|EVAC|DUSTOFF|C17|C5|C130|C40)/.test(clean)) return "transport";
+  if (/^(RQ|MQ|REAPER|PREDATOR|GLOBAL)/.test(clean)) return "drone";
+  if (/^(DEATH|BONE|DOOM|B52|B1|B2)/.test(clean)) return "bomber";
+  return "unknown";
+}
+
+function worldMonitorAdsbInBounds(lat, lon, bounds) {
+  if (!bounds || typeof bounds !== "object") return false;
+  const la = Number(lat);
+  const lo = Number(lon);
+  if (!Number.isFinite(la) || !Number.isFinite(lo)) return false;
+  return la >= Number(bounds.south) && la <= Number(bounds.north) && lo >= Number(bounds.west) && lo <= Number(bounds.east);
+}
+
+function normalizeWorldMonitorServiceIndicator(indicator) {
+  const clean = String(indicator || "").trim().toLowerCase();
+  if (!clean) return "unknown";
+  if (clean === "none" || clean === "operational") return "ok";
+  if (clean === "minor" || clean === "degraded") return "degraded";
+  if (clean === "major" || clean === "critical" || clean === "outage") return "outage";
+  return clean;
+}
+
+function pruneWorldMonitorNativeSignals(nowMs = Date.now()) {
+  const maxAgeMs = Math.max(1, Number(WORLDMONITOR_NATIVE_SIGNALS_MAX_AGE_DAYS || 90)) * 24 * 60 * 60 * 1000;
+  const minTs = Number(nowMs || Date.now()) - maxAgeMs;
+  const maxPerSeries = Math.max(400, Math.trunc((WORLDMONITOR_NATIVE_SIGNALS_MAX_AGE_DAYS || 90) * (24 * 60 / 5) * 1.25));
+  const keys = ["marketSeries", "cryptoSeries", "seismicSeries", "infrastructureSeries", "adsbSeries", "disasterSeries", "maritimeSeries", "serviceSeries", "macroSeries", "predictionSeries"];
+  for (const key of keys) {
+    const src = Array.isArray(worldMonitorNativeSignals[key]) ? worldMonitorNativeSignals[key] : [];
+    const kept = src
+      .filter((x) => Number(x?.ts || 0) >= minTs)
+      .sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
+    while (kept.length > maxPerSeries) kept.shift();
+    worldMonitorNativeSignals[key] = kept;
+  }
+}
+
+function pushWorldMonitorSignalSample(seriesKey, sample) {
+  if (!sample || typeof sample !== "object") return;
+  const ts = Number(sample.ts || 0) || Date.now();
+  const normalized = { ...sample, ts };
+  const arr = Array.isArray(worldMonitorNativeSignals[seriesKey]) ? worldMonitorNativeSignals[seriesKey] : [];
+  arr.push(normalized);
+  worldMonitorNativeSignals[seriesKey] = arr;
+}
+
+function parseYahooChartPoint(data) {
+  const chart = data?.chart && typeof data.chart === "object" ? data.chart : null;
+  const result = Array.isArray(chart?.result) && chart.result[0] ? chart.result[0] : null;
+  if (!result) return null;
+  const ts = Array.isArray(result.timestamp) ? result.timestamp : [];
+  const closes = Array.isArray(result?.indicators?.quote?.[0]?.close) ? result.indicators.quote[0].close : [];
+  if (ts.length === 0 || closes.length === 0) return null;
+  const points = [];
+  for (let i = 0; i < Math.min(ts.length, closes.length); i += 1) {
+    const close = Number(closes[i]);
+    const t = Number(ts[i]) * 1000;
+    if (!Number.isFinite(close) || !Number.isFinite(t) || t <= 0) continue;
+    points.push({ close, t });
+  }
+  if (points.length === 0) return null;
+  const last = points[points.length - 1];
+  const prev = points.length > 1 ? points[points.length - 2] : null;
+  const changePct = prev && Number(prev.close || 0) !== 0
+    ? ((Number(last.close || 0) - Number(prev.close || 0)) / Number(prev.close || 1)) * 100
+    : 0;
+  return {
+    price: Number(last.close),
+    prevClose: prev ? Number(prev.close) : Number(last.close),
+    changePct: Number(changePct),
+    asOf: Number(last.t),
+  };
+}
+
+function parseYahooCloseSeries(data) {
+  const chart = data?.chart && typeof data.chart === "object" ? data.chart : null;
+  const result = Array.isArray(chart?.result) && chart.result[0] ? chart.result[0] : null;
+  if (!result) return [];
+  const ts = Array.isArray(result.timestamp) ? result.timestamp : [];
+  const closes = Array.isArray(result?.indicators?.quote?.[0]?.close) ? result.indicators.quote[0].close : [];
+  if (ts.length === 0 || closes.length === 0) return [];
+  const points = [];
+  for (let i = 0; i < Math.min(ts.length, closes.length); i += 1) {
+    const close = Number(closes[i]);
+    const t = Number(ts[i]) * 1000;
+    if (!Number.isFinite(close) || !Number.isFinite(t) || t <= 0) continue;
+    points.push({ t, close });
+  }
+  return points;
+}
+
+function rateOfChangeFromSeries(points, periodsBack) {
+  const series = Array.isArray(points) ? points : [];
+  const back = Math.max(1, Math.trunc(Number(periodsBack) || 1));
+  if (series.length <= back) return null;
+  const latest = Number(series[series.length - 1]?.close);
+  const past = Number(series[series.length - 1 - back]?.close);
+  if (!Number.isFinite(latest) || !Number.isFinite(past) || past === 0) return null;
+  return ((latest - past) / past) * 100;
+}
+
+async function fetchYahooQuote(symbol, timeoutMs) {
+  const encoded = encodeURIComponent(String(symbol || "").trim());
+  if (!encoded) throw new Error("symbol missing");
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encoded}?interval=1d&range=5d`;
+  const data = await fetchJsonUrl(url, {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": REDDIT_USER_AGENT,
+    },
+    timeoutMs,
+  });
+  const point = parseYahooChartPoint(data);
+  if (!point) throw new Error("chart point unavailable");
+  return point;
+}
+
+async function fetchYahooSeries(symbol, timeoutMs, { range = "1y", interval = "1d" } = {}) {
+  const encoded = encodeURIComponent(String(symbol || "").trim());
+  if (!encoded) throw new Error("symbol missing");
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encoded}?interval=${encodeURIComponent(interval)}&range=${encodeURIComponent(range)}`;
+  const data = await fetchJsonUrl(url, {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": REDDIT_USER_AGENT,
+    },
+    timeoutMs,
+  });
+  return parseYahooCloseSeries(data);
+}
+
+async function fetchWorldMonitorNativeMarketSnapshot(timeoutMs) {
+  const out = {};
+  const errors = [];
+  const symbols = Object.keys(WORLDMONITOR_MARKET_SYMBOLS);
+  const jobs = symbols.map((symbol) => (async () => {
+    const label = WORLDMONITOR_MARKET_SYMBOLS[symbol];
+    try {
+      const point = await fetchYahooQuote(symbol, timeoutMs);
+      out[label] = {
+        price: Number(point.price || 0),
+        changePct: Number(point.changePct || 0),
+        asOf: Number(point.asOf || 0),
+      };
+    } catch (err) {
+      if (errors.length < 12) {
+        errors.push(`${label}: ${String(err?.message || err || "").trim() || "fetch failed"}`);
+      }
+    }
+  })());
+  await Promise.all(jobs);
+  return {
+    ts: Date.now(),
+    metrics: out,
+    errorCount: errors.length,
+    sampleErrors: errors,
+  };
+}
+
+async function fetchWorldMonitorNativeCryptoSnapshot(timeoutMs) {
+  const ids = [
+    "bitcoin", "ethereum", "tether", "usd-coin", "binancecoin", "solana", "ripple", "cardano",
+  ];
+  const url = `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(ids.join(","))}&vs_currencies=usd&include_24hr_change=true`;
+  const data = await fetchJsonUrl(url, {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": REDDIT_USER_AGENT,
+    },
+    timeoutMs,
+  });
+  const map = {
+    bitcoin: "BTC",
+    ethereum: "ETH",
+    tether: "USDT",
+    "usd-coin": "USDC",
+    binancecoin: "BNB",
+    solana: "SOL",
+    ripple: "XRP",
+    cardano: "ADA",
+  };
+  const metrics = {};
+  for (const [id, label] of Object.entries(map)) {
+    const row = worldMonitorNonEmptyObject(data?.[id]);
+    const usd = Number(row.usd);
+    const ch24 = Number(row.usd_24h_change);
+    if (!Number.isFinite(usd)) continue;
+    metrics[label] = {
+      usd,
+      change24hPct: Number.isFinite(ch24) ? ch24 : 0,
+    };
+  }
+  return {
+    ts: Date.now(),
+    metrics,
+  };
+}
+
+async function fetchWorldMonitorNativeSeismicSnapshot(timeoutMs) {
+  const url = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson";
+  const data = await fetchJsonUrl(url, {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": REDDIT_USER_AGENT,
+    },
+    timeoutMs,
+  });
+  const features = Array.isArray(data?.features) ? data.features : [];
+  const events = features
+    .map((f) => ({
+      mag: Number(f?.properties?.mag || 0) || 0,
+      place: String(f?.properties?.place || "").trim(),
+      time: Number(f?.properties?.time || 0) || 0,
+      url: normalizeWorldMonitorLink(String(f?.properties?.url || "").trim()),
+    }))
+    .filter((x) => Number.isFinite(x.mag) && x.time > 0)
+    .sort((a, b) => Number(b.mag || 0) - Number(a.mag || 0));
+  const major = events.filter((x) => Number(x.mag || 0) >= 5).slice(0, 8);
+  return {
+    ts: Date.now(),
+    count24h: events.length,
+    majorCount24h: major.length,
+    maxMag24h: events.length > 0 ? Number(events[0].mag || 0) : 0,
+    majorEvents: major,
+  };
+}
+
+async function fetchWorldMonitorNativeAdsbSnapshot(timeoutMs) {
+  const bounds = WORLDMONITOR_NATIVE_ADSB_REGION;
+  const qs = new URLSearchParams({
+    lamin: String(bounds.lamin),
+    lamax: String(bounds.lamax),
+    lomin: String(bounds.lomin),
+    lomax: String(bounds.lomax),
+  });
+  const url = `https://opensky-network.org/api/states/all?${qs.toString()}`;
+  const data = await fetchJsonUrl(url, {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": REDDIT_USER_AGENT,
+    },
+    timeoutMs,
+  });
+  const rows = Array.isArray(data?.states) ? data.states : [];
+  const byId = new Map();
+  for (const row of rows) {
+    if (!Array.isArray(row)) continue;
+    const idRaw = String(row?.[0] || "").trim().toLowerCase();
+    const callsign = String(row?.[1] || "").trim().toUpperCase();
+    const lon = Number(row?.[5]);
+    const lat = Number(row?.[6]);
+    const onGround = row?.[8] === true;
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || onGround) continue;
+    const id = idRaw || `${callsign}|${Math.round(lat * 100)}|${Math.round(lon * 100)}`;
+    if (!id || byId.has(id)) continue;
+    const military = worldMonitorIsLikelyMilitaryCallsign(callsign);
+    byId.set(id, {
+      id,
+      callsign,
+      lat,
+      lon,
+      military,
+      type: military ? worldMonitorAdsbAircraftClass(callsign) : "unknown",
+    });
+  }
+  const flights = [...byId.values()];
+  const militaryFlights = flights.filter((x) => x.military);
+  const byType = {
+    tanker: 0,
+    awacs: 0,
+    transport: 0,
+    drone: 0,
+    bomber: 0,
+    unknown: 0,
+  };
+  for (const f of militaryFlights) {
+    const type = String(f?.type || "unknown").toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(byType, type)) byType[type] += 1;
+    else byType.unknown += 1;
+  }
+
+  const theaterCounts = WORLDMONITOR_NATIVE_ADSB_THEATERS.map((theater) => {
+    const inTheater = flights.filter((f) => worldMonitorAdsbInBounds(f.lat, f.lon, theater.bounds));
+    const militaryInTheater = inTheater.filter((f) => f.military);
+    const typeCounts = {
+      tanker: 0,
+      awacs: 0,
+      transport: 0,
+      drone: 0,
+      bomber: 0,
+      unknown: 0,
+    };
+    for (const f of militaryInTheater) {
+      const type = String(f?.type || "unknown").toLowerCase();
+      if (Object.prototype.hasOwnProperty.call(typeCounts, type)) typeCounts[type] += 1;
+      else typeCounts.unknown += 1;
+    }
+    return {
+      id: theater.id,
+      name: theater.name,
+      totalFlights: inTheater.length,
+      militaryFlights: militaryInTheater.length,
+      byType: typeCounts,
+    };
+  });
+
+  const taiwanTheater = theaterCounts.find((x) => x.id === "taiwan_strait");
+  const sampleCallsigns = militaryFlights
+    .map((x) => String(x?.callsign || "").trim())
+    .filter(Boolean)
+    .slice(0, 14);
+
+  return {
+    ts: Date.now(),
+    source: "opensky",
+    queryBounds: bounds,
+    totalFlights: flights.length,
+    militaryFlights: militaryFlights.length,
+    militaryRatioPct: flights.length > 0 ? (militaryFlights.length / flights.length) * 100 : 0,
+    taiwanTheaterFlights: Number(taiwanTheater?.totalFlights || 0) || 0,
+    taiwanMilitaryFlights: Number(taiwanTheater?.militaryFlights || 0) || 0,
+    byType,
+    theaterCounts,
+    sampleCallsigns,
+  };
+}
+
+async function fetchWorldMonitorNativeDisasterSnapshot(timeoutMs) {
+  const url = "https://www.gdacs.org/xml/rss.xml";
+  const controller = new AbortController();
+  const ms = Number(timeoutMs);
+  const useTimeout = Number.isFinite(ms) && ms > 0;
+  const timer = useTimeout ? setTimeout(() => controller.abort(), ms) : null;
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      headers: {
+        Accept: "application/rss+xml, application/xml, text/xml, */*",
+        "User-Agent": REDDIT_USER_AGENT,
+      },
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(`${res.status} ${String(res.statusText || "request failed").trim()}`.trim());
+    }
+    const blocks = [];
+    for (const m of String(text || "").matchAll(/<item\b[\s\S]*?<\/item>/gi)) {
+      blocks.push(m[0]);
+      if (blocks.length >= 260) break;
+    }
+
+    const now = Date.now();
+    const dayMs = 24 * 60 * 60 * 1000;
+    const events = [];
+    for (const block of blocks) {
+      const title = worldMonitorExtractFirstXmlTag(block, ["title"]);
+      if (!title) continue;
+      const link = worldMonitorExtractLinkFromItem(block);
+      const country = worldMonitorExtractFirstXmlTag(block, ["country", "gdacs:country"]);
+      const eventTypeRaw = worldMonitorExtractFirstXmlTag(block, ["eventtype", "gdacs:eventtype", "dc:subject"]);
+      const eventType = String(eventTypeRaw || "").toUpperCase().trim().slice(0, 12);
+      const pubRaw = worldMonitorExtractFirstXmlTag(block, ["pubDate", "dateadded", "gdacs:dateadded", "datemodified", "gdacs:datemodified"]);
+      const publishedAt = Number(Date.parse(pubRaw)) || 0;
+      const isCurrentRaw = worldMonitorExtractFirstXmlTag(block, ["iscurrent", "gdacs:iscurrent"]);
+      const isCurrent = isCurrentRaw
+        ? /^true$/i.test(String(isCurrentRaw).trim())
+        : (publishedAt > 0 ? (now - publishedAt) <= (14 * dayMs) : false);
+      const alertRaw = worldMonitorExtractFirstXmlTag(block, ["alertlevel", "gdacs:alertlevel", "episodealertlevel", "gdacs:episodealertlevel"]);
+      const fallbackMatch = String(title).match(/\b(Red|Orange|Green)\b/i);
+      const level = String(alertRaw || (fallbackMatch ? fallbackMatch[1] : "green")).toLowerCase().trim();
+      events.push({
+        title: String(title || "").trim(),
+        link,
+        country: String(country || "").trim(),
+        eventType,
+        level,
+        isCurrent,
+        publishedAt,
+      });
+    }
+
+    const recent72h = events.filter((x) => Number(x?.publishedAt || 0) >= (now - (72 * 60 * 60 * 1000)));
+    const current = events.filter((x) => x.isCurrent);
+    const currentRed = current.filter((x) => x.level === "red");
+    const currentOrange = current.filter((x) => x.level === "orange");
+    const taiwanRegionPattern = /(taiwan|china|japan|korea|philippines|south china sea|east china sea|pacific)/i;
+    const taiwanRegionCurrent = current.filter((x) => {
+      const hay = `${String(x.title || "")} ${String(x.country || "")}`.toLowerCase();
+      return taiwanRegionPattern.test(hay);
+    });
+    const taiwanRegionOrangeOrRed = taiwanRegionCurrent.filter((x) => x.level === "orange" || x.level === "red");
+
+    const byType = {};
+    for (const x of current) {
+      const key = String(x?.eventType || "OTHER").trim() || "OTHER";
+      byType[key] = Number(byType[key] || 0) + 1;
+    }
+
+    const topAlerts = current
+      .filter((x) => x.level === "red" || x.level === "orange")
+      .sort((a, b) => Number(b.publishedAt || 0) - Number(a.publishedAt || 0))
+      .slice(0, 10)
+      .map((x) => ({
+        title: x.title,
+        level: x.level,
+        eventType: x.eventType,
+        country: x.country,
+        publishedAt: Number(x.publishedAt || 0) || 0,
+        link: x.link,
+      }));
+
+    return {
+      ts: now,
+      source: "gdacs",
+      totalParsed: events.length,
+      recent72h: recent72h.length,
+      currentTotal: current.length,
+      currentRed: currentRed.length,
+      currentOrange: currentOrange.length,
+      currentGreen: current.filter((x) => x.level === "green").length,
+      taiwanRegionCurrent: taiwanRegionCurrent.length,
+      taiwanRegionOrangeOrRed: taiwanRegionOrangeOrRed.length,
+      byType,
+      topAlerts,
+    };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function fetchWorldMonitorNativeMaritimeSnapshot(timeoutMs) {
+  const url = "https://msi.nga.mil/api/publications/broadcast-warn?output=json&status=A";
+  const data = await fetchJsonUrl(url, {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": REDDIT_USER_AGENT,
+    },
+    timeoutMs,
+  });
+  const rows = Array.isArray(data?.["broadcast-warn"])
+    ? data["broadcast-warn"]
+    : Array.isArray(data?.broadcastWarn)
+      ? data.broadcastWarn
+      : [];
+  const regionCounts = {};
+  for (const r of WORLDMONITOR_NATIVE_MARITIME_REGION_PATTERNS) {
+    regionCounts[r.id] = 0;
+  }
+  const militaryKeywords = /(exercise|gunnery|firing|missile|rocket|naval|warship|submarine|military)/i;
+  const keyWarnings = [];
+  let militaryRelated = 0;
+  for (const row of rows.slice(0, 900)) {
+    const text = String(row?.text || row?.message || "").trim();
+    if (!text) continue;
+    const lower = text.toLowerCase();
+    let matchedAnyRegion = false;
+    for (const r of WORLDMONITOR_NATIVE_MARITIME_REGION_PATTERNS) {
+      if (r.regex.test(lower)) {
+        regionCounts[r.id] = Number(regionCounts[r.id] || 0) + 1;
+        matchedAnyRegion = true;
+      }
+    }
+    const military = militaryKeywords.test(lower);
+    if (military) militaryRelated += 1;
+    if ((matchedAnyRegion || military) && keyWarnings.length < 12) {
+      keyWarnings.push({
+        id: `${String(row?.msgYear || "").trim()}-${String(row?.msgNumber || "").trim()}`,
+        navArea: String(row?.navArea || "").trim(),
+        subregion: String(row?.subregion || "").trim(),
+        text: oneLine(text).slice(0, 260),
+        military,
+      });
+    }
+  }
+  const taiwanRegionWarnings = Number(regionCounts.taiwan_strait || 0)
+    + Number(regionCounts.south_china_sea || 0)
+    + Number(regionCounts.east_china_sea || 0);
+  return {
+    ts: Date.now(),
+    source: "nga_broadcast_warn",
+    totalWarnings: rows.length,
+    militaryRelated,
+    regionCounts,
+    taiwanRegionWarnings,
+    keyWarnings,
+  };
+}
+
+async function fetchWorldMonitorNativeServiceSnapshot(timeoutMs) {
+  const results = [];
+  const errors = [];
+  for (const source of WORLDMONITOR_NATIVE_SERVICE_SOURCES) {
+    try {
+      const data = await fetchJsonUrl(source.url, {
+        headers: {
+          Accept: "application/json",
+          "User-Agent": REDDIT_USER_AGENT,
+        },
+        timeoutMs,
+      });
+      const statusObj = worldMonitorNonEmptyObject(data?.status);
+      const rawIndicator = String(statusObj?.indicator || statusObj?.status || "").trim().toLowerCase();
+      const indicator = normalizeWorldMonitorServiceIndicator(rawIndicator);
+      results.push({
+        id: source.id,
+        name: source.name,
+        indicator,
+        description: oneLine(String(statusObj?.description || "")).slice(0, 140),
+      });
+    } catch (err) {
+      const message = String(err?.message || err || "").trim() || "fetch failed";
+      results.push({
+        id: source.id,
+        name: source.name,
+        indicator: "unknown",
+        description: "",
+      });
+      if (errors.length < 12) errors.push(`${source.name}: ${message}`);
+    }
+  }
+  const okCount = results.filter((x) => x.indicator === "ok").length;
+  const degradedCount = results.filter((x) => x.indicator === "degraded").length;
+  const outageCount = results.filter((x) => x.indicator === "outage").length;
+  return {
+    ts: Date.now(),
+    source: "public_status_pages",
+    totalServices: results.length,
+    okCount,
+    degradedCount,
+    outageCount,
+    services: results,
+    errorCount: errors.length,
+    sampleErrors: errors,
+  };
+}
+
+async function fetchWorldMonitorNativeMacroSnapshot(timeoutMs) {
+  const errors = [];
+  const seriesMap = {};
+  const symbolEntries = Object.entries(WORLDMONITOR_NATIVE_MACRO_SYMBOLS);
+  await Promise.all(symbolEntries.map(([symbol, label]) => (async () => {
+    try {
+      const series = await fetchYahooSeries(symbol, timeoutMs, { range: "1y", interval: "1d" });
+      seriesMap[label] = series;
+    } catch (err) {
+      if (errors.length < 12) {
+        errors.push(`${label}: ${String(err?.message || err || "fetch failed")}`);
+      }
+      seriesMap[label] = [];
+    }
+  })()));
+
+  const [fearGreedResult, mempoolResult] = await Promise.allSettled([
+    fetchJsonUrl("https://api.alternative.me/fng/?limit=30&format=json", {
+      headers: { Accept: "application/json", "User-Agent": REDDIT_USER_AGENT },
+      timeoutMs,
+    }),
+    fetchJsonUrl("https://mempool.space/api/v1/mining/hashrate/1m", {
+      headers: { Accept: "application/json", "User-Agent": REDDIT_USER_AGENT },
+      timeoutMs,
+    }),
+  ]);
+
+  let fearGreedValue = null;
+  let fearGreedLabel = "unknown";
+  let fearGreedHistory = [];
+  if (fearGreedResult.status === "fulfilled") {
+    const rows = Array.isArray(fearGreedResult.value?.data) ? fearGreedResult.value.data : [];
+    if (rows.length > 0) {
+      const v = Number.parseInt(String(rows[0]?.value || ""), 10);
+      fearGreedValue = Number.isFinite(v) ? v : null;
+      fearGreedLabel = String(rows[0]?.value_classification || "").trim().toLowerCase() || "unknown";
+      fearGreedHistory = rows
+        .slice(0, 30)
+        .map((x) => ({
+          value: Number.parseInt(String(x?.value || ""), 10),
+          timestamp: Number.parseInt(String(x?.timestamp || ""), 10) * 1000,
+        }))
+        .filter((x) => Number.isFinite(x.value) && Number.isFinite(x.timestamp) && x.timestamp > 0);
+    }
+  } else if (errors.length < 12) {
+    errors.push(`fear-greed: ${String(fearGreedResult.reason?.message || fearGreedResult.reason || "failed")}`);
+  }
+
+  let hashRateChange30dPct = null;
+  if (mempoolResult.status === "fulfilled") {
+    const rows = Array.isArray(mempoolResult.value) ? mempoolResult.value : Array.isArray(mempoolResult.value?.hashrates) ? mempoolResult.value.hashrates : [];
+    const normalized = rows
+      .map((x) => Number(x?.avgHashrate ?? x))
+      .filter((x) => Number.isFinite(x) && x > 0);
+    if (normalized.length >= 2) {
+      const first = normalized[0];
+      const last = normalized[normalized.length - 1];
+      hashRateChange30dPct = ((last - first) / first) * 100;
+    }
+  } else if (errors.length < 12) {
+    errors.push(`hashrate: ${String(mempoolResult.reason?.message || mempoolResult.reason || "failed")}`);
+  }
+
+  const btcSeries = Array.isArray(seriesMap.BTC) ? seriesMap.BTC : [];
+  const qqqSeries = Array.isArray(seriesMap.QQQ) ? seriesMap.QQQ : [];
+  const xlpSeries = Array.isArray(seriesMap.XLP) ? seriesMap.XLP : [];
+  const jpySeries = Array.isArray(seriesMap.USD_JPY) ? seriesMap.USD_JPY : [];
+
+  const metrics = {
+    btcRoc5Pct: rateOfChangeFromSeries(btcSeries, 5),
+    qqqRoc5Pct: rateOfChangeFromSeries(qqqSeries, 5),
+    qqqRoc20Pct: rateOfChangeFromSeries(qqqSeries, 20),
+    xlpRoc20Pct: rateOfChangeFromSeries(xlpSeries, 20),
+    jpyRoc30Pct: rateOfChangeFromSeries(jpySeries, 30),
+    fearGreedValue,
+    fearGreedLabel,
+    hashRateChange30dPct,
+  };
+
+  let riskOnSignals = 0;
+  let knownSignals = 0;
+  if (Number.isFinite(metrics.jpyRoc30Pct)) {
+    knownSignals += 1;
+    if (Number(metrics.jpyRoc30Pct) > -2) riskOnSignals += 1;
+  }
+  if (Number.isFinite(metrics.btcRoc5Pct) && Number.isFinite(metrics.qqqRoc5Pct)) {
+    knownSignals += 1;
+    if (Math.abs(Number(metrics.btcRoc5Pct) - Number(metrics.qqqRoc5Pct)) <= 5) riskOnSignals += 1;
+  }
+  if (Number.isFinite(metrics.qqqRoc20Pct) && Number.isFinite(metrics.xlpRoc20Pct)) {
+    knownSignals += 1;
+    if (Number(metrics.qqqRoc20Pct) > Number(metrics.xlpRoc20Pct)) riskOnSignals += 1;
+  }
+  if (Number.isFinite(metrics.fearGreedValue)) {
+    knownSignals += 1;
+    if (Number(metrics.fearGreedValue) > 50) riskOnSignals += 1;
+  }
+  if (Number.isFinite(metrics.hashRateChange30dPct)) {
+    knownSignals += 1;
+    if (Number(metrics.hashRateChange30dPct) > 0) riskOnSignals += 1;
+  }
+
+  const riskRegime = knownSignals <= 0
+    ? "unknown"
+    : (riskOnSignals / knownSignals >= 0.57 ? "risk_on" : "risk_off");
+
+  return {
+    ts: Date.now(),
+    source: "macro_public_feeds",
+    metrics,
+    riskRegime,
+    riskOnSignals,
+    knownSignals,
+    fearGreedHistory: fearGreedHistory.slice(0, 30),
+    seriesCoverage: {
+      btc: btcSeries.length,
+      qqq: qqqSeries.length,
+      xlp: xlpSeries.length,
+      usd_jpy: jpySeries.length,
+    },
+    errorCount: errors.length,
+    sampleErrors: errors,
+  };
+}
+
+function parsePolymarketYesPrice(market) {
+  try {
+    const raw = market?.outcomePrices;
+    if (!raw) return null;
+    const arr = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (!Array.isArray(arr) || arr.length <= 0) return null;
+    const value = Number(arr[0]);
+    if (!Number.isFinite(value)) return null;
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchWorldMonitorNativePredictionSnapshot(timeoutMs) {
+  const url = `https://gamma-api.polymarket.com/events?${new URLSearchParams({
+    closed: "false",
+    active: "true",
+    archived: "false",
+    end_date_min: new Date().toISOString(),
+    order: "volume",
+    ascending: "false",
+    limit: "80",
+  }).toString()}`;
+  const data = await fetchJsonUrl(url, {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": REDDIT_USER_AGENT,
+    },
+    timeoutMs,
+  });
+  const events = Array.isArray(data) ? data : [];
+  const normalized = events.map((event) => {
+    const markets = Array.isArray(event?.markets) ? event.markets : [];
+    const topMarket = markets[0] || null;
+    const title = String(topMarket?.question || event?.title || "").trim();
+    const volume = Number(event?.volume ?? topMarket?.volumeNum ?? topMarket?.volume ?? 0) || 0;
+    const yesPrice = parsePolymarketYesPrice(topMarket);
+    const closesAt = Number(Date.parse(String(topMarket?.endDate || event?.endDate || ""))) || 0;
+    const slug = String(event?.slug || topMarket?.slug || "").trim();
+    const link = slug ? `https://polymarket.com/event/${slug}` : "";
+    const taiwanRelated = WORLDMONITOR_NATIVE_PREDICTION_TAIWAN_PATTERN.test(title);
+    return {
+      id: String(event?.id || slug || title).trim(),
+      title,
+      volume,
+      yesPrice,
+      closesAt,
+      link,
+      taiwanRelated,
+    };
+  }).filter((x) => x.id && x.title);
+
+  const topByVolume = [...normalized]
+    .sort((a, b) => Number(b.volume || 0) - Number(a.volume || 0))
+    .slice(0, 16);
+  const highVolumeUncertain = normalized.filter((x) => {
+    const yp = Number(x?.yesPrice);
+    return Number(x?.volume || 0) >= 100_000
+      && Number.isFinite(yp)
+      && yp >= 0.35
+      && yp <= 0.65;
+  });
+  const taiwanRelated = normalized.filter((x) => x.taiwanRelated);
+  return {
+    ts: Date.now(),
+    source: "polymarket_gamma",
+    totalActiveEvents: normalized.length,
+    taiwanRelatedCount: taiwanRelated.length,
+    highVolumeUncertainCount: highVolumeUncertain.length,
+    topByVolume: topByVolume.map((x) => ({
+      title: x.title,
+      volume: Number(x.volume || 0) || 0,
+      yesPrice: Number.isFinite(Number(x.yesPrice)) ? Number(x.yesPrice) : null,
+      closesAt: Number(x.closesAt || 0) || 0,
+      link: x.link,
+      taiwanRelated: x.taiwanRelated,
+    })),
+    taiwanRelatedTop: taiwanRelated
+      .sort((a, b) => Number(b.volume || 0) - Number(a.volume || 0))
+      .slice(0, 10)
+      .map((x) => ({
+        title: x.title,
+        volume: Number(x.volume || 0) || 0,
+        yesPrice: Number.isFinite(Number(x.yesPrice)) ? Number(x.yesPrice) : null,
+        closesAt: Number(x.closesAt || 0) || 0,
+        link: x.link,
+      })),
+  };
+}
+
+function buildWorldMonitorInfrastructureSnapshot(nowMs = Date.now()) {
+  const now = Number(nowMs || Date.now()) || Date.now();
+  const dayMs = 24 * 60 * 60 * 1000;
+  const items24 = worldMonitorNativeNewsItems.filter((x) => Number(x?.publishedAt || x?.firstSeenAt || 0) >= (now - dayMs));
+  const itemsPrev24 = worldMonitorNativeNewsItems.filter((x) => {
+    const ts = Number(x?.publishedAt || x?.firstSeenAt || 0);
+    return ts >= (now - (2 * dayMs)) && ts < (now - dayMs);
+  });
+  function countKeywords(items, pattern) {
+    const seen = new Set();
+    let count = 0;
+    for (const item of items) {
+      const title = String(item?.title || "").toLowerCase();
+      if (!title || !pattern.test(title)) continue;
+      const key = normalizeWorldMonitorTitleForKey(title);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      count += 1;
+    }
+    return count;
+  }
+  const cables24 = countKeywords(items24, /(subsea|undersea|sea cable|internet cable|cable cut|cable damage)/i);
+  const ports24 = countKeywords(items24, /(port|harbor|harbour|terminal|container ship|shipping lane|chokepoint|suez|panama canal)/i);
+  const pipelines24 = countKeywords(items24, /(pipeline|lng terminal|gas pipeline|oil pipeline|refinery)/i);
+  const cablesPrev = countKeywords(itemsPrev24, /(subsea|undersea|sea cable|internet cable|cable cut|cable damage)/i);
+  const portsPrev = countKeywords(itemsPrev24, /(port|harbor|harbour|terminal|container ship|shipping lane|chokepoint|suez|panama canal)/i);
+  const pipelinesPrev = countKeywords(itemsPrev24, /(pipeline|lng terminal|gas pipeline|oil pipeline|refinery)/i);
+  const total24 = cables24 + ports24 + pipelines24;
+  const totalPrev24 = cablesPrev + portsPrev + pipelinesPrev;
+  const deltaPct = totalPrev24 > 0 ? ((total24 - totalPrev24) / totalPrev24) * 100 : (total24 > 0 ? 100 : 0);
+  return {
+    ts: now,
+    cables24h: cables24,
+    ports24h: ports24,
+    pipelines24h: pipelines24,
+    total24h: total24,
+    totalPrev24h: totalPrev24,
+    deltaPct,
+  };
+}
+
+function worldMonitorAddSignalsPenalty() {
+  const market = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.marketSeries);
+  const crypto = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.cryptoSeries);
+  const seismic = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.seismicSeries);
+  const infra = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.infrastructureSeries);
+  const adsb = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.adsbSeries);
+  const disaster = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.disasterSeries);
+  const maritime = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.maritimeSeries);
+  const service = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.serviceSeries);
+  const macro = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.macroSeries);
+  const prediction = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.predictionSeries);
+  let penalty = 0;
+  if (market?.metrics && typeof market.metrics === "object") {
+    const tw = Number(market.metrics?.TWSE?.changePct || 0);
+    const hsi = Number(market.metrics?.HANG_SENG?.changePct || 0);
+    const spx = Number(market.metrics?.SP500?.changePct || 0);
+    const oil = Number(market.metrics?.WTI_OIL?.changePct || 0);
+    const gold = Number(market.metrics?.GOLD?.changePct || 0);
+    if (tw <= -2.2) penalty += 3;
+    if (hsi <= -2.2) penalty += 3;
+    if (spx <= -2.8) penalty += 2;
+    if (oil >= 4.5) penalty += 2;
+    if (gold >= 2.5) penalty += 1;
+  }
+  if (crypto?.metrics && typeof crypto.metrics === "object") {
+    const btc = Number(crypto.metrics?.BTC?.change24hPct || 0);
+    const eth = Number(crypto.metrics?.ETH?.change24hPct || 0);
+    const usdt = Number(crypto.metrics?.USDT?.usd || 1);
+    const usdc = Number(crypto.metrics?.USDC?.usd || 1);
+    if (btc <= -5 || eth <= -7) penalty += 2;
+    if (Math.abs(usdt - 1) >= 0.01 || Math.abs(usdc - 1) >= 0.01) penalty += 2;
+  }
+  if (seismic && Number(seismic.maxMag24h || 0) >= 6.8) penalty += 2;
+  if (infra && Number(infra.total24h || 0) >= 8 && Number(infra.deltaPct || 0) >= 50) penalty += 2;
+  if (adsb) {
+    const twMilitary = Number(adsb.taiwanMilitaryFlights || 0);
+    const totalMilitary = Number(adsb.militaryFlights || 0);
+    const tankers = Number(adsb?.byType?.tanker || 0);
+    const awacs = Number(adsb?.byType?.awacs || 0);
+    if (twMilitary >= 10) penalty += 3;
+    else if (twMilitary >= 6) penalty += 2;
+    if (totalMilitary >= 24) penalty += 2;
+    if ((tankers + awacs) >= 4) penalty += 2;
+  }
+  if (disaster) {
+    const currentRed = Number(disaster.currentRed || 0);
+    const currentOrange = Number(disaster.currentOrange || 0);
+    const twRegional = Number(disaster.taiwanRegionOrangeOrRed || 0);
+    if (currentRed >= 2) penalty += 2;
+    if ((currentRed + currentOrange) >= 10) penalty += 1;
+    if (twRegional >= 1) penalty += 1;
+  }
+  if (maritime) {
+    const tw = Number(maritime.taiwanRegionWarnings || 0);
+    const military = Number(maritime.militaryRelated || 0);
+    if (tw >= 8) penalty += 2;
+    else if (tw >= 4) penalty += 1;
+    if (military >= 30) penalty += 1;
+  }
+  if (service) {
+    const degraded = Number(service.degradedCount || 0);
+    const outage = Number(service.outageCount || 0);
+    if (outage >= 2) penalty += 1;
+    if ((degraded + outage) >= 4) penalty += 1;
+  }
+  if (macro) {
+    const regime = String(macro.riskRegime || "").toLowerCase();
+    const fearGreed = Number(macro?.metrics?.fearGreedValue);
+    if (regime === "risk_off") penalty += 2;
+    if (Number.isFinite(fearGreed) && fearGreed <= 15) penalty += 1;
+  }
+  if (prediction) {
+    const tw = Number(prediction.taiwanRelatedCount || 0);
+    const uncertain = Number(prediction.highVolumeUncertainCount || 0);
+    if (tw >= 3) penalty += 1;
+    if (uncertain >= 6) penalty += 1;
+  }
+  if (WORLDMONITOR_DEEP_INGEST_ENABLED) {
+    const sinceMs = Date.now() - (24 * 60 * 60 * 1000);
+    const themeSnap = buildWorldMonitorArticleThemeSnapshot(sinceMs);
+    const scores = new Map(
+      (Array.isArray(themeSnap?.top_themes) ? themeSnap.top_themes : [])
+        .map((x) => [String(x?.theme || ""), Number(x?.score || 0) || 0]),
+    );
+    if (Number(scores.get("military") || 0) >= 12) penalty += 1;
+    if (Number(scores.get("taiwan_china") || 0) >= 10) penalty += 1;
+    if (Number(scores.get("infrastructure") || 0) >= 10) penalty += 1;
+  }
+  return Math.max(0, Math.min(20, penalty));
+}
+
+async function runWorldMonitorNativeSignalsRefresh(options = {}) {
+  const force = options?.force === true;
+  const now = Date.now();
+  const minIntervalMs = Math.max(0, Number(WORLDMONITOR_NATIVE_SIGNALS_REFRESH_MIN_INTERVAL_SEC || 0) * 1000);
+  const seismicMinIntervalMs = Math.max(0, Number(WORLDMONITOR_NATIVE_SEISMIC_REFRESH_MIN_INTERVAL_SEC || 0) * 1000);
+  const adsbMinIntervalMs = Math.max(0, Number(WORLDMONITOR_NATIVE_ADSB_REFRESH_MIN_INTERVAL_SEC || 0) * 1000);
+  const disasterMinIntervalMs = Math.max(0, Number(WORLDMONITOR_NATIVE_DISASTER_REFRESH_MIN_INTERVAL_SEC || 0) * 1000);
+  const maritimeMinIntervalMs = Math.max(0, Number(WORLDMONITOR_NATIVE_MARITIME_REFRESH_MIN_INTERVAL_SEC || 0) * 1000);
+  const serviceMinIntervalMs = Math.max(0, Number(WORLDMONITOR_NATIVE_SERVICE_REFRESH_MIN_INTERVAL_SEC || 0) * 1000);
+  const macroMinIntervalMs = Math.max(0, Number(WORLDMONITOR_NATIVE_MACRO_REFRESH_MIN_INTERVAL_SEC || 0) * 1000);
+  const predictionMinIntervalMs = Math.max(0, Number(WORLDMONITOR_NATIVE_PREDICTION_REFRESH_MIN_INTERVAL_SEC || 0) * 1000);
+  const lastAt = Number(worldMonitorMonitor.nativeSignalsLastRefreshAt || 0) || 0;
+  const shouldSkip = !force && lastAt > 0 && (now - lastAt) < minIntervalMs;
+  if (shouldSkip) {
+    return {
+      ok: true,
+      skipped: "fresh",
+      refreshedAt: lastAt,
+      stats: worldMonitorMonitor.nativeSignalsLastRefreshStats || {},
+    };
+  }
+
+  if (worldMonitorNativeRuntime.signalsPromise) {
+    return worldMonitorNativeRuntime.signalsPromise;
+  }
+
+  const promise = (async () => {
+    const startedAt = Date.now();
+    const timeoutMs = Number(WORLDMONITOR_NATIVE_SIGNAL_TIMEOUT_MS || 0);
+    const stats = {
+      market: "skipped",
+      crypto: "skipped",
+      seismic: "skipped",
+      adsb: "skipped",
+      disaster: "skipped",
+      maritime: "skipped",
+      services: "skipped",
+      macro: "skipped",
+      prediction: "skipped",
+      infrastructure: "ok",
+      errors: [],
+    };
+
+    try {
+      const [marketResult, cryptoResult] = await Promise.allSettled([
+        fetchWorldMonitorNativeMarketSnapshot(timeoutMs),
+        fetchWorldMonitorNativeCryptoSnapshot(timeoutMs),
+      ]);
+
+      if (marketResult.status === "fulfilled") {
+        pushWorldMonitorSignalSample("marketSeries", marketResult.value);
+        stats.market = "ok";
+      } else {
+        stats.market = "error";
+        if (stats.errors.length < 8) {
+          stats.errors.push(`market: ${String(marketResult.reason?.message || marketResult.reason || "failed")}`);
+        }
+      }
+
+      if (cryptoResult.status === "fulfilled") {
+        pushWorldMonitorSignalSample("cryptoSeries", cryptoResult.value);
+        stats.crypto = "ok";
+      } else {
+        stats.crypto = "error";
+        if (stats.errors.length < 8) {
+          stats.errors.push(`crypto: ${String(cryptoResult.reason?.message || cryptoResult.reason || "failed")}`);
+        }
+      }
+
+      const lastSeismic = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.seismicSeries);
+      const shouldRefreshSeismic = force
+        || !lastSeismic
+        || (now - Number(lastSeismic.ts || 0) >= seismicMinIntervalMs);
+      if (shouldRefreshSeismic) {
+        try {
+          const seismic = await fetchWorldMonitorNativeSeismicSnapshot(timeoutMs);
+          pushWorldMonitorSignalSample("seismicSeries", seismic);
+          stats.seismic = "ok";
+        } catch (err) {
+          stats.seismic = "error";
+          if (stats.errors.length < 8) {
+            stats.errors.push(`seismic: ${String(err?.message || err || "failed")}`);
+          }
+        }
+      } else {
+        stats.seismic = "stale-ok";
+      }
+
+      const lastAdsb = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.adsbSeries);
+      const shouldRefreshAdsb = force
+        || !lastAdsb
+        || (now - Number(lastAdsb.ts || 0) >= adsbMinIntervalMs);
+      if (shouldRefreshAdsb) {
+        try {
+          const adsb = await fetchWorldMonitorNativeAdsbSnapshot(timeoutMs);
+          pushWorldMonitorSignalSample("adsbSeries", adsb);
+          stats.adsb = "ok";
+        } catch (err) {
+          stats.adsb = "error";
+          if (stats.errors.length < 8) {
+            stats.errors.push(`adsb: ${String(err?.message || err || "failed")}`);
+          }
+        }
+      } else {
+        stats.adsb = "stale-ok";
+      }
+
+      const lastDisaster = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.disasterSeries);
+      const shouldRefreshDisaster = force
+        || !lastDisaster
+        || (now - Number(lastDisaster.ts || 0) >= disasterMinIntervalMs);
+      if (shouldRefreshDisaster) {
+        try {
+          const disaster = await fetchWorldMonitorNativeDisasterSnapshot(timeoutMs);
+          pushWorldMonitorSignalSample("disasterSeries", disaster);
+          stats.disaster = "ok";
+        } catch (err) {
+          stats.disaster = "error";
+          if (stats.errors.length < 8) {
+            stats.errors.push(`disaster: ${String(err?.message || err || "failed")}`);
+          }
+        }
+      } else {
+        stats.disaster = "stale-ok";
+      }
+
+      const lastMaritime = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.maritimeSeries);
+      const shouldRefreshMaritime = force
+        || !lastMaritime
+        || (now - Number(lastMaritime.ts || 0) >= maritimeMinIntervalMs);
+      if (shouldRefreshMaritime) {
+        try {
+          const maritime = await fetchWorldMonitorNativeMaritimeSnapshot(timeoutMs);
+          pushWorldMonitorSignalSample("maritimeSeries", maritime);
+          stats.maritime = "ok";
+        } catch (err) {
+          stats.maritime = "error";
+          if (stats.errors.length < 8) {
+            stats.errors.push(`maritime: ${String(err?.message || err || "failed")}`);
+          }
+        }
+      } else {
+        stats.maritime = "stale-ok";
+      }
+
+      const lastService = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.serviceSeries);
+      const shouldRefreshService = force
+        || !lastService
+        || (now - Number(lastService.ts || 0) >= serviceMinIntervalMs);
+      if (shouldRefreshService) {
+        try {
+          const service = await fetchWorldMonitorNativeServiceSnapshot(timeoutMs);
+          pushWorldMonitorSignalSample("serviceSeries", service);
+          stats.services = "ok";
+        } catch (err) {
+          stats.services = "error";
+          if (stats.errors.length < 8) {
+            stats.errors.push(`services: ${String(err?.message || err || "failed")}`);
+          }
+        }
+      } else {
+        stats.services = "stale-ok";
+      }
+
+      const lastMacro = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.macroSeries);
+      const shouldRefreshMacro = force
+        || !lastMacro
+        || (now - Number(lastMacro.ts || 0) >= macroMinIntervalMs);
+      if (shouldRefreshMacro) {
+        try {
+          const macro = await fetchWorldMonitorNativeMacroSnapshot(timeoutMs);
+          pushWorldMonitorSignalSample("macroSeries", macro);
+          stats.macro = "ok";
+        } catch (err) {
+          stats.macro = "error";
+          if (stats.errors.length < 8) {
+            stats.errors.push(`macro: ${String(err?.message || err || "failed")}`);
+          }
+        }
+      } else {
+        stats.macro = "stale-ok";
+      }
+
+      const lastPrediction = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.predictionSeries);
+      const shouldRefreshPrediction = force
+        || !lastPrediction
+        || (now - Number(lastPrediction.ts || 0) >= predictionMinIntervalMs);
+      if (shouldRefreshPrediction) {
+        try {
+          const prediction = await fetchWorldMonitorNativePredictionSnapshot(timeoutMs);
+          pushWorldMonitorSignalSample("predictionSeries", prediction);
+          stats.prediction = "ok";
+        } catch (err) {
+          stats.prediction = "error";
+          if (stats.errors.length < 8) {
+            stats.errors.push(`prediction: ${String(err?.message || err || "failed")}`);
+          }
+        }
+      } else {
+        stats.prediction = "stale-ok";
+      }
+
+      try {
+        const infra = buildWorldMonitorInfrastructureSnapshot(now);
+        pushWorldMonitorSignalSample("infrastructureSeries", infra);
+        stats.infrastructure = "ok";
+      } catch (err) {
+        stats.infrastructure = "error";
+        if (stats.errors.length < 8) {
+          stats.errors.push(`infrastructure: ${String(err?.message || err || "failed")}`);
+        }
+      }
+
+      pruneWorldMonitorNativeSignals(now);
+      persistWorldMonitorNativeSignalsStore();
+
+      worldMonitorMonitor.nativeSignalsLastRefreshAt = Date.now();
+      worldMonitorMonitor.nativeSignalsLastRefreshDurationMs = Date.now() - startedAt;
+      worldMonitorMonitor.nativeSignalsLastRefreshErrorAt = 0;
+      worldMonitorMonitor.nativeSignalsLastRefreshError = "";
+      worldMonitorMonitor.nativeSignalsLastRefreshStats = {
+        ...stats,
+        market_points: Array.isArray(worldMonitorNativeSignals.marketSeries) ? worldMonitorNativeSignals.marketSeries.length : 0,
+        crypto_points: Array.isArray(worldMonitorNativeSignals.cryptoSeries) ? worldMonitorNativeSignals.cryptoSeries.length : 0,
+        seismic_points: Array.isArray(worldMonitorNativeSignals.seismicSeries) ? worldMonitorNativeSignals.seismicSeries.length : 0,
+        infrastructure_points: Array.isArray(worldMonitorNativeSignals.infrastructureSeries) ? worldMonitorNativeSignals.infrastructureSeries.length : 0,
+        adsb_points: Array.isArray(worldMonitorNativeSignals.adsbSeries) ? worldMonitorNativeSignals.adsbSeries.length : 0,
+        disaster_points: Array.isArray(worldMonitorNativeSignals.disasterSeries) ? worldMonitorNativeSignals.disasterSeries.length : 0,
+        maritime_points: Array.isArray(worldMonitorNativeSignals.maritimeSeries) ? worldMonitorNativeSignals.maritimeSeries.length : 0,
+        service_points: Array.isArray(worldMonitorNativeSignals.serviceSeries) ? worldMonitorNativeSignals.serviceSeries.length : 0,
+        macro_points: Array.isArray(worldMonitorNativeSignals.macroSeries) ? worldMonitorNativeSignals.macroSeries.length : 0,
+        prediction_points: Array.isArray(worldMonitorNativeSignals.predictionSeries) ? worldMonitorNativeSignals.predictionSeries.length : 0,
+      };
+      persistState();
+      return {
+        ok: true,
+        refreshedAt: Number(worldMonitorMonitor.nativeSignalsLastRefreshAt || Date.now()) || Date.now(),
+        durationMs: Number(worldMonitorMonitor.nativeSignalsLastRefreshDurationMs || 0) || 0,
+        stats: worldMonitorMonitor.nativeSignalsLastRefreshStats,
+      };
+    } catch (err) {
+      const message = String(err?.message || err || "").trim() || "signals refresh failed";
+      worldMonitorMonitor.nativeSignalsLastRefreshErrorAt = Date.now();
+      worldMonitorMonitor.nativeSignalsLastRefreshError = message;
+      persistState();
+      return { ok: false, error: message, refreshedAt: Date.now(), stats };
+    } finally {
+      worldMonitorNativeRuntime.signalsPromise = null;
+    }
+  })();
+
+  worldMonitorNativeRuntime.signalsPromise = promise;
+  return promise;
+}
+
+async function runWorldMonitorNativeFeedRefresh(options = {}) {
+  const minIntervalMs = Math.max(0, Number(WORLDMONITOR_NATIVE_REFRESH_MIN_INTERVAL_SEC || 0) * 1000);
+  const force = options?.force === true;
+  const startedAt = Date.now();
+  if (
+    !force
+    && Number(worldMonitorMonitor.nativeLastRefreshAt || 0) > 0
+    && (startedAt - Number(worldMonitorMonitor.nativeLastRefreshAt || 0)) < minIntervalMs
+  ) {
+    return {
+      ok: true,
+      skipped: "fresh",
+      stats: worldMonitorMonitor.nativeLastRefreshStats || {},
+      refreshedAt: Number(worldMonitorMonitor.nativeLastRefreshAt || 0) || startedAt,
+    };
+  }
+
+  if (worldMonitorNativeRuntime.refreshPromise) {
+    return worldMonitorNativeRuntime.refreshPromise;
+  }
+
+  const refreshPromise = (async () => {
+    const feeds = loadWorldMonitorNativeFeedManifest();
+    if (!Array.isArray(feeds) || feeds.length === 0) {
+      throw new Error(`No native feed manifest entries loaded from ${WORLDMONITOR_NATIVE_FEEDS_PATH}`);
+    }
+
+    const timeoutMs = Number(WORLDMONITOR_NATIVE_FEED_TIMEOUT_MS || 0);
+    const concurrency = Math.max(1, Number(WORLDMONITOR_NATIVE_FEED_FETCH_CONCURRENCY || 1));
+    const fetchedAt = Date.now();
+    const existingByKey = new Map();
+    for (const item of worldMonitorNativeNewsItems) {
+      const key = String(item?.articleKey || "").trim();
+      if (!key) continue;
+      existingByKey.set(key, item);
+    }
+
+    let cursor = 0;
+    let feedsOk = 0;
+    let feedsFail = 0;
+    let newItems = 0;
+    const newItemKeys = [];
+    const errors = [];
+
+    async function workerLoop() {
+      for (;;) {
+        const idx = cursor;
+        cursor += 1;
+        if (idx >= feeds.length) break;
+        const feed = feeds[idx];
+        try {
+          const controller = new AbortController();
+          const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
+          let text = "";
+          try {
+            const resp = await fetch(String(feed.url), {
+              method: "GET",
+              headers: {
+                "User-Agent": REDDIT_USER_AGENT,
+                Accept: "application/rss+xml, application/xml, text/xml, application/atom+xml, */*",
+                "Cache-Control": "no-cache",
+              },
+              signal: controller.signal,
+            });
+            if (!resp.ok) {
+              throw new Error(`HTTP ${resp.status}`);
+            }
+            text = await resp.text();
+          } finally {
+            if (timer) clearTimeout(timer);
+          }
+          const parsed = parseWorldMonitorFeedXml(text, feed, fetchedAt);
+          for (const next of parsed) {
+            const key = String(next.articleKey || "").trim();
+            if (!key) continue;
+            const prev = existingByKey.get(key);
+            if (prev && typeof prev === "object") {
+              prev.lastSeenAt = fetchedAt;
+              if (!prev.publishedAt || Number(next.publishedAt || 0) > Number(prev.publishedAt || 0)) {
+                prev.publishedAt = Number(next.publishedAt || prev.publishedAt || fetchedAt) || fetchedAt;
+              }
+              if (!prev.threatLevel || worldMonitorFeedAlertLevelRank(next.threatLevel) > worldMonitorFeedAlertLevelRank(prev.threatLevel)) {
+                prev.threatLevel = next.threatLevel;
+              }
+              if (Number(next.taiwanScore || 0) > Number(prev.taiwanScore || 0)) prev.taiwanScore = Number(next.taiwanScore || 0);
+              if ((!Array.isArray(prev.countries) || prev.countries.length === 0) && Array.isArray(next.countries)) {
+                prev.countries = next.countries.slice(0, 6);
+              }
+              continue;
+            }
+            existingByKey.set(key, next);
+            worldMonitorNativeNewsItems.push(next);
+            newItemKeys.push(key);
+            newItems += 1;
+          }
+          feedsOk += 1;
+        } catch (err) {
+          feedsFail += 1;
+          if (errors.length < 12) {
+            errors.push(`${feed.name}: ${String(err?.message || err || "").trim() || "fetch failed"}`);
+          }
+        }
+      }
+    }
+
+    const workers = [];
+    for (let i = 0; i < concurrency; i += 1) {
+      workers.push(workerLoop());
+    }
+    await Promise.all(workers);
+
+    pruneWorldMonitorNativeStore(fetchedAt);
+    const deepIngestResult = await runWorldMonitorNativeDeepIngest({ force, seedKeys: newItemKeys });
+    persistWorldMonitorNativeStore();
+    const signalsResult = await runWorldMonitorNativeSignalsRefresh({ force });
+
+    const durationMs = Date.now() - startedAt;
+    const stats = {
+      feeds_total: feeds.length,
+      feeds_ok: feedsOk,
+      feeds_failed: feedsFail,
+      new_items: newItems,
+      stored_items: worldMonitorNativeNewsItems.length,
+      deep_ingest_ok: Boolean(deepIngestResult?.ok),
+      deep_ingest_run_at: Number(deepIngestResult?.refreshedAt || 0) || 0,
+      deep_ingest: deepIngestResult?.stats && typeof deepIngestResult.stats === "object"
+        ? deepIngestResult.stats
+        : {},
+      signals_ok: Boolean(signalsResult?.ok),
+      signals_refresh_at: Number(signalsResult?.refreshedAt || 0) || 0,
+      signals: signalsResult?.stats && typeof signalsResult.stats === "object" ? signalsResult.stats : {},
+      sample_errors: errors,
+    };
+    worldMonitorMonitor.nativeLastRefreshAt = Date.now();
+    worldMonitorMonitor.nativeLastRefreshDurationMs = durationMs;
+    worldMonitorMonitor.nativeLastRefreshErrorAt = 0;
+    worldMonitorMonitor.nativeLastRefreshError = "";
+    worldMonitorMonitor.nativeLastRefreshStats = stats;
+    persistState();
+    return {
+      ok: true,
+      refreshedAt: Number(worldMonitorMonitor.nativeLastRefreshAt || Date.now()) || Date.now(),
+      durationMs,
+      stats,
+    };
+  })().catch((err) => {
+    const message = String(err?.message || err || "").trim() || "native feed refresh failed";
+    worldMonitorMonitor.nativeLastRefreshErrorAt = Date.now();
+    worldMonitorMonitor.nativeLastRefreshError = message;
+    persistState();
+    return { ok: false, error: message, refreshedAt: Date.now(), stats: {} };
+  }).finally(() => {
+    worldMonitorNativeRuntime.refreshPromise = null;
+  });
+
+  worldMonitorNativeRuntime.refreshPromise = refreshPromise;
+  return refreshPromise;
+}
+
+function getWorldMonitorNativeRecentItems(options = {}) {
+  const lookbackHours = Math.max(1, Number(options?.lookbackHours || WORLDMONITOR_CHECK_LOOKBACK_HOURS || 48));
+  const minTs = Date.now() - (lookbackHours * 60 * 60 * 1000);
+  return worldMonitorNativeNewsItems
+    .filter((x) => Number(x?.publishedAt || x?.firstSeenAt || 0) >= minTs)
+    .sort((a, b) => Number(b.publishedAt || b.firstSeenAt || 0) - Number(a.publishedAt || a.firstSeenAt || 0));
+}
+
+function getWorldMonitorNativeFactors(items) {
+  const buckets = {
+    military: 0,
+    diplomacy: 0,
+    economy: 0,
+    cyber: 0,
+    humanitarian: 0,
+    unrest: 0,
+  };
+  for (const item of items) {
+    const title = String(item?.title || "").toLowerCase();
+    const w = worldMonitorFeedAlertLevelRank(item?.threatLevel || "low");
+    if (/(war|military|missile|airstrike|naval|troop|drone|exercise|invasion)/i.test(title)) buckets.military += w;
+    if (/(ceasefire|summit|talks|diplomacy|sanctions|embassy|treaty)/i.test(title)) buckets.diplomacy += w;
+    if (/(inflation|rate|economy|oil|gas|market|tariff|trade|supply)/i.test(title)) buckets.economy += w;
+    if (/(cyber|ransomware|breach|malware|hack)/i.test(title)) buckets.cyber += w;
+    if (/(humanitarian|refugee|displacement|aid|famine|earthquake|wildfire)/i.test(title)) buckets.humanitarian += w;
+    if (/(protest|riot|unrest|coup|martial law)/i.test(title)) buckets.unrest += w;
+  }
+  return Object.entries(buckets)
+    .filter(([, score]) => Number(score || 0) > 0)
+    .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))
+    .slice(0, 6)
+    .map(([k]) => k.toUpperCase());
+}
+
+function buildWorldMonitorNativeRiskSnapshot() {
+  const items = getWorldMonitorNativeRecentItems({ lookbackHours: WORLDMONITOR_CHECK_LOOKBACK_HOURS });
+  const seenCluster = new Set();
+  const countryScores = new Map();
+  let weightedPoints = 0;
+
+  for (const item of items) {
+    const titleKey = normalizeWorldMonitorTitleForKey(item?.title || "");
+    if (!titleKey || seenCluster.has(titleKey)) continue;
+    seenCluster.add(titleKey);
+    const level = String(item?.threatLevel || "low").toLowerCase();
+    const base = level === "critical"
+      ? 6
+      : level === "high"
+        ? 3.5
+        : level === "medium"
+          ? 2
+          : 1;
+    const taiwanBoost = Number(item?.taiwanScore || 0) > 0 ? 1.15 : 1;
+    const sourceW = worldMonitorSourceWeight(item?.source || "", item?.feedSection || "");
+    const points = base * taiwanBoost * sourceW;
+    weightedPoints += points;
+    const countries = Array.isArray(item?.countries) ? item.countries : [];
+    for (const code of countries.slice(0, 3)) {
+      const prev = Number(countryScores.get(code) || 0) || 0;
+      countryScores.set(code, prev + points);
+    }
+  }
+
+  const baseGlobalScore = Math.round(Math.min(100, 100 * (1 - Math.exp(-(weightedPoints / 130)))));
+  const signalPenalty = worldMonitorAddSignalsPenalty();
+  const globalScore = Math.max(0, Math.min(100, Math.round(baseGlobalScore + signalPenalty)));
+  const globalLevel = globalScore >= 80
+    ? "critical"
+    : globalScore >= 62
+      ? "high"
+      : globalScore >= 38
+        ? "medium"
+        : "low";
+  const topCountries = [...countryScores.entries()]
+    .map(([region, pts]) => ({
+      region,
+      name: resolveWorldMonitorRegionName(region),
+      score: Math.round(Math.min(100, 100 * (1 - Math.exp(-(Number(pts || 0) / 28))))),
+    }))
+    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))
+    .slice(0, WORLDMONITOR_TOP_COUNTRIES);
+
+  const signalFactors = [];
+  const market = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.marketSeries);
+  const crypto = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.cryptoSeries);
+  const seismic = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.seismicSeries);
+  const infra = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.infrastructureSeries);
+  const adsb = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.adsbSeries);
+  const disaster = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.disasterSeries);
+  const maritime = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.maritimeSeries);
+  const service = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.serviceSeries);
+  const macro = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.macroSeries);
+  const prediction = worldMonitorLatestSeriesItem(worldMonitorNativeSignals.predictionSeries);
+  if (market?.metrics && Number(market.metrics?.TWSE?.changePct || 0) <= -2) signalFactors.push("MARKET_TW_STRESS");
+  if (market?.metrics && Number(market.metrics?.WTI_OIL?.changePct || 0) >= 4) signalFactors.push("ENERGY_SPIKE");
+  if (crypto?.metrics && Math.abs(Number(crypto.metrics?.USDT?.usd || 1) - 1) >= 0.01) signalFactors.push("STABLECOIN_DEPEG");
+  if (seismic && Number(seismic.maxMag24h || 0) >= 6.8) signalFactors.push("SEISMIC_MAJOR");
+  if (infra && Number(infra.total24h || 0) >= 8 && Number(infra.deltaPct || 0) >= 50) signalFactors.push("INFRA_DISRUPTION_SPIKE");
+  if (adsb && Number(adsb.taiwanMilitaryFlights || 0) >= 6) signalFactors.push("ADSB_TW_STRESS");
+  if (adsb && (Number(adsb?.byType?.tanker || 0) + Number(adsb?.byType?.awacs || 0)) >= 3) signalFactors.push("ADSB_FORCE_PROJECTION");
+  if (disaster && Number(disaster.currentRed || 0) >= 1) signalFactors.push("DISASTER_RED_ALERT");
+  if (disaster && Number(disaster.taiwanRegionOrangeOrRed || 0) >= 1) signalFactors.push("DISASTER_WESTPAC_ALERT");
+  if (maritime && Number(maritime.taiwanRegionWarnings || 0) >= 4) signalFactors.push("MARITIME_TW_WARNING_CLUSTER");
+  if (maritime && Number(maritime.militaryRelated || 0) >= 25) signalFactors.push("MARITIME_MIL_WARNING_SPIKE");
+  if (service && Number(service.outageCount || 0) >= 2) signalFactors.push("SERVICE_OUTAGE_CLUSTER");
+  if (macro && String(macro.riskRegime || "").toLowerCase() === "risk_off") signalFactors.push("MACRO_RISK_OFF");
+  if (macro && Number(macro?.metrics?.fearGreedValue || 50) <= 15) signalFactors.push("MACRO_EXTREME_FEAR");
+  if (prediction && Number(prediction.taiwanRelatedCount || 0) >= 3) signalFactors.push("PREDICTION_TW_ACTIVITY");
+  if (prediction && Number(prediction.highVolumeUncertainCount || 0) >= 6) signalFactors.push("PREDICTION_UNCERTAINTY_SPIKE");
+
+  return {
+    fetchedAt: Date.now(),
+    sourceUrl: "native://worldmonitor-feed-engine",
+    globalScore,
+    globalLevel,
+    globalFactors: [...new Set([...getWorldMonitorNativeFactors(items), ...signalFactors])].slice(0, 8),
+    topCountries,
+  };
+}
+
+function buildWorldMonitorNativeFeedAlerts(sinceMs = 0) {
+  const minSeen = Math.max(0, Number(sinceMs || 0) || 0);
+  const groups = new Map();
+  for (const item of worldMonitorNativeNewsItems) {
+    const seenAt = Number(item?.firstSeenAt || item?.publishedAt || 0) || 0;
+    if (seenAt <= 0 || seenAt < minSeen) continue;
+    const title = String(item?.title || "").trim();
+    const link = normalizeWorldMonitorLink(item?.link || "");
+    if (!title || !link) continue;
+    const titleKey = worldMonitorFeedAlertTitleKey({ title });
+    const dedupeKey = titleKey || `${String(item?.source || "").toLowerCase()}|${normalizeWorldMonitorTitleForKey(title)}`;
+    const prev = groups.get(dedupeKey);
+    const candidate = {
+      key: String(item?.articleKey || `${dedupeKey}|${link}`).trim(),
+      titleKey,
+      source: String(item?.source || "Unknown").trim() || "Unknown",
+      title,
+      link,
+      threatLevel: String(item?.threatLevel || "low").trim().toLowerCase(),
+      publishedAt: Number(item?.publishedAt || item?.firstSeenAt || 0) || 0,
+      firstSeenAt: seenAt,
+    };
+    if (!prev) {
+      groups.set(dedupeKey, candidate);
+      continue;
+    }
+    const prevRank = worldMonitorFeedAlertLevelRank(prev.threatLevel);
+    const nextRank = worldMonitorFeedAlertLevelRank(candidate.threatLevel);
+    if (nextRank > prevRank || (nextRank === prevRank && candidate.firstSeenAt < prev.firstSeenAt)) {
+      groups.set(dedupeKey, candidate);
+    }
+  }
+  return [...groups.values()]
+    .sort((a, b) => Number(a.firstSeenAt || 0) - Number(b.firstSeenAt || 0));
+}
+
+function findWorldMonitorItemForAlert(alert) {
+  const key = String(alert?.key || "").trim();
+  const link = normalizeWorldMonitorLink(alert?.link || "");
+  const titleKey = worldMonitorFeedAlertTitleKey({ title: String(alert?.title || "") });
+
+  if (key) {
+    for (let i = worldMonitorNativeNewsItems.length - 1; i >= 0; i -= 1) {
+      const item = worldMonitorNativeNewsItems[i];
+      if (String(item?.articleKey || "").trim() === key) return item;
+    }
+  }
+  if (link) {
+    for (let i = worldMonitorNativeNewsItems.length - 1; i >= 0; i -= 1) {
+      const item = worldMonitorNativeNewsItems[i];
+      if (normalizeWorldMonitorLink(item?.link || "") === link) return item;
+    }
+  }
+  if (titleKey) {
+    for (let i = worldMonitorNativeNewsItems.length - 1; i >= 0; i -= 1) {
+      const item = worldMonitorNativeNewsItems[i];
+      const k = worldMonitorFeedAlertTitleKey({ title: String(item?.title || "") });
+      if (k && k === titleKey) return item;
+    }
+  }
+  return null;
+}
+
+function compactWorldMonitorArticleContext(context) {
+  const ctx = context && typeof context === "object" ? context : null;
+  if (!ctx || String(ctx.status || "").toLowerCase() !== "ok") return null;
+  const summary = String(ctx.summary || "").trim();
+  if (!summary) return null;
+  return {
+    summary: summary.slice(0, WORLDMONITOR_DEEP_INGEST_SUMMARY_MAX_CHARS),
+    key_points: Array.isArray(ctx.keyPoints)
+      ? ctx.keyPoints.map((x) => oneLine(x)).filter(Boolean).slice(0, 3)
+      : [],
+    source_title: oneLine(String(ctx.articleTitle || "")),
+    site_name: oneLine(String(ctx.siteName || "")),
+    lang: oneLine(String(ctx.lang || "")),
+    author: oneLine(String(ctx.author || "")),
+    published_at: Number(ctx.articlePublishedAt || 0) > 0 ? nowIso(Number(ctx.articlePublishedAt || 0)) : "",
+    fetched_at: Number(ctx.fetchedAt || 0) > 0 ? nowIso(Number(ctx.fetchedAt || 0)) : "",
+  };
+}
+
+function buildWorldMonitorArticleContextStats(sinceMs = 0) {
+  const minTs = Math.max(0, Number(sinceMs || 0) || 0);
+  let total = 0;
+  let ok = 0;
+  let errors = 0;
+  let pending = 0;
+  let taiwanRelated = 0;
+  let taiwanSummarized = 0;
+  for (const item of worldMonitorNativeNewsItems) {
+    const ts = Number(item?.publishedAt || item?.firstSeenAt || 0) || 0;
+    if (minTs > 0 && ts < minTs) continue;
+    total += 1;
+    const tw = Number(item?.taiwanScore || 0) > 0;
+    if (tw) taiwanRelated += 1;
+    const ctx = getWorldMonitorItemArticleContext(item);
+    const status = String(ctx?.status || "").toLowerCase();
+    if (status === "ok" && String(ctx?.summary || "").trim()) {
+      ok += 1;
+      if (tw) taiwanSummarized += 1;
+    } else if (status === "error") {
+      errors += 1;
+    } else {
+      pending += 1;
+    }
+  }
+  return {
+    total_items: total,
+    summarized_items: ok,
+    errored_items: errors,
+    pending_items: pending,
+    coverage_pct: total > 0 ? Math.round((ok / total) * 1000) / 10 : 0,
+    taiwan_items: taiwanRelated,
+    taiwan_summarized_items: taiwanSummarized,
+    taiwan_coverage_pct: taiwanRelated > 0 ? Math.round((taiwanSummarized / taiwanRelated) * 1000) / 10 : 0,
+  };
+}
+
+function buildWorldMonitorArticleThemeSnapshot(sinceMs = 0) {
+  const minTs = Math.max(0, Number(sinceMs || 0) || 0);
+  const themes = [
+    { id: "military", re: /(military|troop|exercise|missile|airstrike|drone|naval|warship|fighter|defense)/i },
+    { id: "taiwan_china", re: /(taiwan|taipei|taiwan strait|china|beijing|pla|south china sea|east china sea)/i },
+    { id: "diplomacy", re: /(summit|talks|negotiation|ceasefire|treaty|sanction|embassy|diplomatic)/i },
+    { id: "economy", re: /(market|inflation|rate|bond|oil|gas|trade|tariff|currency|supply chain)/i },
+    { id: "cyber", re: /(cyber|ransomware|hack|malware|breach|ddos)/i },
+    { id: "humanitarian", re: /(refugee|displacement|aid|humanitarian|famine|casualties|evacuation)/i },
+    { id: "infrastructure", re: /(port|harbor|harbour|pipeline|subsea|cable|shipping|chokepoint)/i },
+    { id: "disaster", re: /(earthquake|wildfire|flood|storm|typhoon|drought|disaster)/i },
+  ];
+  const counts = new Map(themes.map((x) => [x.id, 0]));
+  let summarized = 0;
+  for (const item of worldMonitorNativeNewsItems) {
+    const ts = Number(item?.publishedAt || item?.firstSeenAt || 0) || 0;
+    if (minTs > 0 && ts < minTs) continue;
+    const ctx = getWorldMonitorItemArticleContext(item);
+    if (!ctx || String(ctx.status || "").toLowerCase() !== "ok") continue;
+    const summary = String(ctx.summary || "").trim();
+    if (!summary) continue;
+    summarized += 1;
+    const text = `${String(item?.title || "")} ${summary}`.toLowerCase();
+    const weight = Math.max(1, worldMonitorFeedAlertLevelRank(item?.threatLevel || "low") - 1);
+    for (const theme of themes) {
+      if (theme.re.test(text)) {
+        const prev = Number(counts.get(theme.id) || 0) || 0;
+        counts.set(theme.id, prev + weight);
+      }
+    }
+  }
+  const topThemes = [...counts.entries()]
+    .map(([id, count]) => ({ theme: id, score: Number(count || 0) || 0 }))
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 8);
+  return {
+    summarized_items: summarized,
+    top_themes: topThemes,
+  };
+}
+
+function parseWorldMonitorQueryTerms(query) {
+  const src = String(query || "").trim();
+  if (!src) return [];
+  return src
+    .replace(/[()"]/g, " ")
+    .split(/\bOR\b|\bAND\b|[,\n]+/i)
+    .map((x) => normalizeWorldMonitorTitleForKey(x))
+    .filter((x) => x && x.length >= 3 && !["site", "when", "sourcelang", "date", "sort"].includes(x))
+    .slice(0, 24);
+}
+
+function buildWorldMonitorNativeSignalContext() {
+  const now = Date.now();
+  const dayAgo = now - (24 * 60 * 60 * 1000);
+  const marketSeries = Array.isArray(worldMonitorNativeSignals.marketSeries) ? worldMonitorNativeSignals.marketSeries : [];
+  const cryptoSeries = Array.isArray(worldMonitorNativeSignals.cryptoSeries) ? worldMonitorNativeSignals.cryptoSeries : [];
+  const seismicSeries = Array.isArray(worldMonitorNativeSignals.seismicSeries) ? worldMonitorNativeSignals.seismicSeries : [];
+  const infraSeries = Array.isArray(worldMonitorNativeSignals.infrastructureSeries) ? worldMonitorNativeSignals.infrastructureSeries : [];
+  const adsbSeries = Array.isArray(worldMonitorNativeSignals.adsbSeries) ? worldMonitorNativeSignals.adsbSeries : [];
+  const disasterSeries = Array.isArray(worldMonitorNativeSignals.disasterSeries) ? worldMonitorNativeSignals.disasterSeries : [];
+  const maritimeSeries = Array.isArray(worldMonitorNativeSignals.maritimeSeries) ? worldMonitorNativeSignals.maritimeSeries : [];
+  const serviceSeries = Array.isArray(worldMonitorNativeSignals.serviceSeries) ? worldMonitorNativeSignals.serviceSeries : [];
+  const macroSeries = Array.isArray(worldMonitorNativeSignals.macroSeries) ? worldMonitorNativeSignals.macroSeries : [];
+  const predictionSeries = Array.isArray(worldMonitorNativeSignals.predictionSeries) ? worldMonitorNativeSignals.predictionSeries : [];
+
+  const marketLatest = worldMonitorLatestSeriesItem(marketSeries);
+  const cryptoLatest = worldMonitorLatestSeriesItem(cryptoSeries);
+  const seismicLatest = worldMonitorLatestSeriesItem(seismicSeries);
+  const infraLatest = worldMonitorLatestSeriesItem(infraSeries);
+  const adsbLatest = worldMonitorLatestSeriesItem(adsbSeries);
+  const disasterLatest = worldMonitorLatestSeriesItem(disasterSeries);
+  const maritimeLatest = worldMonitorLatestSeriesItem(maritimeSeries);
+  const serviceLatest = worldMonitorLatestSeriesItem(serviceSeries);
+  const macroLatest = worldMonitorLatestSeriesItem(macroSeries);
+  const predictionLatest = worldMonitorLatestSeriesItem(predictionSeries);
+
+  const market24 = marketSeries.filter((x) => Number(x?.ts || 0) >= dayAgo);
+  const crypto24 = cryptoSeries.filter((x) => Number(x?.ts || 0) >= dayAgo);
+  const infra24 = infraSeries.filter((x) => Number(x?.ts || 0) >= dayAgo);
+  const adsb24 = adsbSeries.filter((x) => Number(x?.ts || 0) >= dayAgo);
+  const disaster24 = disasterSeries.filter((x) => Number(x?.ts || 0) >= dayAgo);
+  const maritime24 = maritimeSeries.filter((x) => Number(x?.ts || 0) >= dayAgo);
+  const service24 = serviceSeries.filter((x) => Number(x?.ts || 0) >= dayAgo);
+  const macro24 = macroSeries.filter((x) => Number(x?.ts || 0) >= dayAgo);
+  const prediction24 = predictionSeries.filter((x) => Number(x?.ts || 0) >= dayAgo);
+
+  function metricDeltaPct(series, pathA, pathB = null) {
+    if (!Array.isArray(series) || series.length < 2) return 0;
+    const first = series[0];
+    const last = series[series.length - 1];
+    const get = (obj, keyPath) => {
+      const keys = String(keyPath || "").split(".").filter(Boolean);
+      let cur = obj;
+      for (const k of keys) {
+        if (!cur || typeof cur !== "object") return NaN;
+        cur = cur[k];
+      }
+      return Number(cur);
+    };
+    const start = get(first, pathA);
+    const end = pathB ? get(last, pathB) : get(last, pathA);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start === 0) return 0;
+    return ((end - start) / Math.abs(start)) * 100;
+  }
+
+  return {
+    source_mode: "native",
+    refresh: {
+      feed_last_at: Number(worldMonitorMonitor.nativeLastRefreshAt || 0) || 0,
+      signals_last_at: Number(worldMonitorMonitor.nativeSignalsLastRefreshAt || 0) || 0,
+    },
+    market: marketLatest ? {
+      ts: Number(marketLatest.ts || 0) || 0,
+      metrics: worldMonitorNonEmptyObject(marketLatest.metrics),
+      twse_24h_delta_pct: metricDeltaPct(market24, "metrics.TWSE.price"),
+      oil_24h_delta_pct: metricDeltaPct(market24, "metrics.WTI_OIL.price"),
+      dxy_24h_delta_pct: metricDeltaPct(market24, "metrics.DOLLAR_INDEX.price"),
+    } : null,
+    crypto: cryptoLatest ? {
+      ts: Number(cryptoLatest.ts || 0) || 0,
+      metrics: worldMonitorNonEmptyObject(cryptoLatest.metrics),
+      btc_24h_delta_pct: metricDeltaPct(crypto24, "metrics.BTC.usd"),
+      eth_24h_delta_pct: metricDeltaPct(crypto24, "metrics.ETH.usd"),
+    } : null,
+    seismic: seismicLatest ? {
+      ts: Number(seismicLatest.ts || 0) || 0,
+      count24h: Number(seismicLatest.count24h || 0) || 0,
+      majorCount24h: Number(seismicLatest.majorCount24h || 0) || 0,
+      maxMag24h: Number(seismicLatest.maxMag24h || 0) || 0,
+      majorEvents: Array.isArray(seismicLatest.majorEvents) ? seismicLatest.majorEvents.slice(0, 6) : [],
+    } : null,
+    infrastructure: infraLatest ? {
+      ts: Number(infraLatest.ts || 0) || 0,
+      cables24h: Number(infraLatest.cables24h || 0) || 0,
+      ports24h: Number(infraLatest.ports24h || 0) || 0,
+      pipelines24h: Number(infraLatest.pipelines24h || 0) || 0,
+      total24h: Number(infraLatest.total24h || 0) || 0,
+      totalPrev24h: Number(infraLatest.totalPrev24h || 0) || 0,
+      deltaPct: Number(infraLatest.deltaPct || 0) || 0,
+      trend_24h_delta_pct: metricDeltaPct(infra24, "total24h"),
+    } : null,
+    adsb: adsbLatest ? {
+      ts: Number(adsbLatest.ts || 0) || 0,
+      totalFlights: Number(adsbLatest.totalFlights || 0) || 0,
+      militaryFlights: Number(adsbLatest.militaryFlights || 0) || 0,
+      militaryRatioPct: Number(adsbLatest.militaryRatioPct || 0) || 0,
+      taiwanTheaterFlights: Number(adsbLatest.taiwanTheaterFlights || 0) || 0,
+      taiwanMilitaryFlights: Number(adsbLatest.taiwanMilitaryFlights || 0) || 0,
+      byType: worldMonitorNonEmptyObject(adsbLatest.byType),
+      theaterCounts: Array.isArray(adsbLatest.theaterCounts) ? adsbLatest.theaterCounts.slice(0, 6) : [],
+      taiwan_military_24h_delta_pct: metricDeltaPct(adsb24, "taiwanMilitaryFlights"),
+      military_24h_delta_pct: metricDeltaPct(adsb24, "militaryFlights"),
+    } : null,
+    disaster: disasterLatest ? {
+      ts: Number(disasterLatest.ts || 0) || 0,
+      totalParsed: Number(disasterLatest.totalParsed || 0) || 0,
+      recent72h: Number(disasterLatest.recent72h || 0) || 0,
+      currentTotal: Number(disasterLatest.currentTotal || 0) || 0,
+      currentRed: Number(disasterLatest.currentRed || 0) || 0,
+      currentOrange: Number(disasterLatest.currentOrange || 0) || 0,
+      currentGreen: Number(disasterLatest.currentGreen || 0) || 0,
+      taiwanRegionCurrent: Number(disasterLatest.taiwanRegionCurrent || 0) || 0,
+      taiwanRegionOrangeOrRed: Number(disasterLatest.taiwanRegionOrangeOrRed || 0) || 0,
+      byType: worldMonitorNonEmptyObject(disasterLatest.byType),
+      topAlerts: Array.isArray(disasterLatest.topAlerts) ? disasterLatest.topAlerts.slice(0, 8) : [],
+      current_red_24h_delta_pct: metricDeltaPct(disaster24, "currentRed"),
+      current_orange_24h_delta_pct: metricDeltaPct(disaster24, "currentOrange"),
+    } : null,
+    maritime: maritimeLatest ? {
+      ts: Number(maritimeLatest.ts || 0) || 0,
+      totalWarnings: Number(maritimeLatest.totalWarnings || 0) || 0,
+      militaryRelated: Number(maritimeLatest.militaryRelated || 0) || 0,
+      taiwanRegionWarnings: Number(maritimeLatest.taiwanRegionWarnings || 0) || 0,
+      regionCounts: worldMonitorNonEmptyObject(maritimeLatest.regionCounts),
+      keyWarnings: Array.isArray(maritimeLatest.keyWarnings) ? maritimeLatest.keyWarnings.slice(0, 8) : [],
+      taiwan_region_24h_delta_pct: metricDeltaPct(maritime24, "taiwanRegionWarnings"),
+      military_related_24h_delta_pct: metricDeltaPct(maritime24, "militaryRelated"),
+    } : null,
+    services: serviceLatest ? {
+      ts: Number(serviceLatest.ts || 0) || 0,
+      totalServices: Number(serviceLatest.totalServices || 0) || 0,
+      okCount: Number(serviceLatest.okCount || 0) || 0,
+      degradedCount: Number(serviceLatest.degradedCount || 0) || 0,
+      outageCount: Number(serviceLatest.outageCount || 0) || 0,
+      services: Array.isArray(serviceLatest.services) ? serviceLatest.services.slice(0, 12) : [],
+      degraded_24h_delta_pct: metricDeltaPct(service24, "degradedCount"),
+      outage_24h_delta_pct: metricDeltaPct(service24, "outageCount"),
+    } : null,
+    macro: macroLatest ? {
+      ts: Number(macroLatest.ts || 0) || 0,
+      riskRegime: String(macroLatest.riskRegime || "").toLowerCase(),
+      riskOnSignals: Number(macroLatest.riskOnSignals || 0) || 0,
+      knownSignals: Number(macroLatest.knownSignals || 0) || 0,
+      metrics: worldMonitorNonEmptyObject(macroLatest.metrics),
+      seriesCoverage: worldMonitorNonEmptyObject(macroLatest.seriesCoverage),
+      fearGreedHistory: Array.isArray(macroLatest.fearGreedHistory) ? macroLatest.fearGreedHistory.slice(0, 20) : [],
+      qqq_24h_delta_pct: metricDeltaPct(macro24, "metrics.qqqRoc20Pct"),
+      fear_greed_24h_delta_pct: metricDeltaPct(macro24, "metrics.fearGreedValue"),
+    } : null,
+    prediction: predictionLatest ? {
+      ts: Number(predictionLatest.ts || 0) || 0,
+      totalActiveEvents: Number(predictionLatest.totalActiveEvents || 0) || 0,
+      taiwanRelatedCount: Number(predictionLatest.taiwanRelatedCount || 0) || 0,
+      highVolumeUncertainCount: Number(predictionLatest.highVolumeUncertainCount || 0) || 0,
+      topByVolume: Array.isArray(predictionLatest.topByVolume) ? predictionLatest.topByVolume.slice(0, 10) : [],
+      taiwanRelatedTop: Array.isArray(predictionLatest.taiwanRelatedTop) ? predictionLatest.taiwanRelatedTop.slice(0, 8) : [],
+      taiwan_related_24h_delta_pct: metricDeltaPct(prediction24, "taiwanRelatedCount"),
+      uncertainty_24h_delta_pct: metricDeltaPct(prediction24, "highVolumeUncertainCount"),
+    } : null,
+  };
+}
+
+async function fetchWorldMonitorNativeRiskSnapshot(options = {}) {
+  const refresh = await runWorldMonitorNativeFeedRefresh({ force: options?.force === true });
+  if (!refresh?.ok) {
+    throw new Error(String(refresh?.error || "native refresh failed"));
+  }
+  return buildWorldMonitorNativeRiskSnapshot();
+}
+
+async function fetchWorldMonitorNativeFeedAlerts(options = {}) {
+  const refresh = await runWorldMonitorNativeFeedRefresh({ force: options?.force === true });
+  if (!refresh?.ok) {
+    throw new Error(String(refresh?.error || "native refresh failed"));
+  }
+  return buildWorldMonitorNativeFeedAlerts(Number(options?.sinceMs || 0));
+}
+
+async function fetchWorldMonitorNativeCountryIntelBrief(countryCode, options = {}) {
+  const code = String(countryCode || "").trim().toUpperCase() || "TW";
+  const label = resolveWorldMonitorRegionName(code) || code;
+  const force = options?.force === true;
+  await runWorldMonitorNativeFeedRefresh({ force });
+  const relevant = getWorldMonitorNativeRecentItems({ lookbackHours: WORLDMONITOR_CHECK_LOOKBACK_HOURS })
+    .filter((x) => {
+      const countries = Array.isArray(x?.countries) ? x.countries : [];
+      if (countries.includes(code)) return true;
+      if (code === "TW") return Number(x?.taiwanScore || 0) > 0;
+      return false;
+    })
+    .slice(0, 40);
+  if (relevant.length === 0) {
+    return {
+      countryCode: code,
+      countryName: label,
+      brief: `No strong ${label} signal in the most recent feed window.`,
+      model: "native-feed-engine",
+      generatedAt: Date.now(),
+    };
+  }
+  const counts = { critical: 0, high: 0, medium: 0 };
+  for (const x of relevant) {
+    const lvl = String(x?.threatLevel || "").toLowerCase();
+    if (lvl === "critical" || lvl === "high" || lvl === "medium") counts[lvl] += 1;
+  }
+  const top = relevant.slice(0, 4).map((x) => String(x?.title || "").trim()).filter(Boolean);
+  const brief = [
+    `${label}: ${relevant.length} relevant headlines in the last ${WORLDMONITOR_CHECK_LOOKBACK_HOURS}h.`,
+    `Risk mix: critical=${counts.critical}, high=${counts.high}, medium=${counts.medium}.`,
+    top.length > 0 ? `Recent signals: ${top.join(" | ")}` : "",
+  ].filter(Boolean).join(" ");
+  return {
+    countryCode: code,
+    countryName: label,
+    brief: oneLine(brief),
+    model: "native-feed-engine",
+    generatedAt: Date.now(),
+  };
+}
+
+async function fetchWorldMonitorNativePizzintStatus(options = {}) {
+  const force = options?.force === true;
+  await runWorldMonitorNativeFeedRefresh({ force });
+  const items = getWorldMonitorNativeRecentItems({ lookbackHours: WORLDMONITOR_CHECK_LOOKBACK_HOURS });
+  const keyItems = items.filter((x) => worldMonitorFeedAlertLevelRank(x?.threatLevel || "low") >= 3);
+  const countryCount = new Set(keyItems.flatMap((x) => Array.isArray(x?.countries) ? x.countries : [])).size;
+  const pairDefs = [
+    ["US_RU", "United States vs Russia", ["US", "RU"]],
+    ["RU_UA", "Russia vs Ukraine", ["RU", "UA"]],
+    ["US_CN", "United States vs China", ["US", "CN"]],
+    ["CN_TW", "China vs Taiwan", ["CN", "TW"]],
+    ["US_IR", "United States vs Iran", ["US", "IR"]],
+    ["US_KP", "United States vs North Korea", ["US", "KP"]],
+  ];
+  const pairs = pairDefs.map(([id, label, members]) => {
+    const hit = keyItems.filter((x) => {
+      const countries = new Set(Array.isArray(x?.countries) ? x.countries : []);
+      return members.every((c) => countries.has(c));
+    }).length;
+    const score = Math.round(Math.min(100, hit * 11));
+    return {
+      id,
+      label,
+      score,
+      trend: "stable",
+      changePercent: 0,
+    };
+  }).sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
+  const maxPairScore = Number(pairs[0]?.score || 0);
+  const defconLevel = maxPairScore >= 80 ? 2 : maxPairScore >= 60 ? 3 : maxPairScore >= 35 ? 4 : 5;
+  const defconLabel = defconLevel <= 2 ? "high" : defconLevel === 3 ? "elevated" : "guarded";
+  return {
+    defconLevel,
+    defconLabel,
+    aggregateActivity: keyItems.length,
+    activeSpikes: keyItems.filter((x) => String(x?.threatLevel || "").toLowerCase() === "critical").length,
+    locationsOpen: countryCount,
+    updatedAt: Date.now(),
+    tensionPairs: pairs.slice(0, 8),
+  };
+}
+
+async function fetchWorldMonitorNativeGdeltDocuments(query, options = {}) {
+  await runWorldMonitorNativeFeedRefresh({ force: options?.force === true });
+  const terms = parseWorldMonitorQueryTerms(query);
+  const limit = Math.max(1, Number(options?.maxRecords || 8) || 8);
+  const items = getWorldMonitorNativeRecentItems({ lookbackHours: WORLDMONITOR_CHECK_LOOKBACK_HOURS });
+  const matched = [];
+  for (const item of items) {
+    const title = String(item?.title || "").toLowerCase();
+    if (!title) continue;
+    if (terms.length > 0 && !terms.some((term) => title.includes(term))) continue;
+    const articleCtx = compactWorldMonitorArticleContext(getWorldMonitorItemArticleContext(item));
+    matched.push({
+      title: String(item?.title || "").trim(),
+      source: String(item?.source || "").trim() || "Unknown",
+      url: normalizeWorldMonitorLink(item?.link || ""),
+      date: nowIso(Number(item?.publishedAt || item?.firstSeenAt || Date.now()) || Date.now()),
+      article_context: articleCtx,
+    });
+    if (matched.length >= limit) break;
+  }
+  return {
+    query: String(query || "").trim(),
+    error: "",
+    articles: matched,
+  };
+}
+
+async function fetchWorldMonitorCountryIntelBrief(countryCode, options = {}) {
+  return fetchWorldMonitorNativeCountryIntelBrief(countryCode, options);
+}
+
+async function fetchWorldMonitorPizzintStatus(options = {}) {
+  return fetchWorldMonitorNativePizzintStatus(options);
+}
+
+async function fetchWorldMonitorGdeltDocuments(query, options = {}) {
+  return fetchWorldMonitorNativeGdeltDocuments(query, options);
+}
+
+function isTaiwanRelevantHeadline(text) {
+  const lower = String(text || "").toLowerCase();
+  if (!lower) return false;
+  return (
+    lower.includes("taiwan")
+    || lower.includes("taipei")
+    || lower.includes("taiwan strait")
+    || lower.includes("strait")
+    || lower.includes("china")
+    || lower.includes("beijing")
+    || lower.includes("pla")
+    || lower.includes("prc")
+    || lower.includes("kinmen")
+    || lower.includes("matsu")
+    || lower.includes("penghu")
+    || lower.includes("south china sea")
+    || lower.includes("east china sea")
+  );
+}
+
+function worldMonitorAlertUrlHost(rawUrl) {
+  const url = normalizeWorldMonitorLink(rawUrl || "");
+  if (!url) return "";
+  try {
+    return String(new URL(url).hostname || "").trim().toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function isWorldMonitorAggregatorHost(host) {
+  const clean = String(host || "").trim().toLowerCase();
+  if (!clean) return false;
+  return (
+    clean === "news.google.com"
+    || clean === "news.yahoo.com"
+    || clean.endsWith(".googlenews.com")
+  );
+}
+
+function isWorldMonitorDocumentUrl(rawUrl) {
+  const url = normalizeWorldMonitorLink(rawUrl || "");
+  if (!url) return false;
+  return (
+    /\.(pdf|doc|docx|ppt|pptx|xls|xlsx)(?:$|[?#])/i.test(url)
+    || /[?&](?:format|output)=pdf(?:[&#]|$)/i.test(url)
+    || /\/(?:download|attachment)(?:\/|$)/i.test(url)
+  );
+}
+
+function isWorldMonitorLowQualityArticleContext(ctx) {
+  const context = ctx && typeof ctx === "object" ? ctx : null;
+  if (!context || String(context.status || "").toLowerCase() !== "ok") return true;
+  const summary = oneLine(String(context.summary || ""));
+  if (!summary) return true;
+  const lower = summary.toLowerCase();
+  if (summary.length < 90) return true;
+  if (
+    lower.includes("comprehensive up-to-date news coverage")
+    || lower.includes("aggregated from sources all over the world")
+    || lower.includes("google news")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function resolveWorldMonitorAlertBestLink(alert, item, ctx = null) {
+  const urls = [
+    normalizeWorldMonitorLink(ctx?.finalUrl || ""),
+    normalizeWorldMonitorLink(item?.link || ""),
+    normalizeWorldMonitorLink(alert?.link || ""),
+  ].filter(Boolean);
+  const nonAggregator = urls.filter((u) => !isWorldMonitorAggregatorHost(worldMonitorAlertUrlHost(u)));
+  return nonAggregator[0] || urls[0] || "";
+}
+
+function isWorldMonitorAlertForwardable(alert, item = null, ctx = null) {
+  const now = Date.now();
+  const publishedAt = Number(alert?.publishedAt || item?.publishedAt || 0) || 0;
+  if (publishedAt > 0) {
+    const ageMs = now - publishedAt;
+    const maxAgeMs = Math.max(1, Number(WORLDMONITOR_FEED_ALERTS_MAX_ARTICLE_AGE_HOURS || 120)) * 60 * 60 * 1000;
+    if (ageMs > maxAgeMs) return false;
+  }
+
+  const urls = [
+    normalizeWorldMonitorLink(alert?.link || ""),
+    normalizeWorldMonitorLink(item?.link || ""),
+    normalizeWorldMonitorLink(ctx?.finalUrl || ""),
+  ].filter(Boolean);
+  if (urls.length <= 0) return false;
+
+  if (WORLDMONITOR_FEED_ALERTS_SKIP_DOCUMENT_LINKS) {
+    const candidate = resolveWorldMonitorAlertBestLink(alert, item, ctx);
+    if (!candidate || isWorldMonitorDocumentUrl(candidate)) return false;
+  }
+
+  if (WORLDMONITOR_FEED_ALERTS_SKIP_AGGREGATOR_LINKS) {
+    const candidate = resolveWorldMonitorAlertBestLink(alert, item, ctx);
+    const host = worldMonitorAlertUrlHost(candidate);
+    if (!host || isWorldMonitorAggregatorHost(host)) return false;
+  }
+
+  if (WORLDMONITOR_FEED_ALERTS_REQUIRE_CONTEXT_QUALITY && WORLDMONITOR_DEEP_INGEST_ENABLED) {
+    if (isWorldMonitorLowQualityArticleContext(ctx)) return false;
+  }
+  return true;
+}
+
+function isWorldMonitorTaiwanWellbeingAlert(alert) {
+  const title = String(alert?.title || "").trim();
+  if (!title) return false;
+  const lower = title.toLowerCase();
+  const level = String(alert?.threatLevel || "").trim().toLowerCase();
+  const rank = worldMonitorFeedAlertLevelRank(level);
+
+  if (isTaiwanRelevantHeadline(lower) && rank >= worldMonitorFeedAlertLevelRank("high")) {
+    return true;
+  }
+  if (rank >= worldMonitorFeedAlertLevelRank("critical")) {
+    return (
+      WORLDMONITOR_TAIWAN_WELLBEING_GLOBAL_CRITICAL_KEYWORDS.some((kw) => lower.includes(kw))
+      || WORLDMONITOR_MAJOR_WORLD_EVENT_KEYWORDS.some((kw) => lower.includes(kw))
+    );
+  }
+  return false;
+}
+
+function worldMonitorSelectMixedAlerts(alerts, limit = 16) {
+  const source = Array.isArray(alerts) ? alerts : [];
+  const maxItems = Math.max(4, Number(limit) || 16);
+  const buckets = {
+    critical: [],
+    high: [],
+    medium: [],
+    low: [],
+    other: [],
+  };
+  for (const alert of source) {
+    const level = String(alert?.threatLevel || "").trim().toLowerCase();
+    if (level === "critical" || level === "high" || level === "medium" || level === "low") {
+      buckets[level].push(alert);
+    } else {
+      buckets.other.push(alert);
+    }
+  }
+
+  const selected = [];
+  const seen = new Set();
+  const add = (alert) => {
+    if (!alert || selected.length >= maxItems) return false;
+    const key = String(alert?.key || "").trim()
+      || String(alert?.titleKey || "").trim()
+      || normalizeWorldMonitorTitleForKey(alert?.title || "");
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    selected.push(alert);
+    return true;
+  };
+
+  const quotas = {
+    critical: Math.max(0, Math.min(buckets.critical.length, Math.round(maxItems * 0.28))),
+    high: Math.max(0, Math.min(buckets.high.length, Math.round(maxItems * 0.30))),
+    medium: Math.max(0, Math.min(buckets.medium.length, Math.round(maxItems * 0.27))),
+    low: Math.max(0, Math.min(buckets.low.length, Math.round(maxItems * 0.15))),
+  };
+
+  for (let i = 0; i < quotas.critical; i += 1) add(buckets.critical[i]);
+  for (let i = 0; i < quotas.high; i += 1) add(buckets.high[i]);
+  for (let i = 0; i < quotas.medium; i += 1) add(buckets.medium[i]);
+  for (let i = 0; i < quotas.low; i += 1) add(buckets.low[i]);
+
+  for (const alert of source) {
+    if (selected.length >= maxItems) break;
+    add(alert);
+  }
+
+  return {
+    items: selected,
+    selected_by_level: {
+      critical: selected.filter((x) => String(x?.threatLevel || "").toLowerCase() === "critical").length,
+      high: selected.filter((x) => String(x?.threatLevel || "").toLowerCase() === "high").length,
+      medium: selected.filter((x) => String(x?.threatLevel || "").toLowerCase() === "medium").length,
+      low: selected.filter((x) => String(x?.threatLevel || "").toLowerCase() === "low").length,
+      other: selected.filter((x) => {
+        const level = String(x?.threatLevel || "").toLowerCase();
+        return level !== "critical" && level !== "high" && level !== "medium" && level !== "low";
+      }).length,
+    },
+  };
+}
+
+function buildWorldMonitorComprehensivePrompt(packet) {
+  return [
+    "You are producing a concise but thorough strategic WorldMonitor brief for a user living in Taiwan.",
+    "Use only the telemetry packet.",
+    "The packet can include multi-signal context (news, market/crypto moves, seismic, infrastructure stress).",
+    "Use mixed news levels (critical/high/medium/low) to infer trend direction, not only crisis spikes.",
+    "",
+    "Output format exactly:",
+    "HEADLINE:",
+    "- One sentence, <= 20 words.",
+    "GLOBAL:",
+    "- 3 to 4 bullets in the form: signal -> why it matters now.",
+    "TAIWAN:",
+    "- 3 to 4 bullets focused on Taiwan-China security, diplomacy, economic spillover, and info-domain risk.",
+    "RISK:",
+    "- Global level: <critical|high|medium|low> (score X/100, trend up|flat|down).",
+    "- Taiwan posture: <escalating|elevated|stable|easing> with a short reason.",
+    "WATCH_24H:",
+    "- 3 concrete indicators to monitor in the next 24 hours.",
+    "BOTTOM_LINE:",
+    "- One sentence plain-language takeaway.",
+    "CONFIDENCE: low|medium|high",
+    "",
+    "Rules:",
+    "- Use full country names, never ISO codes (no TW/UA/etc).",
+    "- Keep language clear and easy to read aloud (TTS-friendly).",
+    "- If article_context summaries are present, prioritize them over headline-only interpretation.",
+    "- Keep total output under 280 words.",
+    "- If data is missing or stale, mention that briefly.",
+    "",
+    `TELEMETRY_PACKET=${JSON.stringify(packet)}`,
+  ].join("\n");
+}
+
+function worldMonitorFeedAlertLevelRank(level) {
+  const clean = String(level || "").trim().toLowerCase();
+  if (clean === "critical") return 5;
+  if (clean === "high") return 4;
+  if (clean === "medium") return 3;
+  if (clean === "low") return 2;
+  return 1;
+}
+
+function worldMonitorFeedAlertTitleKey(raw) {
+  const title = String(raw?.title || "").trim();
+  if (!title) return "";
+  const withoutTrailer = title
+    .replace(/\s+[|]\s+[\p{L}\p{N} .,&'()/-]{2,50}$/u, "")
+    .replace(/\s+-\s+[\p{L}\p{N} .,&'()/-]{2,50}$/u, "");
+  return withoutTrailer
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 220);
+}
+
+function formatWorldMonitorFeedAlertMessage(alert) {
+  const level = String(alert?.threatLevel || "low").trim().toLowerCase() || "low";
+  const levelTag = level.toUpperCase();
+  const source = oneLine(String(alert?.source || "").trim());
+  const rawTitle = String(alert?.title || "").replace(/\s+/g, " ").trim();
+  const rawLink = String(alert?.link || "").trim();
+  const safeTitle = rawTitle.replace(/[\[\]]/g, "").trim();
+  const hasLink = /^https?:\/\/\S+$/i.test(rawLink);
+  const header = `${fmtBold("WorldMonitor Alert")} [${levelTag}]`;
+  const lines = [header];
+  if (safeTitle && hasLink) {
+    lines.push(`[${safeTitle}](${rawLink})`);
+  } else if (rawTitle) {
+    lines.push(rawTitle);
+  }
+  if (source) lines.push(`source: ${source}`);
+  if (rawLink && !(safeTitle && hasLink)) lines.push(rawLink);
+  return lines.join("\n");
+}
+
+const WORLDMONITOR_REGION_NAME_OVERRIDES = Object.freeze({
+  XK: "Kosovo",
+  KP: "North Korea",
+  KR: "South Korea",
+  TW: "Taiwan",
+  RU: "Russia",
+  US: "United States",
+  GB: "United Kingdom",
+  IR: "Iran",
+  SY: "Syria",
+  YE: "Yemen",
+  IL: "Israel",
+  UA: "Ukraine",
+});
+let worldMonitorRegionDisplayNames = null;
+
+function resolveWorldMonitorRegionName(region) {
+  const code = String(region || "").trim().toUpperCase();
+  if (!code) return "";
+  if (code === "GLOBAL") return "Global";
+  if (WORLDMONITOR_REGION_NAME_OVERRIDES[code]) return WORLDMONITOR_REGION_NAME_OVERRIDES[code];
+  try {
+    if (typeof Intl !== "undefined" && typeof Intl.DisplayNames === "function") {
+      if (!worldMonitorRegionDisplayNames) {
+        worldMonitorRegionDisplayNames = new Intl.DisplayNames(["en"], { type: "region" });
+      }
+      const label = String(worldMonitorRegionDisplayNames.of(code) || "").trim();
+      if (label && label.toUpperCase() !== code) return label;
+    }
+  } catch {
+    // ignore and fall back to raw code
+  }
+  return code;
+}
+
+function compactWorldMonitorCountryCodeList(items, limit = 3) {
+  const source = Array.isArray(items) ? items : [];
+  const maxItems = Math.max(1, Number(limit) || 1);
+  return source
+    .slice(0, maxItems)
+    .map((x) => `${String(x.region || "??").toUpperCase()}:${Math.round(Number(x.score || 0))}`)
+    .join(", ");
+}
+
+function compactWorldMonitorCountryList(items, limit = 3) {
+  const source = Array.isArray(items) ? items : [];
+  const maxItems = Math.max(1, Number(limit) || 1);
+  return source
+    .slice(0, maxItems)
+    .map((x) => {
+      const region = String(x?.region || "").trim().toUpperCase();
+      const name = String(x?.name || resolveWorldMonitorRegionName(region)).trim();
+      const score = Math.round(Number(x?.score || 0));
+      const label = !region
+        ? (name || "unknown")
+        : (name && name.toUpperCase() !== region ? `${name} (${region})` : (name || region));
+      return `${label}:${score}`;
+    })
+    .join(", ");
+}
+
+function ensureWorldMonitorWorker() {
+  const stored = String(worldMonitorMonitor.workerId || "").trim();
+  if (stored && getCodexWorker(stored)) return stored;
+
+  let workerId = "";
+
+  const configuredWorkdir = String(WORLDMONITOR_WORKDIR || "").trim();
+  if (configuredWorkdir && fs.existsSync(configuredWorkdir)) {
+    workerId = findWorkerByWorkdir(configuredWorkdir);
+    if (!workerId && listCodexWorkers().length < ORCH_MAX_CODEX_WORKERS) {
+      try {
+        workerId = createRepoWorker(configuredWorkdir, WORLDMONITOR_WORKER_TITLE);
+      } catch (err) {
+        log(`worldmonitor worker create failed: ${redactError(err?.message || err)}`);
+      }
+    }
+  }
+
+  if (!workerId) {
+    const wantedTitle = String(WORLDMONITOR_WORKER_TITLE || "").trim().toLowerCase();
+    if (wantedTitle) {
+      for (const w of listCodexWorkers()) {
+        const title = String(w.title || "").trim().toLowerCase();
+        if (title && title === wantedTitle) {
+          workerId = w.id;
+          break;
+        }
+      }
+    }
+  }
+
+  if (!workerId) workerId = ORCH_GENERAL_WORKER_ID;
+
+  if (String(worldMonitorMonitor.workerId || "").trim() !== workerId) {
+    worldMonitorMonitor.workerId = workerId;
+    persistState();
+  }
+  return workerId;
+}
+
+async function fetchWorldMonitorRiskSnapshot(options = {}) {
+  return fetchWorldMonitorNativeRiskSnapshot(options);
+}
+
+async function fetchWorldMonitorFeedAlerts(options = {}) {
+  return fetchWorldMonitorNativeFeedAlerts(options);
+}
+
+function evaluateWorldMonitorSnapshot(snapshot, options = {}) {
+  const prevScore = Number(worldMonitorMonitor.lastObservedGlobalScore || 0) || 0;
+  const reasons = [];
+  const hotCountries = (Array.isArray(snapshot?.topCountries) ? snapshot.topCountries : [])
+    .filter((x) => Number(x?.score || 0) >= WORLDMONITOR_MIN_COUNTRY_RISK_SCORE);
+  const globalScore = Number(snapshot?.globalScore || 0);
+  const globalDeltaSigned = prevScore > 0 ? (globalScore - prevScore) : 0;
+  const globalDelta = prevScore > 0 ? Math.abs(globalScore - prevScore) : 0;
+
+  if (globalScore >= WORLDMONITOR_MIN_GLOBAL_RISK_SCORE) {
+    reasons.push(`global risk ${Math.round(globalScore)} >= ${WORLDMONITOR_MIN_GLOBAL_RISK_SCORE}`);
+  }
+  if (hotCountries.length > 0) {
+    reasons.push(
+      `country risk spike (${compactWorldMonitorCountryList(hotCountries, 3)}) >= ${WORLDMONITOR_MIN_COUNTRY_RISK_SCORE}`,
+    );
+  }
+  if (prevScore > 0 && globalDelta >= WORLDMONITOR_MIN_GLOBAL_DELTA) {
+    reasons.push(
+      `global risk moved ${globalDelta.toFixed(1)} points (${prevScore.toFixed(1)} -> ${globalScore.toFixed(1)})`,
+    );
+  }
+
+  const fingerprint = [
+    `${Math.round(globalScore)}`,
+    `${String(snapshot?.globalLevel || "unknown").toLowerCase()}`,
+    compactWorldMonitorCountryCodeList(snapshot?.topCountries, 4),
+    compactWorldMonitorCountryCodeList(hotCountries, 3),
+  ].join("|");
+
+  const forceAlert = options?.forceAlert === true;
+  const shouldAlert = forceAlert || reasons.length > 0;
+
+  return {
+    shouldAlert,
+    reasons,
+    previousGlobalScore: prevScore,
+    currentGlobalScore: globalScore,
+    globalDeltaSigned,
+    globalDelta,
+    hotCountries,
+    fingerprint,
+  };
+}
+
+function buildWorldMonitorSnapshotSummary(snapshot) {
+  const globalScore = Math.round(Number(snapshot?.globalScore || 0));
+  const level = String(snapshot?.globalLevel || "unknown").toLowerCase();
+  const top = compactWorldMonitorCountryList(snapshot?.topCountries, 4) || "none";
+  const factors = Array.isArray(snapshot?.globalFactors) && snapshot.globalFactors.length > 0
+    ? snapshot.globalFactors.slice(0, 4).join(", ")
+    : "none";
+  return `global=${globalScore}/${level}; top=${top}; factors=${factors}`;
+}
+
+function buildWorldMonitorAlertPrompt(snapshot, decision, source = "interval") {
+  const packet = {
+    monitor_source: source,
+    fetched_at: nowIso(snapshot?.fetchedAt || Date.now()),
+    trigger_reasons: Array.isArray(decision?.reasons) ? decision.reasons : [],
+    global_risk: {
+      score: Number(snapshot?.globalScore || 0),
+      level: String(snapshot?.globalLevel || "").toLowerCase(),
+      factors: Array.isArray(snapshot?.globalFactors) ? snapshot.globalFactors : [],
+    },
+    top_countries: Array.isArray(snapshot?.topCountries) ? snapshot.topCountries : [],
+    source_url: String(snapshot?.sourceUrl || "").trim(),
+  };
+
+  return [
+    "You are monitoring WorldMonitor risk telemetry for actionable geopolitical alerts.",
+    "Produce a concise operator alert for Telegram.",
+    "",
+    "Output format:",
+    "ALERT_LEVEL: low|medium|high",
+    "SUMMARY: 2-4 lines on what changed and why it matters now.",
+    "IMPLICATIONS:",
+    "- bullet 1",
+    "- bullet 2",
+    "WATCHLIST:",
+    "- 3-5 concrete indicators to track in the next 6-24h.",
+    "",
+    "Rules:",
+    "- Use only the provided telemetry packet.",
+    "- If confidence is low, say so explicitly.",
+    "- Use full country names (for example, 'Ukraine') and avoid ISO codes like 'UA'.",
+    "- Write in plain spoken language that sounds natural in text-to-speech.",
+    "- Keep total output under 220 words.",
+    "",
+    `TELEMETRY_PACKET=${JSON.stringify(packet)}`,
+  ].join("\n");
+}
+
+function getWorldMonitorWorkerLaneState(workerId) {
+  const lane = ensureWorkerLane(workerId) || getLane(workerId);
+  const busy = Boolean(lane?.currentJob);
+  const queued = Array.isArray(lane?.queue) ? lane.queue.length : 0;
+  return { busy, queued };
+}
+
+async function runWorldMonitorMonitorCycle(options = {}) {
+  const source = String(options?.source || "interval").trim().toLowerCase() || "interval";
+  const allowWhenDisabled = options?.allowWhenDisabled === true;
+  const forceAlert = options?.forceAlert === true;
+  const replyChatId = String(options?.replyChatId || "").trim();
+  const now = Date.now();
+
+  if (!WORLDMONITOR_MONITOR_ENABLED && !allowWhenDisabled) {
+    return { ok: false, skipped: "disabled" };
+  }
+  if (worldMonitorRuntime.inFlight) {
+    return { ok: false, skipped: "busy" };
+  }
+
+  worldMonitorRuntime.inFlight = true;
+  try {
+    const snapshot = await fetchWorldMonitorRiskSnapshot();
+    const decision = evaluateWorldMonitorSnapshot(snapshot, { forceAlert });
+    const summary = buildWorldMonitorSnapshotSummary(snapshot);
+
+    worldMonitorMonitor.lastRunAt = now;
+    worldMonitorMonitor.lastRunSource = source;
+    worldMonitorMonitor.lastErrorAt = 0;
+    worldMonitorMonitor.lastError = "";
+    worldMonitorMonitor.lastObservedGlobalScore = Number(snapshot.globalScore || 0);
+    worldMonitorMonitor.lastObservedFingerprint = String(decision.fingerprint || "").trim();
+    worldMonitorMonitor.lastSnapshotSummary = summary;
+    persistState();
+
+    let enqueued = false;
+    let enqueueReason = "not triggered";
+
+    if (decision.shouldAlert) {
+      const cooldownMs = Math.max(0, Number(WORLDMONITOR_ALERT_COOLDOWN_SEC || 0) * 1000);
+      const lastAlertAt = Number(worldMonitorMonitor.lastAlertAt || 0) || 0;
+      const inCooldown = !forceAlert && cooldownMs > 0 && lastAlertAt > 0 && (now - lastAlertAt) < cooldownMs;
+      const duplicate = !forceAlert
+        && String(worldMonitorMonitor.lastAlertFingerprint || "").trim()
+        && String(worldMonitorMonitor.lastAlertFingerprint || "").trim() === String(decision.fingerprint || "").trim();
+
+      if (inCooldown) {
+        enqueueReason = "cooldown";
+      } else if (duplicate) {
+        enqueueReason = "duplicate";
+      } else {
+        const workerId = ensureWorldMonitorWorker();
+        const laneState = getWorldMonitorWorkerLaneState(workerId);
+        if (laneState.busy || laneState.queued > 0) {
+          enqueueReason = `worker busy (queued=${laneState.queued})`;
+        } else {
+          const prompt = buildWorldMonitorAlertPrompt(snapshot, decision, source);
+          await enqueuePrompt(WORLDMONITOR_ALERT_CHAT_ID, prompt, "worldmonitor-monitor", {
+            workerId,
+            setActiveWorker: false,
+            model: WORLDMONITOR_SUMMARY_MODEL,
+            reasoning: WORLDMONITOR_SUMMARY_REASONING,
+          });
+          enqueued = true;
+          enqueueReason = "enqueued";
+          worldMonitorMonitor.workerId = workerId;
+          worldMonitorMonitor.lastAlertAt = Date.now();
+          worldMonitorMonitor.lastAlertReason = decision.reasons.join("; ");
+          worldMonitorMonitor.lastAlertFingerprint = String(decision.fingerprint || "").trim();
+          persistState();
+        }
+      }
+    }
+
+    if (replyChatId) {
+      const factors = Array.isArray(snapshot?.globalFactors) && snapshot.globalFactors.length > 0
+        ? snapshot.globalFactors.slice(0, 8).join(", ")
+        : "none";
+      const hotList = compactWorldMonitorCountryList(decision.hotCountries, 5) || "none";
+      const topCountries = Array.isArray(snapshot?.topCountries) ? snapshot.topCountries.slice(0, 5) : [];
+      const signedDelta = Number(decision?.globalDeltaSigned || 0);
+      const deltaText = Number(decision?.previousGlobalScore || 0) > 0
+        ? `${signedDelta >= 0 ? "+" : ""}${signedDelta.toFixed(1)} (prev ${Number(decision.previousGlobalScore || 0).toFixed(1)})`
+        : "n/a (first observation)";
+      const lines = [
+        fmtBold("WorldMonitor Check"),
+        `- source: ${source}`,
+        `- fetched: ${nowIso(snapshot.fetchedAt)} (${formatRelativeAge(snapshot.fetchedAt)})`,
+        `- source_url: ${String(snapshot.sourceUrl || "").trim() || "(unknown)"}`,
+        `- global_risk: ${Math.round(snapshot.globalScore)}/${snapshot.globalLevel}`,
+        `- delta_vs_last: ${deltaText}`,
+        `- global_factors: ${factors}`,
+        `- hot_countries(>=${WORLDMONITOR_MIN_COUNTRY_RISK_SCORE}): ${hotList}`,
+        `- thresholds: global>=${WORLDMONITOR_MIN_GLOBAL_RISK_SCORE}, country>=${WORLDMONITOR_MIN_COUNTRY_RISK_SCORE}, delta>=${WORLDMONITOR_MIN_GLOBAL_DELTA}`,
+        `- trigger: ${decision.shouldAlert ? "yes" : "no"}`,
+        `- alert_action: ${enqueued ? "queued_codex_alert" : enqueueReason}`,
+      ];
+      if (topCountries.length > 0) {
+        lines.push("- top_countries:");
+        for (let i = 0; i < topCountries.length; i += 1) {
+          const it = topCountries[i] || {};
+          const region = String(it.region || "").trim().toUpperCase();
+          const name = String(it.name || resolveWorldMonitorRegionName(region)).trim();
+          const label = !region
+            ? (name || "unknown")
+            : (name && name.toUpperCase() !== region ? `${name} (${region})` : (name || region));
+          lines.push(`  ${i + 1}. ${label}: ${Math.round(Number(it.score || 0))}`);
+        }
+      } else {
+        lines.push("- top_countries: none");
+      }
+      if (decision.reasons.length > 0) {
+        lines.push("- reasons:");
+        for (let i = 0; i < decision.reasons.length; i += 1) {
+          lines.push(`  ${i + 1}. ${decision.reasons[i]}`);
+        }
+      }
+      await sendMessage(replyChatId, lines.join("\n"));
+    }
+
+    return {
+      ok: true,
+      enqueued,
+      enqueueReason,
+      decision,
+      snapshot,
+    };
+  } catch (err) {
+    const message = String(err?.message || err || "").trim() || "worldmonitor monitor error";
+    worldMonitorMonitor.lastRunAt = now;
+    worldMonitorMonitor.lastRunSource = source;
+    worldMonitorMonitor.lastErrorAt = Date.now();
+    worldMonitorMonitor.lastError = message;
+    persistState();
+
+    if (WORLDMONITOR_NOTIFY_ERRORS) {
+      const cooldownMs = Math.max(0, Number(WORLDMONITOR_ALERT_COOLDOWN_SEC || 0) * 1000);
+      const lastNotified = Number(worldMonitorMonitor.lastNotifiedErrorAt || 0) || 0;
+      const canNotify = cooldownMs <= 0 || (Date.now() - lastNotified) >= cooldownMs;
+      if (canNotify) {
+        worldMonitorMonitor.lastNotifiedErrorAt = Date.now();
+        persistState();
+        await sendMessage(
+          WORLDMONITOR_ALERT_CHAT_ID,
+          `WorldMonitor monitor error: ${message}`,
+          { silent: true },
+        );
+      }
+    }
+
+    if (replyChatId) {
+      await sendMessage(replyChatId, `WorldMonitor check failed: ${message}`);
+    }
+
+    return { ok: false, error: message };
+  } finally {
+    worldMonitorRuntime.inFlight = false;
+  }
+}
+
+async function runWorldMonitorComprehensiveCheck(options = {}) {
+  const chatId = String(options?.chatId || "").trim();
+  if (!chatId) return { ok: false, error: "chatId missing" };
+
+  if (worldMonitorComprehensiveRuntime.inFlight) {
+    await sendMessage(chatId, "WorldMonitor comprehensive check is already running. Please wait for the current report.");
+    return { ok: false, skipped: "busy" };
+  }
+  worldMonitorComprehensiveRuntime.inFlight = true;
+  worldMonitorComprehensiveRuntime.lastStartedAt = Date.now();
+
+  if (options?.announceStart !== false) {
+    await sendMessage(chatId, `${fmtBold("WorldMonitor Check")} started. Gathering telemetry and drafting report...`);
+  }
+
+  try {
+    const now = Date.now();
+    const lookbackMs = Math.max(1, Number(WORLDMONITOR_CHECK_LOOKBACK_HOURS || 48)) * 60 * 60 * 1000;
+    const sinceMs = now - lookbackMs;
+    const maxHeadlines = Math.max(4, Number(WORLDMONITOR_CHECK_MAX_HEADLINES || 16));
+    const force = options?.forceAlert === true;
+
+  const [
+    riskResult,
+    feedResult,
+    taiwanBriefResult,
+    pizzintResult,
+    gdeltTaiwanResult,
+    gdeltGlobalResult,
+  ] = await Promise.allSettled([
+    fetchWorldMonitorRiskSnapshot({ force }),
+    fetchWorldMonitorFeedAlerts({ sinceMs, force }),
+    fetchWorldMonitorCountryIntelBrief(WORLDMONITOR_CHECK_TAIWAN_COUNTRY_CODE, { force }),
+    fetchWorldMonitorPizzintStatus({ force }),
+    fetchWorldMonitorGdeltDocuments(
+      '(Taiwan OR Taiwan Strait OR Taipei OR China OR PLA OR South China Sea)',
+      { maxRecords: 10, timespan: `${WORLDMONITOR_CHECK_LOOKBACK_HOURS}h`, sort: "date", force },
+    ),
+    fetchWorldMonitorGdeltDocuments(
+      '(military exercise OR troop deployment OR airstrike OR naval exercise OR sanctions OR ceasefire)',
+      { maxRecords: 10, timespan: `${WORLDMONITOR_CHECK_LOOKBACK_HOURS}h`, sort: "date", force },
+    ),
+  ]);
+
+  if (riskResult.status !== "fulfilled") {
+    const message = String(riskResult.reason?.message || riskResult.reason || "risk snapshot failed");
+    await sendMessage(chatId, `WorldMonitor comprehensive check failed: ${message}`);
+    return { ok: false, error: message };
+  }
+
+  const riskSnapshot = riskResult.value;
+  const allFeedAlerts = feedResult.status === "fulfilled" ? feedResult.value : [];
+  const recentAlerts = allFeedAlerts
+    .filter((x) => Number(x?.firstSeenAt || 0) >= sinceMs)
+    .sort((a, b) => Number(b.firstSeenAt || 0) - Number(a.firstSeenAt || 0));
+  const mixedGlobalSelection = worldMonitorSelectMixedAlerts(recentAlerts, maxHeadlines);
+  const topGlobalAlerts = mixedGlobalSelection.items;
+  const taiwanSelection = worldMonitorSelectMixedAlerts(
+    recentAlerts.filter((x) => isTaiwanRelevantHeadline(x?.title || "")),
+    Math.min(maxHeadlines, 10),
+  );
+  const taiwanAlerts = taiwanSelection.items;
+
+  const alertLevelCounts = {
+    critical: recentAlerts.filter((x) => String(x?.threatLevel || "").toLowerCase() === "critical").length,
+    high: recentAlerts.filter((x) => String(x?.threatLevel || "").toLowerCase() === "high").length,
+    medium: recentAlerts.filter((x) => String(x?.threatLevel || "").toLowerCase() === "medium").length,
+    low: recentAlerts.filter((x) => String(x?.threatLevel || "").toLowerCase() === "low").length,
+  };
+  const articleContextStats = buildWorldMonitorArticleContextStats(sinceMs);
+  const articleThemeSnapshot = buildWorldMonitorArticleThemeSnapshot(sinceMs);
+
+  const taiwanBrief = taiwanBriefResult.status === "fulfilled" ? taiwanBriefResult.value : null;
+  const pizzint = pizzintResult.status === "fulfilled" ? pizzintResult.value : null;
+  const gdeltTaiwan = gdeltTaiwanResult.status === "fulfilled" ? gdeltTaiwanResult.value : null;
+  const gdeltGlobal = gdeltGlobalResult.status === "fulfilled" ? gdeltGlobalResult.value : null;
+
+  const dataGaps = [];
+  if (feedResult.status !== "fulfilled") dataGaps.push("feed_alert_bridge_unavailable");
+  if (taiwanBriefResult.status !== "fulfilled" || !String(taiwanBrief?.brief || "").trim()) dataGaps.push("taiwan_country_brief_unavailable");
+  if (pizzintResult.status !== "fulfilled") dataGaps.push("pizzint_unavailable");
+  if (gdeltTaiwanResult.status !== "fulfilled" || (gdeltTaiwan?.error && !gdeltTaiwan?.articles?.length)) dataGaps.push("gdelt_taiwan_unavailable");
+  if (gdeltGlobalResult.status !== "fulfilled" || (gdeltGlobal?.error && !gdeltGlobal?.articles?.length)) dataGaps.push("gdelt_global_unavailable");
+  const nativeHistory = (() => {
+    const nowMs = Date.now();
+    const dayMs = 24 * 60 * 60 * 1000;
+    const last7d = worldMonitorNativeNewsItems.filter((x) => Number(x?.publishedAt || x?.firstSeenAt || 0) >= (nowMs - 7 * dayMs));
+    const prev7d = worldMonitorNativeNewsItems.filter((x) => {
+      const ts = Number(x?.publishedAt || x?.firstSeenAt || 0);
+      return ts >= (nowMs - 14 * dayMs) && ts < (nowMs - 7 * dayMs);
+    });
+    const taiwan7d = last7d.filter((x) => Number(x?.taiwanScore || 0) > 0);
+    const prevTaiwan7d = prev7d.filter((x) => Number(x?.taiwanScore || 0) > 0);
+    return {
+      source_mode: "native",
+      store_items_total: worldMonitorNativeNewsItems.length,
+      retention_days: WORLDMONITOR_NATIVE_STORE_MAX_AGE_DAYS,
+      last_7d_items: last7d.length,
+      prev_7d_items: prev7d.length,
+      last_7d_taiwan_items: taiwan7d.length,
+      prev_7d_taiwan_items: prevTaiwan7d.length,
+    };
+  })();
+  const nativeSignalContext = buildWorldMonitorNativeSignalContext();
+  if (!nativeSignalContext?.market) dataGaps.push("native_market_signals_unavailable");
+  if (!nativeSignalContext?.crypto) dataGaps.push("native_crypto_signals_unavailable");
+  if (!nativeSignalContext?.seismic) dataGaps.push("native_seismic_signals_unavailable");
+  if (!nativeSignalContext?.infrastructure) dataGaps.push("native_infrastructure_signals_unavailable");
+  if (!nativeSignalContext?.adsb) dataGaps.push("native_adsb_signals_unavailable");
+  if (!nativeSignalContext?.disaster) dataGaps.push("native_disaster_signals_unavailable");
+  if (!nativeSignalContext?.maritime) dataGaps.push("native_maritime_signals_unavailable");
+  if (!nativeSignalContext?.services) dataGaps.push("native_service_signals_unavailable");
+  if (!nativeSignalContext?.macro) dataGaps.push("native_macro_signals_unavailable");
+  if (!nativeSignalContext?.prediction) dataGaps.push("native_prediction_signals_unavailable");
+  if (WORLDMONITOR_DEEP_INGEST_ENABLED && Number(articleContextStats.summarized_items || 0) <= 0) {
+    dataGaps.push("article_context_unavailable");
+  }
+  const mapAlertRow = (x) => {
+    const row = {
+      title: String(x?.title || "").trim(),
+      source: String(x?.source || "").trim(),
+      threat_level: String(x?.threatLevel || "").trim().toLowerCase(),
+      first_seen_at: nowIso(Number(x?.firstSeenAt || 0) || now),
+      link: String(x?.link || "").trim(),
+    };
+    const item = findWorldMonitorItemForAlert(x);
+    const articleContext = compactWorldMonitorArticleContext(getWorldMonitorItemArticleContext(item));
+    if (articleContext) row.article_context = articleContext;
+    return row;
+  };
+
+  const packet = {
+    mode: "comprehensive_manual_check",
+    requested_at: nowIso(now),
+    lookback_hours: Number(WORLDMONITOR_CHECK_LOOKBACK_HOURS || 48),
+    force_requested: force,
+    risk_snapshot: {
+      fetched_at: nowIso(riskSnapshot?.fetchedAt || now),
+      source_url: String(riskSnapshot?.sourceUrl || "").trim(),
+      global_risk: {
+        score: Number(riskSnapshot?.globalScore || 0),
+        level: String(riskSnapshot?.globalLevel || "").trim().toLowerCase(),
+        factors: Array.isArray(riskSnapshot?.globalFactors) ? riskSnapshot.globalFactors : [],
+      },
+      top_countries: Array.isArray(riskSnapshot?.topCountries) ? riskSnapshot.topCountries : [],
+    },
+    feed_alerts: {
+      total: recentAlerts.length,
+      by_level: alertLevelCounts,
+      selection_mode: "mixed_levels_recency",
+      selected_global_by_level: mixedGlobalSelection.selected_by_level,
+      selected_taiwan_by_level: taiwanSelection.selected_by_level,
+      top_global: topGlobalAlerts.map(mapAlertRow),
+      taiwan_related: taiwanAlerts.map(mapAlertRow),
+    },
+    taiwan_brief: {
+      country_code: WORLDMONITOR_CHECK_TAIWAN_COUNTRY_CODE,
+      country_name: String(taiwanBrief?.countryName || "Taiwan").trim(),
+      generated_at: taiwanBrief?.generatedAt ? nowIso(Number(taiwanBrief.generatedAt)) : "",
+      model: String(taiwanBrief?.model || "").trim(),
+      brief: String(taiwanBrief?.brief || "").trim(),
+    },
+    pizzint: pizzint ? {
+      defcon_level: Number(pizzint?.defconLevel || 0),
+      defcon_label: String(pizzint?.defconLabel || "").trim(),
+      aggregate_activity: Number(pizzint?.aggregateActivity || 0),
+      active_spikes: Number(pizzint?.activeSpikes || 0),
+      locations_open: Number(pizzint?.locationsOpen || 0),
+      updated_at: pizzint?.updatedAt ? nowIso(Number(pizzint.updatedAt)) : "",
+      top_tension_pairs: Array.isArray(pizzint?.tensionPairs) ? pizzint.tensionPairs.slice(0, 6) : [],
+    } : null,
+    gdelt: {
+      taiwan_query: String(gdeltTaiwan?.query || "").trim(),
+      taiwan_error: String(gdeltTaiwan?.error || "").trim(),
+      taiwan_articles: Array.isArray(gdeltTaiwan?.articles) ? gdeltTaiwan.articles.slice(0, 8) : [],
+      global_query: String(gdeltGlobal?.query || "").trim(),
+      global_error: String(gdeltGlobal?.error || "").trim(),
+      global_articles: Array.isArray(gdeltGlobal?.articles) ? gdeltGlobal.articles.slice(0, 8) : [],
+    },
+    native_history: nativeHistory,
+    article_context: {
+      ...articleContextStats,
+      theme_snapshot: articleThemeSnapshot,
+      deep_ingest_enabled: WORLDMONITOR_DEEP_INGEST_ENABLED,
+      deep_ingest_last_run_at: Number(worldMonitorMonitor.nativeDeepIngestLastRunAt || 0) > 0
+        ? nowIso(Number(worldMonitorMonitor.nativeDeepIngestLastRunAt || 0))
+        : "",
+      deep_ingest_last_error: String(worldMonitorMonitor.nativeDeepIngestLastError || "").trim(),
+      deep_ingest_last_stats: worldMonitorMonitor.nativeDeepIngestLastStats
+        && typeof worldMonitorMonitor.nativeDeepIngestLastStats === "object"
+        ? worldMonitorMonitor.nativeDeepIngestLastStats
+        : {},
+    },
+    signal_context: nativeSignalContext,
+    data_gaps: dataGaps,
+  };
+
+  const prompt = buildWorldMonitorComprehensivePrompt(packet);
+  const workerId = ensureWorldMonitorWorker();
+  await enqueuePrompt(chatId, prompt, "worldmonitor-check", {
+    workerId,
+    setActiveWorker: false,
+    model: WORLDMONITOR_SUMMARY_MODEL,
+    reasoning: WORLDMONITOR_SUMMARY_REASONING,
+  });
+
+  if (options?.announceQueued === true) {
+    const lineA = `${fmtBold("WorldMonitor Check")} comprehensive report queued`;
+    const lineB = `- scope: global + Taiwan (${WORLDMONITOR_CHECK_LOOKBACK_HOURS}h lookback)`;
+    const signalLinePart = ` market=${nativeSignalContext?.market ? "ok" : "unavailable"} crypto=${nativeSignalContext?.crypto ? "ok" : "unavailable"} seismic=${nativeSignalContext?.seismic ? "ok" : "unavailable"} infra=${nativeSignalContext?.infrastructure ? "ok" : "unavailable"} adsb=${nativeSignalContext?.adsb ? "ok" : "unavailable"} disaster=${nativeSignalContext?.disaster ? "ok" : "unavailable"} maritime=${nativeSignalContext?.maritime ? "ok" : "unavailable"} services=${nativeSignalContext?.services ? "ok" : "unavailable"} macro=${nativeSignalContext?.macro ? "ok" : "unavailable"} prediction=${nativeSignalContext?.prediction ? "ok" : "unavailable"}`;
+    const lineC = `- sources: risk=${riskSnapshot?.sourceUrl ? "ok" : "ok"} feed_alerts=${feedResult.status === "fulfilled" ? recentAlerts.length : "unavailable"} article_context=${articleContextStats.summarized_items}/${articleContextStats.total_items} (${articleContextStats.coverage_pct}%) gdelt_tw=${gdeltTaiwanResult.status === "fulfilled" ? (gdeltTaiwan?.articles?.length || 0) : "unavailable"} gdelt_global=${gdeltGlobalResult.status === "fulfilled" ? (gdeltGlobal?.articles?.length || 0) : "unavailable"}${signalLinePart}`;
+    const lineD = dataGaps.length > 0 ? `- data_gaps: ${dataGaps.join(", ")}` : "- data_gaps: none";
+    await sendMessage(chatId, [lineA, lineB, lineC, lineD].join("\n"));
+  }
+
+  return { ok: true, queued: true };
+  } finally {
+    worldMonitorComprehensiveRuntime.inFlight = false;
+  }
+}
+
+function stopWorldMonitorMonitorLoop() {
+  if (worldMonitorRuntime.timer) {
+    clearTimeout(worldMonitorRuntime.timer);
+    worldMonitorRuntime.timer = null;
+  }
+}
+
+function scheduleWorldMonitorMonitorLoop(delayMs) {
+  if (shuttingDown || !WORLDMONITOR_MONITOR_ENABLED) return;
+  stopWorldMonitorMonitorLoop();
+  const ms = Math.max(1_000, Number(delayMs || 0) || Number(WORLDMONITOR_MONITOR_INTERVAL_SEC) * 1000);
+  worldMonitorRuntime.timer = setTimeout(() => {
+    worldMonitorRuntime.timer = null;
+    void (async () => {
+      const res = await runWorldMonitorMonitorCycle({ source: "interval" });
+      if (!res?.ok && String(res?.error || "").trim()) {
+        log(`worldmonitor monitor cycle failed: ${redactError(res.error)}`);
+      }
+      scheduleWorldMonitorMonitorLoop(Number(WORLDMONITOR_MONITOR_INTERVAL_SEC) * 1000);
+    })();
+  }, ms);
+}
+
+function startWorldMonitorMonitorLoop() {
+  if (!WORLDMONITOR_MONITOR_ENABLED) return;
+  const initialDelayMs = Math.max(0, Number(WORLDMONITOR_STARTUP_DELAY_SEC || 0) * 1000);
+  scheduleWorldMonitorMonitorLoop(initialDelayMs);
+}
+
+async function runWorldMonitorFeedAlertsCycle(options = {}) {
+  const source = String(options?.source || "interval").trim().toLowerCase() || "interval";
+  const now = Date.now();
+
+  if (!WORLDMONITOR_MONITOR_ENABLED || !WORLDMONITOR_FEED_ALERTS_ENABLED) {
+    return { ok: false, skipped: "disabled" };
+  }
+  if (worldMonitorFeedAlertsRuntime.inFlight) {
+    return { ok: false, skipped: "busy" };
+  }
+
+  worldMonitorFeedAlertsRuntime.inFlight = true;
+  try {
+    if (Number(worldMonitorMonitor.feedAlertsLastSeenAt || 0) <= 0) {
+      worldMonitorMonitor.feedAlertsLastSeenAt = now;
+      worldMonitorMonitor.feedAlertsLastRunAt = now;
+      worldMonitorMonitor.feedAlertsLastErrorAt = 0;
+      worldMonitorMonitor.feedAlertsLastError = "";
+      persistState();
+      return { ok: true, skipped: "warmup", sent: 0 };
+    }
+
+    const sinceMs = Number(worldMonitorMonitor.feedAlertsLastSeenAt || 0) || 0;
+    const alerts = await fetchWorldMonitorFeedAlerts({ sinceMs });
+    let sent = 0;
+    let maxSeenAt = sinceMs;
+    const maxPerCycle = Math.max(1, Number(WORLDMONITOR_FEED_ALERTS_MAX_PER_CYCLE || 1));
+
+    for (const alert of alerts) {
+      const key = String(alert?.key || "").trim();
+      const titleKey = String(alert?.titleKey || "").trim();
+      const seenAt = Number(alert?.firstSeenAt || 0) || 0;
+      if (seenAt > maxSeenAt) maxSeenAt = seenAt;
+      if (worldMonitorFeedAlertLevelRank(alert?.threatLevel) < worldMonitorFeedAlertLevelRank(WORLDMONITOR_FEED_ALERTS_MIN_LEVEL)) {
+        continue;
+      }
+      if (WORLDMONITOR_FEED_ALERTS_REQUIRE_TAIWAN_WELLBEING && !isWorldMonitorTaiwanWellbeingAlert(alert)) {
+        continue;
+      }
+      const item = findWorldMonitorItemForAlert(alert);
+      const ctx = getWorldMonitorItemArticleContext(item);
+      if (!isWorldMonitorAlertForwardable(alert, item, ctx)) {
+        continue;
+      }
+      if (!key || worldMonitorFeedAlertSentKeySet.has(key)) continue;
+      if (titleKey && worldMonitorFeedAlertSentTitleKeySet.has(titleKey)) continue;
+      if (sent >= maxPerCycle) break;
+      const bestLink = resolveWorldMonitorAlertBestLink(alert, item, ctx);
+      const outboundAlert = bestLink ? { ...alert, link: bestLink } : alert;
+      await sendMessage(WORLDMONITOR_FEED_ALERTS_CHAT_ID, formatWorldMonitorFeedAlertMessage(outboundAlert));
+      rememberWorldMonitorFeedAlertKey(key);
+      if (titleKey) rememberWorldMonitorFeedAlertTitleKey(titleKey);
+      sent += 1;
+    }
+
+    worldMonitorMonitor.feedAlertsLastSeenAt = Math.max(
+      Number(worldMonitorMonitor.feedAlertsLastSeenAt || 0) || 0,
+      maxSeenAt,
+    );
+    worldMonitorMonitor.feedAlertsLastRunAt = now;
+    worldMonitorMonitor.feedAlertsLastErrorAt = 0;
+    worldMonitorMonitor.feedAlertsLastError = "";
+    persistState();
+
+    return { ok: true, sent, seen: alerts.length };
+  } catch (err) {
+    const message = String(err?.message || err || "").trim() || "worldmonitor feed alerts error";
+    worldMonitorMonitor.feedAlertsLastRunAt = now;
+    worldMonitorMonitor.feedAlertsLastErrorAt = Date.now();
+    worldMonitorMonitor.feedAlertsLastError = message;
+    persistState();
+    return { ok: false, error: message };
+  } finally {
+    worldMonitorFeedAlertsRuntime.inFlight = false;
+  }
+}
+
+function stopWorldMonitorFeedAlertsLoop() {
+  if (worldMonitorFeedAlertsRuntime.timer) {
+    clearTimeout(worldMonitorFeedAlertsRuntime.timer);
+    worldMonitorFeedAlertsRuntime.timer = null;
+  }
+}
+
+function scheduleWorldMonitorFeedAlertsLoop(delayMs) {
+  if (shuttingDown || !WORLDMONITOR_MONITOR_ENABLED || !WORLDMONITOR_FEED_ALERTS_ENABLED) return;
+  stopWorldMonitorFeedAlertsLoop();
+  const ms = Math.max(1_000, Number(delayMs || 0) || Number(WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC) * 1000);
+  worldMonitorFeedAlertsRuntime.timer = setTimeout(() => {
+    worldMonitorFeedAlertsRuntime.timer = null;
+    void (async () => {
+      const res = await runWorldMonitorFeedAlertsCycle({ source: "interval" });
+      if (!res?.ok && String(res?.error || "").trim()) {
+        log(`worldmonitor feed-alert cycle failed: ${redactError(res.error)}`);
+      }
+      scheduleWorldMonitorFeedAlertsLoop(Number(WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC) * 1000);
+    })();
+  }, ms);
+}
+
+function startWorldMonitorFeedAlertsLoop() {
+  if (!WORLDMONITOR_MONITOR_ENABLED || !WORLDMONITOR_FEED_ALERTS_ENABLED) return;
+  const initialDelayMs = Math.max(0, Number(WORLDMONITOR_STARTUP_DELAY_SEC || 0) * 1000);
+  scheduleWorldMonitorFeedAlertsLoop(initialDelayMs);
+}
+
+async function sendWorldMonitorStatus(chatId) {
+  const workerId = String(worldMonitorMonitor.workerId || "").trim()
+    || (WORLDMONITOR_MONITOR_ENABLED ? ensureWorldMonitorWorker() : "");
+  const worker = workerId ? getCodexWorker(workerId) : null;
+  const laneState = workerId ? getWorldMonitorWorkerLaneState(workerId) : { busy: false, queued: 0 };
+  const nativeStats = worldMonitorMonitor.nativeLastRefreshStats && typeof worldMonitorMonitor.nativeLastRefreshStats === "object"
+    ? worldMonitorMonitor.nativeLastRefreshStats
+    : {};
+  const deepIngestStats = worldMonitorMonitor.nativeDeepIngestLastStats && typeof worldMonitorMonitor.nativeDeepIngestLastStats === "object"
+    ? worldMonitorMonitor.nativeDeepIngestLastStats
+    : {};
+  const nativeFeeds = loadWorldMonitorNativeFeedManifest();
+  const nativeFeedCount = Array.isArray(nativeFeeds) ? nativeFeeds.length : 0;
+  const lines = [
+    fmtBold("WorldMonitor Monitor"),
+    `- enabled: ${WORLDMONITOR_MONITOR_ENABLED}`,
+    `- source_mode: native`,
+    `- feed_manifest_path: ${WORLDMONITOR_NATIVE_FEEDS_PATH}`,
+    `- feed_manifest_count: ${nativeFeedCount}`,
+    `- native_store_items: ${worldMonitorNativeNewsItems.length}`,
+    `- native_last_refresh: ${worldMonitorMonitor.nativeLastRefreshAt ? `${nowIso(worldMonitorMonitor.nativeLastRefreshAt)} (${formatRelativeAge(worldMonitorMonitor.nativeLastRefreshAt)})` : "never"}`,
+    `- native_refresh_duration_ms: ${Math.round(Number(worldMonitorMonitor.nativeLastRefreshDurationMs || 0) || 0)}`,
+    `- native_feed_stats: total=${Math.round(Number(nativeStats.feeds_total || 0) || 0)}, ok=${Math.round(Number(nativeStats.feeds_ok || 0) || 0)}, failed=${Math.round(Number(nativeStats.feeds_failed || 0) || 0)}, new=${Math.round(Number(nativeStats.new_items || 0) || 0)}`,
+    `- native_article_context_refresh: ${worldMonitorMonitor.nativeDeepIngestLastRunAt ? `${nowIso(worldMonitorMonitor.nativeDeepIngestLastRunAt)} (${formatRelativeAge(worldMonitorMonitor.nativeDeepIngestLastRunAt)})` : "never"}`,
+    `- native_article_context_duration_ms: ${Math.round(Number(worldMonitorMonitor.nativeDeepIngestLastDurationMs || 0) || 0)}`,
+    `- native_article_context_stats: scanned=${Math.round(Number(deepIngestStats.scanned || 0) || 0)}, ok=${Math.round(Number(deepIngestStats.completed || 0) || 0)}, errors=${Math.round(Number(deepIngestStats.errors || 0) || 0)}, pending=${Math.round(Number(deepIngestStats.remaining_pending || 0) || 0)}`,
+    `- native_signals_refresh: ${worldMonitorMonitor.nativeSignalsLastRefreshAt ? `${nowIso(worldMonitorMonitor.nativeSignalsLastRefreshAt)} (${formatRelativeAge(worldMonitorMonitor.nativeSignalsLastRefreshAt)})` : "never"}`,
+    `- native_signals_points: market=${Array.isArray(worldMonitorNativeSignals.marketSeries) ? worldMonitorNativeSignals.marketSeries.length : 0}, crypto=${Array.isArray(worldMonitorNativeSignals.cryptoSeries) ? worldMonitorNativeSignals.cryptoSeries.length : 0}, seismic=${Array.isArray(worldMonitorNativeSignals.seismicSeries) ? worldMonitorNativeSignals.seismicSeries.length : 0}, infra=${Array.isArray(worldMonitorNativeSignals.infrastructureSeries) ? worldMonitorNativeSignals.infrastructureSeries.length : 0}, adsb=${Array.isArray(worldMonitorNativeSignals.adsbSeries) ? worldMonitorNativeSignals.adsbSeries.length : 0}, disaster=${Array.isArray(worldMonitorNativeSignals.disasterSeries) ? worldMonitorNativeSignals.disasterSeries.length : 0}, maritime=${Array.isArray(worldMonitorNativeSignals.maritimeSeries) ? worldMonitorNativeSignals.maritimeSeries.length : 0}, services=${Array.isArray(worldMonitorNativeSignals.serviceSeries) ? worldMonitorNativeSignals.serviceSeries.length : 0}, macro=${Array.isArray(worldMonitorNativeSignals.macroSeries) ? worldMonitorNativeSignals.macroSeries.length : 0}, prediction=${Array.isArray(worldMonitorNativeSignals.predictionSeries) ? worldMonitorNativeSignals.predictionSeries.length : 0}`,
+    `- interval_sec: ${WORLDMONITOR_MONITOR_INTERVAL_SEC}`,
+    `- cooldown_sec: ${WORLDMONITOR_ALERT_COOLDOWN_SEC}`,
+    `- article_context: ${WORLDMONITOR_DEEP_INGEST_ENABLED ? `enabled (concurrency=${WORLDMONITOR_DEEP_INGEST_CONCURRENCY}, timeout=${WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS}ms, max_per_cycle=${WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE}, lookback_hours=${WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS})` : "disabled"}`,
+    `- thresholds: global>=${WORLDMONITOR_MIN_GLOBAL_RISK_SCORE}, country>=${WORLDMONITOR_MIN_COUNTRY_RISK_SCORE}, delta>=${WORLDMONITOR_MIN_GLOBAL_DELTA}`,
+    `- feed_alerts: ${WORLDMONITOR_FEED_ALERTS_ENABLED ? `enabled (interval=${WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC}s, engine=native, min_level=${WORLDMONITOR_FEED_ALERTS_MIN_LEVEL}, taiwan_wellbeing_filter=${WORLDMONITOR_FEED_ALERTS_REQUIRE_TAIWAN_WELLBEING}, max_article_age_h=${WORLDMONITOR_FEED_ALERTS_MAX_ARTICLE_AGE_HOURS}, skip_aggregators=${WORLDMONITOR_FEED_ALERTS_SKIP_AGGREGATOR_LINKS}, skip_documents=${WORLDMONITOR_FEED_ALERTS_SKIP_DOCUMENT_LINKS}, require_context_quality=${WORLDMONITOR_FEED_ALERTS_REQUIRE_CONTEXT_QUALITY})` : "disabled"}`,
+    `- voice_alerts: ${WORLDMONITOR_ALERT_VOICE_ENABLED ? `enabled (max_chars=${WORLDMONITOR_ALERT_VOICE_MAX_CHARS})` : "disabled"}`,
+    `- check_voice: ${WORLDMONITOR_CHECK_VOICE_ENABLED ? `enabled (max_chars=${WORLDMONITOR_CHECK_VOICE_MAX_CHARS})` : "disabled"}`,
+    `- worker: ${workerId ? `${workerId}${worker ? ` (${String(worker.name || worker.title || workerId).trim() || workerId})` : ""}` : "(none)"}`,
+    `- worker_queue: busy=${laneState.busy} queued=${laneState.queued}`,
+    `- last_run: ${worldMonitorMonitor.lastRunAt ? `${nowIso(worldMonitorMonitor.lastRunAt)} (${formatRelativeAge(worldMonitorMonitor.lastRunAt)})` : "never"}`,
+    `- last_alert: ${worldMonitorMonitor.lastAlertAt ? `${nowIso(worldMonitorMonitor.lastAlertAt)} (${formatRelativeAge(worldMonitorMonitor.lastAlertAt)})` : "never"}`,
+    `- feed_last_run: ${worldMonitorMonitor.feedAlertsLastRunAt ? `${nowIso(worldMonitorMonitor.feedAlertsLastRunAt)} (${formatRelativeAge(worldMonitorMonitor.feedAlertsLastRunAt)})` : "never"}`,
+    `- feed_last_seen_at: ${worldMonitorMonitor.feedAlertsLastSeenAt ? `${nowIso(worldMonitorMonitor.feedAlertsLastSeenAt)} (${formatRelativeAge(worldMonitorMonitor.feedAlertsLastSeenAt)})` : "never"}`,
+    `- last_alert_reason: ${String(worldMonitorMonitor.lastAlertReason || "").trim() || "(none)"}`,
+    `- snapshot: ${String(worldMonitorMonitor.lastSnapshotSummary || "").trim() || "(none)"}`,
+    `- last_error: ${String(worldMonitorMonitor.lastError || "").trim() || "(none)"}`,
+    `- feed_last_error: ${String(worldMonitorMonitor.feedAlertsLastError || "").trim() || "(none)"}`,
+    `- native_last_error: ${String(worldMonitorMonitor.nativeLastRefreshError || "").trim() || "(none)"}`,
+    `- native_article_context_last_error: ${String(worldMonitorMonitor.nativeDeepIngestLastError || "").trim() || "(none)"}`,
+    `- native_signals_last_error: ${String(worldMonitorMonitor.nativeSignalsLastRefreshError || "").trim() || "(none)"}`,
+  ];
+  await sendMessage(chatId, lines.join("\n"));
+}
+
 async function sendStatus(chatId) {
   const queueCap = MAX_QUEUE_SIZE > 0 ? String(MAX_QUEUE_SIZE) : "unlimited";
   const queued = totalQueuedJobs();
@@ -6090,6 +10509,15 @@ async function sendStatus(chatId) {
     : TTS_BATCH_PIPELINED_MAX_CHUNKS > 0
       ? `adaptive (pipeline<=${TTS_BATCH_PIPELINED_MAX_CHUNKS})`
       : "pipelined";
+  const worldMonitorWorkerId = String(worldMonitorMonitor.workerId || "").trim()
+    || (WORLDMONITOR_MONITOR_ENABLED ? ensureWorldMonitorWorker() : "");
+  const worldMonitorWorker = worldMonitorWorkerId ? getCodexWorker(worldMonitorWorkerId) : null;
+  const worldMonitorLane = worldMonitorWorkerId
+    ? getWorldMonitorWorkerLaneState(worldMonitorWorkerId)
+    : { busy: false, queued: 0 };
+  const worldMonitorWorkerLabel = worldMonitorWorkerId
+    ? `${worldMonitorWorkerId}${worldMonitorWorker ? ` (${String(worldMonitorWorker.name || worldMonitorWorker.title || worldMonitorWorkerId).trim() || worldMonitorWorkerId})` : ""}`
+    : "(none)";
 
   const lines = [
     fmtBold("Status"),
@@ -6113,6 +10541,24 @@ async function sendStatus(chatId) {
     `- tts_batch_mode: ${ttsBatchMode}`,
     `- tts_lane: ${ttsLane?.currentJob ? "busy" : "idle"} (queued=${ttsLane?.queue?.length || 0})`,
     `- whisper_lane: ${whisperLane?.currentJob ? "busy" : "idle"} (queued=${whisperLane?.queue?.length || 0})`,
+    `- worldmonitor_source_mode: native`,
+    `- worldmonitor_monitor: ${WORLDMONITOR_MONITOR_ENABLED ? "enabled" : "disabled"} (interval=${WORLDMONITOR_MONITOR_INTERVAL_SEC}s, cooldown=${WORLDMONITOR_ALERT_COOLDOWN_SEC}s)`,
+    `- worldmonitor_feed_alerts: ${WORLDMONITOR_FEED_ALERTS_ENABLED ? "enabled" : "disabled"} (interval=${WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC}s, engine=native, min_level=${WORLDMONITOR_FEED_ALERTS_MIN_LEVEL}, taiwan_wellbeing_filter=${WORLDMONITOR_FEED_ALERTS_REQUIRE_TAIWAN_WELLBEING}, max_article_age_h=${WORLDMONITOR_FEED_ALERTS_MAX_ARTICLE_AGE_HOURS}, skip_aggregators=${WORLDMONITOR_FEED_ALERTS_SKIP_AGGREGATOR_LINKS}, skip_documents=${WORLDMONITOR_FEED_ALERTS_SKIP_DOCUMENT_LINKS}, require_context_quality=${WORLDMONITOR_FEED_ALERTS_REQUIRE_CONTEXT_QUALITY})`,
+    `- worldmonitor_article_context: ${WORLDMONITOR_DEEP_INGEST_ENABLED ? "enabled" : "disabled"} (concurrency=${WORLDMONITOR_DEEP_INGEST_CONCURRENCY}, timeout=${WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS}ms, max_per_cycle=${WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE}, lookback_hours=${WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS})`,
+    `- worldmonitor_worker: ${worldMonitorWorkerLabel} | busy=${worldMonitorLane.busy} queued=${worldMonitorLane.queued}`,
+    `- worldmonitor_check: ${worldMonitorComprehensiveRuntime.inFlight ? `running (${formatRelativeAge(worldMonitorComprehensiveRuntime.lastStartedAt)})` : "idle"}`,
+    `- worldmonitor_last_run: ${worldMonitorMonitor.lastRunAt ? `${formatRelativeAge(worldMonitorMonitor.lastRunAt)}` : "never"}`,
+    `- worldmonitor_last_alert: ${worldMonitorMonitor.lastAlertAt ? `${formatRelativeAge(worldMonitorMonitor.lastAlertAt)}` : "never"}`,
+    `- worldmonitor_feed_last_run: ${worldMonitorMonitor.feedAlertsLastRunAt ? `${formatRelativeAge(worldMonitorMonitor.feedAlertsLastRunAt)}` : "never"}`,
+    `- worldmonitor_native_refresh: ${worldMonitorMonitor.nativeLastRefreshAt ? `${formatRelativeAge(worldMonitorMonitor.nativeLastRefreshAt)}` : "never"} (items=${worldMonitorNativeNewsItems.length})`,
+    `- worldmonitor_article_context_refresh: ${worldMonitorMonitor.nativeDeepIngestLastRunAt ? `${formatRelativeAge(worldMonitorMonitor.nativeDeepIngestLastRunAt)}` : "never"} (scanned=${Math.round(Number(worldMonitorMonitor?.nativeDeepIngestLastStats?.scanned || 0) || 0)}, ok=${Math.round(Number(worldMonitorMonitor?.nativeDeepIngestLastStats?.completed || 0) || 0)}, errors=${Math.round(Number(worldMonitorMonitor?.nativeDeepIngestLastStats?.errors || 0) || 0)}, pending=${Math.round(Number(worldMonitorMonitor?.nativeDeepIngestLastStats?.remaining_pending || 0) || 0)})`,
+    `- worldmonitor_native_signals_refresh: ${worldMonitorMonitor.nativeSignalsLastRefreshAt ? `${formatRelativeAge(worldMonitorMonitor.nativeSignalsLastRefreshAt)}` : "never"} (market=${Array.isArray(worldMonitorNativeSignals.marketSeries) ? worldMonitorNativeSignals.marketSeries.length : 0}, crypto=${Array.isArray(worldMonitorNativeSignals.cryptoSeries) ? worldMonitorNativeSignals.cryptoSeries.length : 0}, seismic=${Array.isArray(worldMonitorNativeSignals.seismicSeries) ? worldMonitorNativeSignals.seismicSeries.length : 0}, infra=${Array.isArray(worldMonitorNativeSignals.infrastructureSeries) ? worldMonitorNativeSignals.infrastructureSeries.length : 0}, adsb=${Array.isArray(worldMonitorNativeSignals.adsbSeries) ? worldMonitorNativeSignals.adsbSeries.length : 0}, disaster=${Array.isArray(worldMonitorNativeSignals.disasterSeries) ? worldMonitorNativeSignals.disasterSeries.length : 0}, maritime=${Array.isArray(worldMonitorNativeSignals.maritimeSeries) ? worldMonitorNativeSignals.maritimeSeries.length : 0}, services=${Array.isArray(worldMonitorNativeSignals.serviceSeries) ? worldMonitorNativeSignals.serviceSeries.length : 0}, macro=${Array.isArray(worldMonitorNativeSignals.macroSeries) ? worldMonitorNativeSignals.macroSeries.length : 0}, prediction=${Array.isArray(worldMonitorNativeSignals.predictionSeries) ? worldMonitorNativeSignals.predictionSeries.length : 0})`,
+    `- worldmonitor_last_error: ${String(worldMonitorMonitor.lastError || "").trim() || "(none)"}`,
+    `- worldmonitor_feed_last_error: ${String(worldMonitorMonitor.feedAlertsLastError || "").trim() || "(none)"}`,
+    `- worldmonitor_native_error: ${String(worldMonitorMonitor.nativeLastRefreshError || "").trim() || "(none)"}`,
+    `- worldmonitor_article_context_error: ${String(worldMonitorMonitor.nativeDeepIngestLastError || "").trim() || "(none)"}`,
+    `- worldmonitor_native_signals_error: ${String(worldMonitorMonitor.nativeSignalsLastRefreshError || "").trim() || "(none)"}`,
+    `- worldmonitor_check_voice: ${WORLDMONITOR_CHECK_VOICE_ENABLED ? `enabled (max_chars=${WORLDMONITOR_CHECK_VOICE_MAX_CHARS})` : "disabled"}`,
     `- restart: ${restartState}`,
     "",
     fmtBold("Config"),
@@ -6208,6 +10654,7 @@ async function sendWorkers(chatId) {
     "/use <worker_id, name, or title> - switch active workspace",
     "/spawn <local-path> [title] - create a new repo workspace",
     "/retire <worker_id, name, or title> - remove a workspace",
+    "/wmstatus - worldmonitor monitor state",
   );
 
   await sendMessage(chatId, lines.join("\n"));
@@ -6618,6 +11065,7 @@ async function enqueueRawCodexCommand(chatId, args, source = "cmd", options = {}
     setActiveWorkerForChat(chatId, lane.id);
   }
   touchWorker(lane.id);
+  const laneWorkdir = refreshLaneWorkdir(lane, { logPrefix: "[enqueue]" });
 
   const job = {
     id: nextJobId++,
@@ -6628,7 +11076,7 @@ async function enqueueRawCodexCommand(chatId, args, source = "cmd", options = {}
     rawArgs: tokens,
     resumeSessionId: "",
     text: "",
-    workdir: lane.workdir,
+    workdir: laneWorkdir,
     replyToMessageId: Number(options?.replyToMessageId || 0),
     startedAt: 0,
     cancelRequested: false,
@@ -6653,6 +11101,12 @@ async function runRawCodexJob(job) {
       text: `Failed to prepare AIDOLON command: ${err.message || err}`,
     };
   }
+  const requestedCwd = String(spec?.cwd || "").trim();
+  const safeCwd = resolveUsableWorkdir(requestedCwd);
+  if (requestedCwd !== safeCwd) {
+    log(`[run] raw worker cwd unavailable: ${requestedCwd || "(empty)"}; using ${safeCwd}.`);
+  }
+  spec.cwd = safeCwd;
 
   return await new Promise((resolve) => {
     let done = false;
@@ -6888,6 +11342,32 @@ async function handleParsedCommand(chatId, parsed) {
     case "/news":
       await handleNewsCommand(chatId, parsed.arg || "");
       return true;
+    case "/wmstatus":
+      await sendWorldMonitorStatus(chatId);
+      return true;
+    case "/wmcheck": {
+      const arg = String(parsed.arg || "").trim().toLowerCase();
+      const forceAlert = /\b(force|alert)\b/.test(arg);
+      const rawMode = /\b(raw|legacy)\b/.test(arg);
+      if (rawMode) {
+        await runWorldMonitorMonitorCycle({
+          source: "manual",
+          allowWhenDisabled: true,
+          forceAlert,
+          replyChatId: chatId,
+        });
+      } else {
+        void runWorldMonitorComprehensiveCheck({
+          chatId,
+          forceAlert,
+          announceStart: true,
+          announceQueued: WORLDMONITOR_CHECK_ANNOUNCE_QUEUED,
+        }).catch((err) => {
+          log(`worldmonitor comprehensive check failed: ${redactError(err?.message || err)}`);
+        });
+      }
+      return true;
+    }
     case "/cancel":
     case "/stop":
       await cancelCurrent(chatId);
@@ -7170,6 +11650,7 @@ async function enqueuePrompt(chatId, inputText, source, options = {}) {
     setActiveWorkerForChat(chatId, lane.id);
   }
   touchWorker(lane.id);
+  const laneWorkdir = refreshLaneWorkdir(lane, { logPrefix: "[enqueue]" });
 
   const resumeSessionId = Object.prototype.hasOwnProperty.call(options || {}, "resumeSessionId")
     ? String(options.resumeSessionId || "").trim()
@@ -7209,7 +11690,7 @@ async function enqueuePrompt(chatId, inputText, source, options = {}) {
     recentHistoryContext: options?.recentHistoryContext && typeof options.recentHistoryContext === "object"
       ? { ...options.recentHistoryContext }
       : null,
-    workdir: lane.workdir,
+    workdir: laneWorkdir,
     taskId: Number.isFinite(taskId) && taskId > 0 ? Math.trunc(taskId) : 0,
     splitGroupId: String(options?.splitGroupId || "").trim(),
     replyToMessageId: Number(options?.replyToMessageId || 0),
@@ -7550,6 +12031,101 @@ function makeSpeakableTextForTts(text) {
   // Collapse whitespace.
   out = out.replace(/\s+/g, " ").trim();
   return out;
+}
+
+function makeWorldMonitorTextTtsFriendly(text) {
+  let out = String(text || "").trim();
+  if (!out) return "";
+
+  // Make section markers read naturally.
+  out = out.replace(/\bALERT_LEVEL\s*:\s*/gi, "Alert level ");
+  out = out.replace(/\bSUMMARY\s*:\s*/gi, "Summary ");
+  out = out.replace(/\bIMPLICATIONS\s*:\s*/gi, "Implications ");
+  out = out.replace(/\bWATCHLIST\s*:\s*/gi, "Watch list ");
+
+  // Expand common abbreviations for clearer speech.
+  out = out.replace(/\bUS\b/g, "United States");
+  out = out.replace(/\bUK\b/g, "United Kingdom");
+  out = out.replace(/\bEU\b/g, "European Union");
+  out = out.replace(/\bUN\b/g, "United Nations");
+  out = out.replace(/\bUAE\b/g, "United Arab Emirates");
+  out = out.replace(/\bPRC\b/g, "China");
+  out = out.replace(/\bDPRK\b/g, "North Korea");
+
+  // Replace compact country-score tokens like "UA:59" or "UA 59".
+  out = out.replace(/\b([A-Z]{2})\s*:\s*(\d{1,3})(?!\d)/g, (m, code, scoreRaw) => {
+    const score = Number(scoreRaw);
+    if (!Number.isFinite(score) || score < 0 || score > 100) return m;
+    const name = resolveWorldMonitorRegionName(code);
+    const c = String(code || "").trim().toUpperCase();
+    if (!name || String(name).trim().toUpperCase() === c) return m;
+    return `${name} score ${scoreRaw}`;
+  });
+  out = out.replace(/\b([A-Z]{2})\s+(\d{1,3})(?!\d)/g, (m, code, scoreRaw) => {
+    const score = Number(scoreRaw);
+    if (!Number.isFinite(score) || score < 0 || score > 100) return m;
+    const name = resolveWorldMonitorRegionName(code);
+    const c = String(code || "").trim().toUpperCase();
+    if (!name || String(name).trim().toUpperCase() === c) return m;
+    return `${name} score ${scoreRaw}`;
+  });
+
+  out = out.replace(/\s+/g, " ").trim();
+  return out;
+}
+
+function makeWorldMonitorCheckVoiceSummary(text) {
+  const src = String(text || "").trim();
+  if (!src) return "";
+
+  const cleanBullet = (line) => oneLine(String(line || "")
+    .replace(/^\s*(?:[-*•]|\d+[.)])\s*/, "")
+    .replace(/[*_`]/g, "")
+    .trim());
+  const lines = src
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const sectionFirstBullet = (sectionName) => {
+    let inSection = false;
+    for (const line of lines) {
+      if (/^[A-Z_ ]+:\s*$/i.test(line)) {
+        inSection = new RegExp(`^${sectionName}\\s*:\\s*$`, "i").test(line);
+        continue;
+      }
+      if (!inSection) continue;
+      if (/^\s*(?:[-*•]|\d+[.)])\s+/.test(line)) {
+        const cleaned = cleanBullet(line);
+        if (cleaned) return cleaned;
+      }
+    }
+    return "";
+  };
+
+  const headline = sectionFirstBullet("HEADLINE");
+  const global = sectionFirstBullet("GLOBAL");
+  const taiwan = sectionFirstBullet("TAIWAN");
+  const watch = sectionFirstBullet("WATCH_24H");
+  const confidenceMatch = src.match(/\bCONFIDENCE\s*:\s*(low|medium|high)\b/i);
+  const confidence = confidenceMatch ? String(confidenceMatch[1] || "").toLowerCase() : "";
+
+  const parts = [];
+  if (headline) parts.push(headline);
+  if (global) parts.push(`Global: ${global}.`);
+  if (taiwan) parts.push(`Taiwan: ${taiwan}.`);
+  if (watch) parts.push(`Watch next 24 hours: ${watch}.`);
+  if (confidence) parts.push(`Confidence ${confidence}.`);
+
+  let summary = parts.join(" ").replace(/\s+/g, " ").trim();
+  if (!summary) {
+    summary = oneLine(src.replace(/[*_`]/g, "")).replace(/\s+/g, " ").trim();
+  }
+  const maxChars = Math.max(120, Number(WORLDMONITOR_CHECK_VOICE_MAX_CHARS || 340) || 340);
+  if (summary.length > maxChars) {
+    summary = `${summary.slice(0, Math.max(1, maxChars - 3)).trim()}...`;
+  }
+  return summary;
 }
 
 function splitTextByMaxChars(text, maxChars) {
@@ -9839,6 +14415,12 @@ async function runCodexJob(job) {
       text: `Failed to prepare AIDOLON execution: ${err.message || err}`,
     };
     }
+  const requestedCwd = String(spec?.cwd || "").trim();
+  const safeCwd = resolveUsableWorkdir(requestedCwd);
+  if (requestedCwd !== safeCwd) {
+    log(`[run] worker cwd unavailable: ${requestedCwd || "(empty)"}; using ${safeCwd}.`);
+  }
+  spec.cwd = safeCwd;
  
     return await new Promise((resolve) => {
       let done = false;
@@ -10055,18 +14637,42 @@ async function processLane(laneId) {
         result?.ok &&
           job?.kind !== "tts" &&
           job?.kind !== "tts-batch" &&
-          String(job?.source || "") === "voice" &&
-          TTS_REPLY_TO_VOICE &&
+          (
+            (String(job?.source || "") === "voice" && TTS_REPLY_TO_VOICE) ||
+            (String(job?.source || "") === "worldmonitor-monitor" && WORLDMONITOR_ALERT_VOICE_ENABLED) ||
+            (String(job?.source || "") === "worldmonitor-check" && WORLDMONITOR_CHECK_VOICE_ENABLED)
+          ) &&
           TTS_ENABLED &&
           String(result?.text || "").trim(),
       );
 
+      const isWorldMonitorAlertJob = String(job?.source || "") === "worldmonitor-monitor";
+      const isWorldMonitorCheckJob = String(job?.source || "") === "worldmonitor-check";
       let voiceQueued = false;
       let voiceReplyReadyText = "";
       if (shouldVoiceReply) {
         try {
-          const parts = splitVoiceReplyParts(String(result.text || ""));
-          const spoken = makeSpeakableTextForTts(parts.spoken || String(result.text || ""));
+          let voiceInput = String(result.text || "");
+          if (isWorldMonitorCheckJob) {
+            voiceInput = makeWorldMonitorCheckVoiceSummary(voiceInput);
+          }
+          if (isWorldMonitorAlertJob && Number(WORLDMONITOR_ALERT_VOICE_MAX_CHARS) > 0) {
+            const maxChars = Number(WORLDMONITOR_ALERT_VOICE_MAX_CHARS);
+            if (voiceInput.length > maxChars) {
+              voiceInput = `${voiceInput.slice(0, Math.max(1, maxChars - 3)).trim()}...`;
+            }
+          }
+          if (isWorldMonitorCheckJob && Number(WORLDMONITOR_CHECK_VOICE_MAX_CHARS) > 0) {
+            const maxChars = Number(WORLDMONITOR_CHECK_VOICE_MAX_CHARS);
+            if (voiceInput.length > maxChars) {
+              voiceInput = `${voiceInput.slice(0, Math.max(1, maxChars - 3)).trim()}...`;
+            }
+          }
+          const parts = splitVoiceReplyParts(voiceInput);
+          const spokenRaw = makeSpeakableTextForTts(parts.spoken || voiceInput);
+          const spoken = (isWorldMonitorAlertJob || isWorldMonitorCheckJob)
+            ? makeWorldMonitorTextTtsFriendly(spokenRaw)
+            : spokenRaw;
           const { chunks: spokenChunks, overflowText } = splitSpeakableTextIntoVoiceChunks(spoken);
           const modelTextOnly = String(parts.textOnly || "").trim();
           const preferredTextOnly = hasForcedTextOnly ? forcedTextOnly : modelTextOnly;
@@ -10112,7 +14718,10 @@ async function processLane(laneId) {
         }
       }
 
-      const shouldSuppressResultTextForQueuedVoice = shouldVoiceReply && voiceQueued;
+      const shouldSuppressResultTextForQueuedVoice = shouldVoiceReply
+        && voiceQueued
+        && !isWorldMonitorAlertJob
+        && !isWorldMonitorCheckJob;
       const shouldSendForcedTextOnly = hasForcedTextOnly && !shouldVoiceReply;
       if (!result || (result.skipSendMessage !== true && !shouldSuppressResultTextForQueuedVoice)) {
         try {
@@ -11403,6 +16012,8 @@ async function shutdown(code = 0, reason = "") {
     }
     stopTtsKeepalive("Bot shutdown.", { allowAutoRestart: false });
     stopWhisperKeepalive("Bot shutdown.", { allowAutoRestart: false });
+    stopWorldMonitorMonitorLoop();
+    stopWorldMonitorFeedAlertsLoop();
   } catch {
     // best effort
   }
@@ -11439,7 +16050,7 @@ process.on("unhandledRejection", (err) => {
     if (LAUNCH_PREV_EXIT_CODE) launchParts.push(`previous_exit_code=${LAUNCH_PREV_EXIT_CODE}`);
     logSystemEvent(launchParts.join(" "), "startup");
 
-    const me = await telegramApi("getMe");
+    const me = await getTelegramIdentityWithRetry();
     log(`Connected as @${me.username || me.id}`);
     log(
       `AIDOLON execution mode: ${codexMode.mode} (${codexMode.mode === "wsl" ? `wsl.exe -e bash -lic <${codexMode.codexPath}>` : `${codexMode.bin}${codexMode.shell ? " via shell" : ""}`})`,
@@ -11495,9 +16106,36 @@ process.on("unhandledRejection", (err) => {
     log(
       `Chat logging: terminal=${CHAT_LOG_TO_TERMINAL} file=${CHAT_LOG_TO_FILE} max_chars=${CHAT_LOG_MAX_CHARS} file_path=${CHAT_LOG_PATH}`,
     );
+    if (WORLDMONITOR_MONITOR_ENABLED) {
+      const configuredWorkdir = String(WORLDMONITOR_WORKDIR || "").trim();
+      if (configuredWorkdir && !fs.existsSync(configuredWorkdir)) {
+        log(`WorldMonitor monitor workdir does not exist: ${configuredWorkdir} (will use general worker fallback).`);
+      }
+      const feeds = loadWorldMonitorNativeFeedManifest();
+      log(
+        `WorldMonitor monitor enabled (source=native, feeds=${feeds.length}, manifest=${WORLDMONITOR_NATIVE_FEEDS_PATH}, interval=${WORLDMONITOR_MONITOR_INTERVAL_SEC}s, cooldown=${WORLDMONITOR_ALERT_COOLDOWN_SEC}s).`,
+      );
+      if (WORLDMONITOR_FEED_ALERTS_ENABLED) {
+        log(
+          `WorldMonitor feed-alert relay enabled (engine=native, interval=${WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC}s, max_per_cycle=${WORLDMONITOR_FEED_ALERTS_MAX_PER_CYCLE}, min_level=${WORLDMONITOR_FEED_ALERTS_MIN_LEVEL}, taiwan_wellbeing_filter=${WORLDMONITOR_FEED_ALERTS_REQUIRE_TAIWAN_WELLBEING}, max_article_age_h=${WORLDMONITOR_FEED_ALERTS_MAX_ARTICLE_AGE_HOURS}, skip_aggregators=${WORLDMONITOR_FEED_ALERTS_SKIP_AGGREGATOR_LINKS}, skip_documents=${WORLDMONITOR_FEED_ALERTS_SKIP_DOCUMENT_LINKS}, require_context_quality=${WORLDMONITOR_FEED_ALERTS_REQUIRE_CONTEXT_QUALITY}).`,
+        );
+      } else {
+        log("WorldMonitor feed-alert relay disabled (WORLDMONITOR_FEED_ALERTS_ENABLED=0).");
+      }
+      log(
+        `WorldMonitor native signals enabled (timeout=${WORLDMONITOR_NATIVE_SIGNAL_TIMEOUT_MS}ms, refresh=${WORLDMONITOR_NATIVE_SIGNALS_REFRESH_MIN_INTERVAL_SEC}s, seismic_refresh=${WORLDMONITOR_NATIVE_SEISMIC_REFRESH_MIN_INTERVAL_SEC}s, adsb_refresh=${WORLDMONITOR_NATIVE_ADSB_REFRESH_MIN_INTERVAL_SEC}s, disaster_refresh=${WORLDMONITOR_NATIVE_DISASTER_REFRESH_MIN_INTERVAL_SEC}s, maritime_refresh=${WORLDMONITOR_NATIVE_MARITIME_REFRESH_MIN_INTERVAL_SEC}s, service_refresh=${WORLDMONITOR_NATIVE_SERVICE_REFRESH_MIN_INTERVAL_SEC}s, macro_refresh=${WORLDMONITOR_NATIVE_MACRO_REFRESH_MIN_INTERVAL_SEC}s, prediction_refresh=${WORLDMONITOR_NATIVE_PREDICTION_REFRESH_MIN_INTERVAL_SEC}s, retention_days=${WORLDMONITOR_NATIVE_SIGNALS_MAX_AGE_DAYS}).`,
+      );
+      log(
+        `WorldMonitor article-context deep ingest ${WORLDMONITOR_DEEP_INGEST_ENABLED ? "enabled" : "disabled"} (timeout=${WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS}ms, concurrency=${WORLDMONITOR_DEEP_INGEST_CONCURRENCY}, max_per_cycle=${WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE}, lookback_hours=${WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS}, summary_words=${WORLDMONITOR_DEEP_INGEST_SUMMARY_MAX_WORDS}).`,
+      );
+    } else {
+      log("WorldMonitor monitor disabled (WORLDMONITOR_MONITOR_ENABLED=0).");
+    }
 
     await prewarmAudioKeepalives();
     await skipStaleUpdates();
+    startWorldMonitorMonitorLoop();
+    startWorldMonitorFeedAlertsLoop();
 
     if (STARTUP_MESSAGE) {
       await sendMessage(PRIMARY_CHAT_ID, `${fmtBold("AIDOLON")} online. Use /help.`);
