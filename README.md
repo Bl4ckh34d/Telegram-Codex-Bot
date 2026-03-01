@@ -65,7 +65,7 @@ Basics:
 - `/help` - help text
 - `/status` - worker + queue status
 - `/wmstatus` - WorldMonitor monitor status + last alert snapshot
-- `/wmcheck [force]` - run a WorldMonitor risk check immediately
+- `/news [force|raw]` - run a WorldMonitor risk check immediately
 - `/cancel` - stop active run(s) for this chat
 - `/restart` - restart the bot process
 
@@ -208,7 +208,7 @@ Most-used toggles:
 - `WORLDMONITOR_FEED_ALERTS_MIN_LEVEL` - minimum feed alert severity to forward (`critical` by default)
 - `WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC` - feed alert relay cadence
 - `WORLDMONITOR_FEED_ALERTS_MAX_PER_CYCLE`, `WORLDMONITOR_FEED_ALERTS_CHAT_ID`, `WORLDMONITOR_FEED_ALERTS_MAX_ARTICLE_AGE_HOURS`, `WORLDMONITOR_FEED_ALERTS_SENT_KEY_CAP` - throughput, destination, freshness window, and dedupe memory controls
-- `WORLDMONITOR_CHECK_LOOKBACK_HOURS`, `WORLDMONITOR_CHECK_MAX_HEADLINES`, `WORLDMONITOR_CHECK_TAIWAN_COUNTRY_CODE` - `/wmcheck` comprehensive report scope (global + Taiwan)
+- `WORLDMONITOR_CHECK_LOOKBACK_HOURS`, `WORLDMONITOR_CHECK_MAX_HEADLINES`, `WORLDMONITOR_CHECK_TAIWAN_COUNTRY_CODE` - `/news` comprehensive report scope (global + Taiwan)
 
 Prompts:
 - `codex_prompt.txt` - normal text mode

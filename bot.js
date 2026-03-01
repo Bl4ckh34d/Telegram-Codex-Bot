@@ -341,21 +341,6 @@ function previewForLog(text, maxChars) {
   return `${normalized.slice(0, lim)}...`;
 }
 
-const NATURAL_NEWS_WORD_TO_DAYS = Object.freeze({
-  one: 1,
-  two: 2,
-  three: 3,
-  four: 4,
-  five: 5,
-  six: 6,
-  seven: 7,
-  eight: 8,
-  nine: 9,
-  ten: 10,
-  couple: 2,
-  few: 3,
-});
-
 const NATURAL_COMMAND_ALIASES = Object.freeze({
   help: "/help",
   start: "/start",
@@ -394,7 +379,6 @@ const NATURAL_COMMAND_ALIASES = Object.freeze({
   wipe: "/wipe",
   restart: "/restart",
   wmstatus: "/wmstatus",
-  wmcheck: "/wmcheck",
 });
 
 const NATURAL_NO_ARG_COMMANDS = new Set([
@@ -458,7 +442,6 @@ const NATURAL_DIRECT_COMMANDS = new Set([
   "/wipe",
   "/restart",
   "/wmstatus",
-  "/wmcheck",
 ]);
 
 function senderLabel(msg) {
@@ -800,6 +783,16 @@ const CODEX_MODEL = String(process.env.CODEX_MODEL || "gpt-5.3-codex").trim();
 const CODEX_MODEL_CHOICES = parseList(process.env.CODEX_MODEL_CHOICES || "");
 const CODEX_REASONING_EFFORT = String(process.env.CODEX_REASONING_EFFORT || "xhigh").trim();
 const CODEX_REASONING_EFFORT_CHOICES = parseList(process.env.CODEX_REASONING_EFFORT_CHOICES || "");
+const CODEX_DEFAULT_MODEL_CHOICES = Object.freeze([
+  "gpt-5.3-codex",
+  "gpt-5.2-codex",
+  "gpt-5.1-codex",
+]);
+const CODEX_REASONING_EFFORTS_BY_MODEL = Object.freeze({
+  "gpt-5.3-codex": ["low", "medium", "high", "xhigh"],
+  "gpt-5.2-codex": ["low", "medium", "high"],
+  "gpt-5.1-codex": ["low", "medium", "high"],
+});
 const CODEX_STREAM_OUTPUT_TO_TERMINAL = toBool(process.env.CODEX_STREAM_OUTPUT_TO_TERMINAL, true);
 const CODEX_PROFILE = String(process.env.CODEX_PROFILE || "").trim();
 const CODEX_DANGEROUS_FULL_ACCESS = toBool(process.env.CODEX_DANGEROUS_FULL_ACCESS, true);
@@ -5258,9 +5251,8 @@ function getTelegramCommandList() {
     { command: "spawn", description: "create a repo workspace" },
     { command: "retire", description: "remove a workspace" },
     { command: "queue", description: "show queued prompts" },
-    { command: "news", description: "voice digest from Reddit top posts" },
+    { command: "news", description: "worldmonitor global+taiwan AI check" },
     { command: "wmstatus", description: "worldmonitor monitor status" },
-    { command: "wmcheck", description: "worldmonitor global+taiwan AI check" },
     { command: "codex", description: "show codex command menu" },
     { command: "commands", description: "show codex command menu" },
     { command: "cmd", description: "stage a raw codex CLI command" },
@@ -5902,8 +5894,6 @@ function parseNaturalCommand(text) {
     const politeArg = arg.replace(/[.!?]+$/g, "").trim().toLowerCase();
     if (/^(?:please|pls|now|today|latest)$/.test(politeArg)) {
       arg = "";
-    } else if (/^(?:reset|clear)(?:\s+please)?$/.test(politeArg)) {
-      arg = "reset";
     } else if (arg) {
       const parsedNewsArg = parseNaturalNewsArgFromText(arg, { allowBareValue: true });
       if (parsedNewsArg.ok) {
@@ -5911,6 +5901,8 @@ function parseNaturalCommand(text) {
       } else if (!prefixMode) {
         // Don't hijack regular conversation that happens to begin with "news".
         return null;
+      } else {
+        arg = "";
       }
     }
   }
@@ -5957,11 +5949,11 @@ const BACKGROUND_LOCAL_COMMANDS = new Set([
   "/status",
   "/workers",
   "/queue",
+  "/news",
   "/screenshot",
   "/sendfile",
   "/model",
   "/wmstatus",
-  "/wmcheck",
   "/imgclear",
   "/wipe",
 ]);
@@ -6019,10 +6011,9 @@ async function sendHelp(chatId) {
     "- /workers - list workspaces/workers",
     "- /use <worker_id, name, or title> - switch active workspace",
     "- /queue - show queued prompts",
-    "- /news [days|reset] - Reddit top-post digest with missed-day catch-up",
-    "- Say \"give me the news\" - bot asks for day count then runs /news",
+    "- /news [force|raw] - WorldMonitor AI check (global + Taiwan)",
+    "- Say \"give me the news\" - runs the same WorldMonitor check flow",
     "- /wmstatus - show WorldMonitor monitor state and last alerts",
-    "- /wmcheck [force|raw] - comprehensive WorldMonitor AI check (global + Taiwan)",
     "- /cancel - stop current AIDOLON run",
     "- /clear - clear queued prompts",
     "- /wipe - wipe runtime files and reset this chat context",
@@ -6061,25 +6052,17 @@ async function sendHelp(chatId) {
 
 function parseNewsCommandArg(argText) {
   const raw = String(argText || "").trim().toLowerCase();
-  if (!raw) {
-    return { ok: true, mode: "auto", forcedDays: 0 };
-  }
-  if (["reset", "clear", "off", "new"].includes(raw)) {
-    return { ok: true, mode: "reset", forcedDays: 0 };
-  }
-  if (/^\d+$/.test(raw)) {
-    const n = Math.trunc(Number(raw) || 0);
-    if (n > 0) {
-      return {
-        ok: true,
-        mode: "manual",
-        forcedDays: Math.max(1, Math.min(n, REDDIT_DIGEST_MAX_DAYS)),
-      };
-    }
-  }
+  const forceAlert = /\b(?:force|alert)\b/.test(raw);
+  const rawMode = /\b(?:raw|legacy)\b/.test(raw);
+  const argNormalized = [
+    forceAlert ? "force" : "",
+    rawMode ? "raw" : "",
+  ].filter(Boolean).join(" ");
   return {
-    ok: false,
-    error: `Usage: /news [1-${REDDIT_DIGEST_MAX_DAYS}] | /news reset`,
+    ok: true,
+    forceAlert,
+    rawMode,
+    argText: argNormalized,
   };
 }
 
@@ -6112,48 +6095,21 @@ function parseNaturalNewsArgFromText(input, { allowBareValue = false } = {}) {
   const text = String(input || "").trim().toLowerCase();
   if (!text) return { ok: false, argText: "" };
 
-  if (/\b(?:auto|catch[- ]?up|default)\b/.test(text)) {
-    return { ok: true, argText: "", mode: "auto" };
-  }
-  if (allowBareValue && /^(?:reset|clear)$/.test(text)) {
-    return { ok: true, argText: "reset", mode: "reset" };
-  }
-  if (/\b(?:reset|clear)\b/.test(text) && /\b(?:news|headlines|digest|cursor|catch[- ]?up)\b/.test(text)) {
-    return { ok: true, argText: "reset", mode: "reset" };
+  const forceAlert = /\b(?:force|alert)\b/.test(text);
+  const rawMode = /\b(?:raw|legacy)\b/.test(text);
+  const newsNowHint = /\b(?:latest|today|now|right\s+now|auto|default|catch[- ]?up)\b/.test(text);
+
+  if (forceAlert || rawMode || newsNowHint) {
+    const argText = [
+      forceAlert ? "force" : "",
+      rawMode ? "raw" : "",
+    ].filter(Boolean).join(" ");
+    return { ok: true, argText };
   }
 
-  if (/\b(?:today|yesterday|now|right\s+now)\b/.test(text)) {
-    return { ok: true, argText: "1", mode: "manual" };
-  }
-  if (/\b(?:this|last|past)\s+week\b/.test(text)) {
-    return { ok: true, argText: "7", mode: "manual" };
-  }
-
-  const dayNumber = text.match(/\b(?:for|last|past|previous|about|around|in|over)?\s*(\d{1,3})\s*(?:day|days|d)\b/);
-  if (dayNumber) {
-    return { ok: true, argText: String(dayNumber[1] || "").trim(), mode: "manual" };
-  }
-
-  const dayWord = text.match(/\b(one|two|three|four|five|six|seven|eight|nine|ten|couple|few)\s*(?:day|days)\b/);
-  if (dayWord) {
-    const n = Number(NATURAL_NEWS_WORD_TO_DAYS[dayWord[1]]);
-    if (Number.isFinite(n) && n > 0) {
-      return { ok: true, argText: String(n), mode: "manual" };
-    }
-  }
-
-  if (allowBareValue) {
-    const bareNumber = text.match(/^\d{1,3}$/);
-    if (bareNumber) {
-      return { ok: true, argText: String(bareNumber[0] || "").trim(), mode: "manual" };
-    }
-    const bareWord = text.match(/^(one|two|three|four|five|six|seven|eight|nine|ten|couple|few)$/);
-    if (bareWord) {
-      const n = Number(NATURAL_NEWS_WORD_TO_DAYS[bareWord[1]]);
-      if (Number.isFinite(n) && n > 0) {
-        return { ok: true, argText: String(n), mode: "manual" };
-      }
-    }
+  if (allowBareValue && /^(?:force|alert|raw|legacy)$/.test(text)) {
+    const argText = /^(?:force|alert)$/.test(text) ? "force" : "raw";
+    return { ok: true, argText };
   }
 
   return { ok: false, argText: "" };
@@ -6216,10 +6172,7 @@ function parseNaturalNewsRequest(text) {
     return { matched: false, needsDays: false, argText: "" };
   }
   const parsedArg = parseNaturalNewsArgFromText(raw, { allowBareValue: false });
-  if (parsedArg.ok) {
-    return { matched: true, needsDays: false, argText: parsedArg.argText };
-  }
-  return { matched: true, needsDays: true, argText: "" };
+  return { matched: true, needsDays: false, argText: parsedArg.ok ? parsedArg.argText : "" };
 }
 
 function isLikelyNaturalNewsFollowupText(text) {
@@ -6228,13 +6181,10 @@ function isLikelyNaturalNewsFollowupText(text) {
   const normalized = lower.replace(/[.!?]+$/g, "").trim();
   if (!normalized) return false;
 
-  if (/^\d{1,3}$/.test(normalized)) return true;
-  if (/^\d{1,3}\s*(?:day|days|d)$/.test(normalized)) return true;
-  if (/^(one|two|three|four|five|six|seven|eight|nine|ten|couple|few)$/.test(normalized)) return true;
-  if (/^(one|two|three|four|five|six|seven|eight|nine|ten|couple|few)\s*(?:day|days)$/.test(normalized)) return true;
-  if (/^(?:for|last|past|previous|about|around|in|over)\s+\d{1,3}\s*(?:day|days|d)$/.test(normalized)) return true;
-  if (/^(?:for|last|past|previous|about|around|in|over)\s+(?:one|two|three|four|five|six|seven|eight|nine|ten|couple|few)\s*(?:day|days)$/.test(normalized)) return true;
-  return /^(?:auto|catch[- ]?up|default|today|yesterday|now|right now|this week|last week|past week|reset|clear|cancel|stop|never ?mind|forget it)(?:\s+please)?$/.test(normalized);
+  if (/^(?:force|alert|raw|legacy)$/.test(normalized)) return true;
+  if (/^(?:force|alert)\s+(?:raw|legacy)$/.test(normalized)) return true;
+  if (/^(?:raw|legacy)\s+(?:force|alert)$/.test(normalized)) return true;
+  return /^(?:latest|today|now|right now|auto|default|catch[- ]?up|cancel|stop|never ?mind|forget it)(?:\s+please)?$/.test(normalized);
 }
 
 async function maybeHandlePendingNaturalNewsFollowup(chatId, text, { replyToMessageId = 0 } = {}) {
@@ -6267,9 +6217,10 @@ async function maybeHandlePendingNaturalNewsFollowup(chatId, text, { replyToMess
     return true;
   }
 
+  clearPendingNaturalNewsFollowup(chatId);
   await sendMessage(
     chatId,
-    `I need a day count. Reply with 1-${REDDIT_DIGEST_MAX_DAYS}, or say "auto catch-up".`,
+    "I run WorldMonitor checks for news now. Use /news, /news force, or /news raw.",
     { replyToMessageId },
   );
   return true;
@@ -6284,16 +6235,6 @@ async function maybeHandleNaturalNewsRequest(chatId, text, { replyToMessageId = 
   if (!request.matched) return false;
 
   clearPendingNaturalNewsFollowup(chatId);
-  if (request.needsDays) {
-    setPendingNaturalNewsFollowup(chatId);
-    await sendMessage(
-      chatId,
-      `How many days of news do you want? Reply with 1-${REDDIT_DIGEST_MAX_DAYS}, or say "auto catch-up".`,
-      { replyToMessageId },
-    );
-    return true;
-  }
-
   await handleNewsCommand(chatId, request.argText);
   return true;
 }
@@ -6449,117 +6390,33 @@ async function maybeHandleNaturalSafeCommandRequest(chatId, text) {
   return true;
 }
 
+async function runWorldMonitorCheckCommand(chatId, argText, options = {}) {
+  const parsed = parseNewsCommandArg(argText);
+  const forceAlert = parsed?.forceAlert === true;
+  const rawMode = parsed?.rawMode === true;
+  const announceStart = options?.announceStart !== false;
+  if (rawMode) {
+    await runWorldMonitorMonitorCycle({
+      source: "manual",
+      allowWhenDisabled: true,
+      forceAlert,
+      replyChatId: chatId,
+    });
+    return;
+  }
+  void runWorldMonitorComprehensiveCheck({
+    chatId,
+    forceAlert,
+    announceStart,
+    announceQueued: WORLDMONITOR_CHECK_ANNOUNCE_QUEUED,
+  }).catch((err) => {
+    log(`worldmonitor comprehensive check failed: ${redactError(err?.message || err)}`);
+  });
+}
+
 async function handleNewsCommand(chatId, argText) {
   clearPendingNaturalNewsFollowup(chatId);
-
-  if (!REDDIT_DIGEST_ENABLED) {
-    await sendMessage(chatId, "Reddit digest is disabled on this bot (REDDIT_DIGEST_ENABLED=0).");
-    return;
-  }
-
-  const parsed = parseNewsCommandArg(argText);
-  if (!parsed.ok) {
-    await sendMessage(chatId, parsed.error || "Usage: /news");
-    return;
-  }
-
-  if (parsed.mode === "reset") {
-    clearRedditDigestCursorForChat(chatId);
-    await sendMessage(chatId, "News catch-up cursor cleared. Next /news run will start from today.");
-    return;
-  }
-
-  const window = computeRedditDigestWindow(chatId, { forcedDays: parsed.forcedDays });
-  const targetDays = Array.isArray(window.days) ? window.days : [];
-  if (targetDays.length === 0) {
-    const cursor = getRedditDigestCursorForChat(chatId);
-      const last = cursor || window.today || "(unknown)";
-      await sendMessage(
-        chatId,
-        `You are already up to date through ${last} (local).\nUse /news 1 to force a fresh one-day digest.`,
-      );
-      return;
-    }
-
-  const topWindow = chooseRedditTopWindowForDays(targetDays);
-  const settled = await Promise.allSettled(
-    // Use a narrower top window for one-day digests so each subreddit can fill up to REDDIT_DIGEST_TOP_POSTS items.
-    // Weekly windows can under-fill "today" when older posts dominate the ranking.
-    REDDIT_DIGEST_SUBREDDITS.map(async (sub) => {
-      try {
-        const posts = await fetchTopPostsForSubreddit(sub, { topWindow });
-        return { subreddit: sub, posts };
-      } catch (err) {
-        const msg = String(err?.message || err || "").trim() || "unknown error";
-        throw new Error(`r/${sub}: ${msg}`);
-      }
-    }),
-  );
-
-  const postsBySubreddit = {};
-  const sourceErrors = [];
-  for (const item of settled) {
-    if (item.status === "fulfilled") {
-      const sub = String(item.value?.subreddit || "").trim();
-      if (!sub) continue;
-      postsBySubreddit[sub] = Array.isArray(item.value?.posts) ? item.value.posts : [];
-      continue;
-    }
-    const reason = String(item.reason?.message || item.reason || "").trim() || "unknown error";
-    sourceErrors.push(reason);
-  }
-
-  const buckets = buildRedditDigestBuckets({ postsBySubreddit, days: targetDays });
-  const totalPosts = countRedditDigestPosts(buckets);
-  if (totalPosts <= 0) {
-    const errText = sourceErrors.length > 0
-      ? `\n\nSource errors:\n- ${sourceErrors.join("\n- ")}`
-      : "";
-    await sendMessage(chatId, `No top posts found for the requested day window.${errText}`);
-    return;
-  }
-
-  if (window.capped) {
-    await sendMessage(
-      chatId,
-      `Catch-up is capped at ${REDDIT_DIGEST_MAX_DAYS} day(s). You missed ${window.missedDays} day(s), so I’m sending the most recent ${targetDays.length} day(s).`,
-    );
-  }
-
-  const prompt = buildRedditDigestPrompt({
-    buckets,
-    cappedBacklog: window.capped,
-    missedDays: window.missedDays,
-  });
-  const forcedTextOnly = buildRedditDigestTextOnlyFromBuckets(buckets);
-
-  const latestDay = String(targetDays[targetDays.length - 1] || "").trim();
-  const canAutoVoiceReply = TTS_ENABLED && TTS_REPLY_TO_VOICE;
-  const canAdvanceCursor = sourceErrors.length === 0;
-
-  await enqueuePrompt(chatId, prompt, canAutoVoiceReply ? "voice" : "reddit-news", {
-    replyStyle: "voice",
-    forcedTextOnly,
-    onSuccess: async () => {
-      if (canAdvanceCursor && latestDay) {
-        setRedditDigestCursorForChat(chatId, latestDay);
-      }
-    },
-  });
-
-  if (!canAutoVoiceReply) {
-    await sendMessage(
-      chatId,
-      "TTS voice auto-reply is disabled, so this digest will be delivered as text only.",
-    );
-  }
-
-  if (sourceErrors.length > 0) {
-    await sendMessage(
-      chatId,
-      `Some subreddit sources failed, so I did not advance the catch-up cursor.\n- ${sourceErrors.join("\n- ")}`,
-    );
-  }
+  await runWorldMonitorCheckCommand(chatId, argText, { announceStart: true });
 }
 
 async function fetchTextUrl(url, { headers = {}, timeoutMs = 0, signal } = {}) {
@@ -11186,6 +11043,7 @@ function getEffectiveModelChoices() {
     out.push(s);
   };
   add(CODEX_MODEL);
+  for (const m of CODEX_DEFAULT_MODEL_CHOICES) add(m);
   for (const m of CODEX_MODEL_CHOICES) add(m);
   return out.length > 0 ? out.slice(0, 12) : [];
 }
@@ -11207,10 +11065,48 @@ function getEffectiveReasoningChoices() {
   return out.slice(0, 8);
 }
 
-async function sendModelPicker(chatId) {
+function getEffectiveReasoningChoicesForModel(model) {
+  const cleanModel = String(model || "").trim().toLowerCase();
+  const modelSpecific = Array.isArray(CODEX_REASONING_EFFORTS_BY_MODEL[cleanModel])
+    ? CODEX_REASONING_EFFORTS_BY_MODEL[cleanModel]
+    : [];
+  const out = [];
+  const seen = new Set();
+  const add = (value) => {
+    const clean = String(value || "").trim().toLowerCase();
+    if (!clean || seen.has(clean)) return;
+    seen.add(clean);
+    out.push(clean);
+  };
+  for (const value of modelSpecific) add(value);
+  if (out.length <= 0) {
+    for (const value of getEffectiveReasoningChoices()) add(value);
+  }
+  return out.slice(0, 8);
+}
+
+function pickDefaultReasoningForModel(model) {
+  const choices = getEffectiveReasoningChoicesForModel(model);
+  const preferred = String(CODEX_REASONING_EFFORT || "").trim().toLowerCase();
+  if (preferred && choices.includes(preferred)) return preferred;
+  return choices[0] || preferred || "";
+}
+
+function normalizeReasoningForModel(model, reasoning) {
+  const choices = getEffectiveReasoningChoicesForModel(model);
+  const cleanReasoning = String(reasoning || "").trim().toLowerCase();
+  if (!cleanReasoning) return "";
+  return choices.includes(cleanReasoning) ? cleanReasoning : "";
+}
+
+function buildModelPickerPayload(chatId) {
   const prefs = getChatPrefs(chatId);
-  const effectiveModel = String(prefs.model || CODEX_MODEL || "").trim() || "(default)";
-  const effectiveReasoning = String(prefs.reasoning || CODEX_REASONING_EFFORT || "").trim() || "(default)";
+  const effectiveModel = String(prefs.model || CODEX_MODEL || "").trim() || CODEX_MODEL || "(default)";
+  const reasoningChoices = getEffectiveReasoningChoicesForModel(effectiveModel);
+  const effectiveReasoning = normalizeReasoningForModel(
+    effectiveModel,
+    String(prefs.reasoning || CODEX_REASONING_EFFORT || "").trim(),
+  ) || "(default)";
 
   const lines = [
     fmtBold("Model settings (this chat)"),
@@ -11232,7 +11128,6 @@ async function sendModelPicker(chatId) {
     keyboard.push(row);
   }
 
-  const reasoningChoices = getEffectiveReasoningChoices();
   for (let i = 0; i < reasoningChoices.length; i += 2) {
     const row = [];
     for (const r of reasoningChoices.slice(i, i + 2)) {
@@ -11246,9 +11141,44 @@ async function sendModelPicker(chatId) {
   const resetId = registerPrefButton(chatId, "reset", "reset");
   keyboard.push([{ text: "Reset to defaults", callback_data: `pref:${resetId}` }]);
 
-  await sendMessage(chatId, lines.join("\n"), {
+  return {
+    text: lines.join("\n"),
     replyMarkup: { inline_keyboard: keyboard },
+  };
+}
+
+async function sendModelPicker(chatId) {
+  const payload = buildModelPickerPayload(chatId);
+  await sendMessage(chatId, payload.text, {
+    replyMarkup: payload.replyMarkup,
   });
+}
+
+async function refreshModelPickerMessage(chatId, messageId) {
+  const msgId = Number(messageId || 0);
+  if (!Number.isFinite(msgId) || msgId <= 0) {
+    await sendModelPicker(chatId);
+    return;
+  }
+  const payload = buildModelPickerPayload(chatId);
+  const formatted = renderTelegramEntities(normalizeResponse(payload.text));
+  const body = {
+    chat_id: chatId,
+    message_id: msgId,
+    text: formatted.text,
+    disable_web_page_preview: true,
+    reply_markup: payload.replyMarkup,
+  };
+  if (formatted.entities) body.entities = formatted.entities;
+  try {
+    await telegramApi("editMessageText", { body });
+  } catch (err) {
+    const message = String(err?.message || err || "");
+    const status = parseTelegramStatusFromError(err);
+    if (status === 400 && /message is not modified/i.test(message)) return;
+    log(`edit model picker failed: ${redactError(message)}`);
+    await sendMessage(chatId, payload.text, { replyMarkup: payload.replyMarkup });
+  }
 }
 
 async function sendQueue(chatId) {
@@ -11859,29 +11789,6 @@ async function handleParsedCommand(chatId, parsed) {
     case "/wmstatus":
       await sendWorldMonitorStatus(chatId);
       return true;
-    case "/wmcheck": {
-      const arg = String(parsed.arg || "").trim().toLowerCase();
-      const forceAlert = /\b(force|alert)\b/.test(arg);
-      const rawMode = /\b(raw|legacy)\b/.test(arg);
-      if (rawMode) {
-        await runWorldMonitorMonitorCycle({
-          source: "manual",
-          allowWhenDisabled: true,
-          forceAlert,
-          replyChatId: chatId,
-        });
-      } else {
-        void runWorldMonitorComprehensiveCheck({
-          chatId,
-          forceAlert,
-          announceStart: true,
-          announceQueued: WORLDMONITOR_CHECK_ANNOUNCE_QUEUED,
-        }).catch((err) => {
-          log(`worldmonitor comprehensive check failed: ${redactError(err?.message || err)}`);
-        });
-      }
-      return true;
-    }
     case "/cancel":
     case "/stop":
       await cancelCurrent(chatId);
@@ -16186,26 +16093,43 @@ async function handleCallbackQuery(cb) {
   if (data.startsWith("pref:")) {
     const prefId = data.slice("pref:".length).trim();
     const entry = consumePrefButton(chatId, prefId);
+    const pickerMessageId = Number(cb?.message?.message_id || 0) || 0;
     if (!entry) {
       await answerCallbackQuery(id, "Expired");
       return;
     }
     if (entry.kind === "model") {
-      setChatPrefs(chatId, { model: entry.value });
+      const nextModel = String(entry.value || "").trim();
+      const prevPrefs = getChatPrefs(chatId);
+      const keptReasoning = normalizeReasoningForModel(nextModel, prevPrefs.reasoning);
+      const nextReasoning = keptReasoning || pickDefaultReasoningForModel(nextModel);
+      setChatPrefs(chatId, {
+        model: nextModel,
+        reasoning: nextReasoning,
+      });
       await answerCallbackQuery(id, "Model set");
-      await sendMessage(chatId, `Model set for this chat: ${String(entry.value || "").trim() || "(default)"}`);
+      await refreshModelPickerMessage(chatId, pickerMessageId);
       return;
     }
     if (entry.kind === "reasoning") {
-      setChatPrefs(chatId, { reasoning: entry.value });
+      const prefs = getChatPrefs(chatId);
+      const activeModel = String(prefs.model || CODEX_MODEL || "").trim();
+      const selectedReasoning = String(entry.value || "").trim().toLowerCase();
+      const normalized = normalizeReasoningForModel(activeModel, selectedReasoning);
+      if (!normalized) {
+        await answerCallbackQuery(id, "Not supported for selected model");
+        await refreshModelPickerMessage(chatId, pickerMessageId);
+        return;
+      }
+      setChatPrefs(chatId, { reasoning: normalized });
       await answerCallbackQuery(id, "Reasoning set");
-      await sendMessage(chatId, `Reasoning effort set for this chat: ${String(entry.value || "").trim() || "(default)"}`);
+      await refreshModelPickerMessage(chatId, pickerMessageId);
       return;
     }
     if (entry.kind === "reset") {
       clearChatPrefs(chatId);
       await answerCallbackQuery(id, "Reset");
-      await sendMessage(chatId, "Model preferences reset to defaults for this chat.");
+      await refreshModelPickerMessage(chatId, pickerMessageId);
       return;
     }
     await answerCallbackQuery(id, "OK");
