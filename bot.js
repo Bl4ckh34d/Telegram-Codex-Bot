@@ -1001,6 +1001,13 @@ const WORLDMONITOR_NATIVE_FEEDS_PATH = resolveMaybeRelativePath(
   process.env.WORLDMONITOR_NATIVE_FEEDS_PATH || path.join(ROOT, "worldmonitor_native_feeds.json"),
 );
 const WORLDMONITOR_MONITOR_INTERVAL_SEC = toInt(process.env.WORLDMONITOR_MONITOR_INTERVAL_SEC, 300, 30, 3600);
+const WORLDMONITOR_INTERVAL_ALERT_MODE = (() => {
+  const raw = String(process.env.WORLDMONITOR_INTERVAL_ALERT_MODE || "smart").trim().toLowerCase();
+  if (raw === "smart" || raw === "hybrid" || raw === "mixed") return "smart";
+  if (raw === "report" || raw === "summary") return "report";
+  if (raw === "off" || raw === "none" || raw === "disabled" || raw === "silent") return "off";
+  return "headlines";
+})();
 const WORLDMONITOR_STARTUP_DELAY_SEC = toInt(process.env.WORLDMONITOR_STARTUP_DELAY_SEC, 25, 0, 600);
 const WORLDMONITOR_NATIVE_FEED_TIMEOUT_MS = toTimeoutMs(process.env.WORLDMONITOR_NATIVE_FEED_TIMEOUT_MS, 9_000, 0, MAX_TIMEOUT_MS);
 const WORLDMONITOR_NATIVE_FEED_FETCH_CONCURRENCY = toInt(process.env.WORLDMONITOR_NATIVE_FEED_FETCH_CONCURRENCY, 10, 2, 40);
@@ -1037,6 +1044,31 @@ const WORLDMONITOR_ALERT_COOLDOWN_SEC = toInt(process.env.WORLDMONITOR_ALERT_COO
 const WORLDMONITOR_MIN_GLOBAL_RISK_SCORE = toInt(process.env.WORLDMONITOR_MIN_GLOBAL_RISK_SCORE, 60, 0, 100);
 const WORLDMONITOR_MIN_COUNTRY_RISK_SCORE = toInt(process.env.WORLDMONITOR_MIN_COUNTRY_RISK_SCORE, 75, 0, 100);
 const WORLDMONITOR_MIN_GLOBAL_DELTA = toInt(process.env.WORLDMONITOR_MIN_GLOBAL_DELTA, 12, 1, 100);
+const WORLDMONITOR_INTERVAL_REPORT_BASELINE_PER_DAY = toInt(
+  process.env.WORLDMONITOR_INTERVAL_REPORT_BASELINE_PER_DAY,
+  1,
+  0,
+  12,
+);
+const WORLDMONITOR_INTERVAL_REPORT_MAX_PER_DAY_RAW = Number(process.env.WORLDMONITOR_INTERVAL_REPORT_MAX_PER_DAY);
+// 0 means unlimited reports per day.
+const WORLDMONITOR_INTERVAL_REPORT_MAX_PER_DAY = Number.isFinite(WORLDMONITOR_INTERVAL_REPORT_MAX_PER_DAY_RAW)
+  ? Math.max(0, Math.trunc(WORLDMONITOR_INTERVAL_REPORT_MAX_PER_DAY_RAW))
+  : 0;
+const WORLDMONITOR_INTERVAL_REPORT_MIN_INTERVAL_SEC_RAW = Number(process.env.WORLDMONITOR_INTERVAL_REPORT_MIN_INTERVAL_SEC);
+// 0 disables spacing between interval reports.
+const WORLDMONITOR_INTERVAL_REPORT_MIN_INTERVAL_SEC = Number.isFinite(WORLDMONITOR_INTERVAL_REPORT_MIN_INTERVAL_SEC_RAW)
+  ? Math.max(0, Math.min(24 * 60 * 60, Math.trunc(WORLDMONITOR_INTERVAL_REPORT_MIN_INTERVAL_SEC_RAW)))
+  : 0;
+const WORLDMONITOR_INTERVAL_REPORT_SIGNIFICANT_DELTA = toInt(
+  process.env.WORLDMONITOR_INTERVAL_REPORT_SIGNIFICANT_DELTA,
+  WORLDMONITOR_MIN_GLOBAL_DELTA,
+  1,
+  100,
+);
+const WORLDMONITOR_INTERVAL_HEADLINES_MIN_LEVEL = String(
+  process.env.WORLDMONITOR_INTERVAL_HEADLINES_MIN_LEVEL || "critical",
+).trim().toLowerCase() || "critical";
 const WORLDMONITOR_TOP_COUNTRIES = toInt(process.env.WORLDMONITOR_TOP_COUNTRIES, 5, 1, 12);
 const WORLDMONITOR_ALERT_CHAT_ID = String(process.env.WORLDMONITOR_ALERT_CHAT_ID || PRIMARY_CHAT_ID).trim() || PRIMARY_CHAT_ID;
 const WORLDMONITOR_WORKDIR = resolveMaybeRelativePath(process.env.WORLDMONITOR_WORKDIR || "");
@@ -1045,7 +1077,8 @@ const WORLDMONITOR_SUMMARY_MODEL = String(process.env.WORLDMONITOR_SUMMARY_MODEL
 const WORLDMONITOR_SUMMARY_REASONING = String(process.env.WORLDMONITOR_SUMMARY_REASONING || "low").trim();
 const WORLDMONITOR_NOTIFY_ERRORS = toBool(process.env.WORLDMONITOR_NOTIFY_ERRORS, false);
 const WORLDMONITOR_ALERT_VOICE_ENABLED = toBool(process.env.WORLDMONITOR_ALERT_VOICE_ENABLED, true);
-const WORLDMONITOR_ALERT_VOICE_MAX_CHARS = toInt(process.env.WORLDMONITOR_ALERT_VOICE_MAX_CHARS, 480, 80, 4000);
+// 0 disables WorldMonitor alert pre-truncation before TTS chunking.
+const WORLDMONITOR_ALERT_VOICE_MAX_CHARS = toInt(process.env.WORLDMONITOR_ALERT_VOICE_MAX_CHARS, 0, 0, 4000);
 const WORLDMONITOR_FEED_ALERTS_ENABLED = toBool(process.env.WORLDMONITOR_FEED_ALERTS_ENABLED, true);
 const WORLDMONITOR_FEED_ALERTS_MIN_LEVEL = String(
   process.env.WORLDMONITOR_FEED_ALERTS_MIN_LEVEL || "critical",
@@ -1055,15 +1088,17 @@ const WORLDMONITOR_FEED_ALERTS_MAX_PER_CYCLE = toInt(process.env.WORLDMONITOR_FE
 const WORLDMONITOR_FEED_ALERTS_CHAT_ID = String(
   process.env.WORLDMONITOR_FEED_ALERTS_CHAT_ID || WORLDMONITOR_ALERT_CHAT_ID,
 ).trim() || WORLDMONITOR_ALERT_CHAT_ID;
-const WORLDMONITOR_FEED_ALERTS_REQUIRE_TAIWAN_WELLBEING = toBool(
-  process.env.WORLDMONITOR_FEED_ALERTS_REQUIRE_TAIWAN_WELLBEING,
-  true,
-);
 const WORLDMONITOR_FEED_ALERTS_MAX_ARTICLE_AGE_HOURS = toInt(
   process.env.WORLDMONITOR_FEED_ALERTS_MAX_ARTICLE_AGE_HOURS,
-  120,
+  6,
   6,
   24 * 30,
+);
+const WORLDMONITOR_FEED_ALERTS_SENT_KEY_CAP = toInt(
+  process.env.WORLDMONITOR_FEED_ALERTS_SENT_KEY_CAP,
+  5000,
+  500,
+  100000,
 );
 const WORLDMONITOR_FEED_ALERTS_SKIP_AGGREGATOR_LINKS = toBool(
   process.env.WORLDMONITOR_FEED_ALERTS_SKIP_AGGREGATOR_LINKS,
@@ -1077,14 +1112,28 @@ const WORLDMONITOR_FEED_ALERTS_REQUIRE_CONTEXT_QUALITY = toBool(
   process.env.WORLDMONITOR_FEED_ALERTS_REQUIRE_CONTEXT_QUALITY,
   true,
 );
-const WORLDMONITOR_CHECK_LOOKBACK_HOURS = toInt(process.env.WORLDMONITOR_CHECK_LOOKBACK_HOURS, 48, 6, 168);
+const WORLDMONITOR_CHECK_LOOKBACK_HOURS = toInt(process.env.WORLDMONITOR_CHECK_LOOKBACK_HOURS, 168, 6, 168);
 const WORLDMONITOR_CHECK_MAX_HEADLINES = toInt(process.env.WORLDMONITOR_CHECK_MAX_HEADLINES, 16, 4, 60);
+const WORLDMONITOR_STARTUP_CATCHUP_ENABLED = toBool(process.env.WORLDMONITOR_STARTUP_CATCHUP_ENABLED, true);
+const WORLDMONITOR_STARTUP_CATCHUP_ITEMS_PER_SOURCE = toInt(
+  process.env.WORLDMONITOR_STARTUP_CATCHUP_ITEMS_PER_SOURCE,
+  Math.max(WORLDMONITOR_NATIVE_FEED_ITEMS_PER_SOURCE, 72),
+  WORLDMONITOR_NATIVE_FEED_ITEMS_PER_SOURCE,
+  240,
+);
+const WORLDMONITOR_STARTUP_CATCHUP_MIN_LOOKBACK_HOURS = toInt(
+  process.env.WORLDMONITOR_STARTUP_CATCHUP_MIN_LOOKBACK_HOURS,
+  WORLDMONITOR_CHECK_LOOKBACK_HOURS,
+  6,
+  24 * 30,
+);
 const WORLDMONITOR_CHECK_TAIWAN_COUNTRY_CODE = String(
   process.env.WORLDMONITOR_CHECK_TAIWAN_COUNTRY_CODE || "TW",
 ).trim().toUpperCase() || "TW";
 const WORLDMONITOR_CHECK_ANNOUNCE_QUEUED = toBool(process.env.WORLDMONITOR_CHECK_ANNOUNCE_QUEUED, false);
 const WORLDMONITOR_CHECK_VOICE_ENABLED = toBool(process.env.WORLDMONITOR_CHECK_VOICE_ENABLED, true);
-const WORLDMONITOR_CHECK_VOICE_MAX_CHARS = toInt(process.env.WORLDMONITOR_CHECK_VOICE_MAX_CHARS, 340, 120, 1200);
+// 0 disables WorldMonitor check pre-truncation before TTS chunking.
+const WORLDMONITOR_CHECK_VOICE_MAX_CHARS = toInt(process.env.WORLDMONITOR_CHECK_VOICE_MAX_CHARS, 0, 0, 1200);
 const NATURAL_NEWS_FOLLOWUP_TTL_MS = 5 * 60 * 1000;
 const NATURAL_SAFE_COMMAND_INTENT_THRESHOLD_RAW = Number(process.env.NATURAL_SAFE_COMMAND_INTENT_THRESHOLD);
 const NATURAL_SAFE_COMMAND_INTENT_THRESHOLD = Number.isFinite(NATURAL_SAFE_COMMAND_INTENT_THRESHOLD_RAW)
@@ -1224,6 +1273,12 @@ const worldMonitorMonitor = {
   lastObservedGlobalScore: Number(worldMonitorMonitorRaw.lastObservedGlobalScore || 0) || 0,
   lastObservedFingerprint: String(worldMonitorMonitorRaw.lastObservedFingerprint || "").trim(),
   lastSnapshotSummary: String(worldMonitorMonitorRaw.lastSnapshotSummary || "").trim(),
+  intervalReportDayKey: isUtcDayKey(worldMonitorMonitorRaw.intervalReportDayKey)
+    ? String(worldMonitorMonitorRaw.intervalReportDayKey || "").trim()
+    : "",
+  intervalReportCount: Math.max(0, Number(worldMonitorMonitorRaw.intervalReportCount || 0) || 0),
+  intervalReportLastAt: Number(worldMonitorMonitorRaw.intervalReportLastAt || 0) || 0,
+  intervalReportLastReason: String(worldMonitorMonitorRaw.intervalReportLastReason || "").trim(),
   lastNotifiedErrorAt: Number(worldMonitorMonitorRaw.lastNotifiedErrorAt || 0) || 0,
   feedAlertsLastRunAt: Number(worldMonitorMonitorRaw.feedAlertsLastRunAt || 0) || 0,
   feedAlertsLastSeenAt: Number(worldMonitorMonitorRaw.feedAlertsLastSeenAt || 0) || 0,
@@ -1265,13 +1320,32 @@ const worldMonitorMonitor = {
     && typeof worldMonitorMonitorRaw.nativeDeepIngestLastStats === "object"
     ? { ...worldMonitorMonitorRaw.nativeDeepIngestLastStats }
     : {},
+  startupCatchupLastRunAt: Number(worldMonitorMonitorRaw.startupCatchupLastRunAt || 0) || 0,
+  startupCatchupLastErrorAt: Number(worldMonitorMonitorRaw.startupCatchupLastErrorAt || 0) || 0,
+  startupCatchupLastError: String(worldMonitorMonitorRaw.startupCatchupLastError || "").trim(),
+  startupCatchupLastStats: worldMonitorMonitorRaw.startupCatchupLastStats
+    && typeof worldMonitorMonitorRaw.startupCatchupLastStats === "object"
+    ? { ...worldMonitorMonitorRaw.startupCatchupLastStats }
+    : {},
 };
 const worldMonitorFeedAlertSentKeySet = new Set(worldMonitorMonitor.feedAlertsSentKeys);
 const worldMonitorFeedAlertSentTitleKeySet = new Set(worldMonitorMonitor.feedAlertsSentTitleKeys);
 const worldMonitorNativeStoreRaw = readJson(WORLDMONITOR_NATIVE_STORE_PATH, { version: 1, items: [] });
 const worldMonitorNativeNewsItems = Array.isArray(worldMonitorNativeStoreRaw?.items)
   ? worldMonitorNativeStoreRaw.items
-    .map((x) => (x && typeof x === "object" ? { ...x } : null))
+    .map((x) => {
+      if (!x || typeof x !== "object") return null;
+      const next = { ...x };
+      const source = String(next.threatLevelSource || "").trim().toLowerCase();
+      if (source !== "native-feed-metadata") {
+        next.threatLevel = "low";
+        next.threatLevelSource = "native-feed-metadata";
+        return next;
+      }
+      next.threatLevel = worldMonitorNormalizeNativeThreatLevel(next.threatLevel) || "low";
+      next.threatLevelSource = "native-feed-metadata";
+      return next;
+    })
     .filter(Boolean)
     .slice(-WORLDMONITOR_NATIVE_STORE_MAX_ITEMS)
   : [];
@@ -1382,7 +1456,7 @@ function rememberWorldMonitorFeedAlertKey(key) {
   const clean = String(key || "").trim();
   if (!clean) return;
   worldMonitorFeedAlertSentKeySet.add(clean);
-  while (worldMonitorFeedAlertSentKeySet.size > 1200) {
+  while (worldMonitorFeedAlertSentKeySet.size > WORLDMONITOR_FEED_ALERTS_SENT_KEY_CAP) {
     const oldest = worldMonitorFeedAlertSentKeySet.values().next().value;
     if (!oldest) break;
     worldMonitorFeedAlertSentKeySet.delete(oldest);
@@ -1394,7 +1468,7 @@ function rememberWorldMonitorFeedAlertTitleKey(key) {
   const clean = String(key || "").trim();
   if (!clean) return;
   worldMonitorFeedAlertSentTitleKeySet.add(clean);
-  while (worldMonitorFeedAlertSentTitleKeySet.size > 1200) {
+  while (worldMonitorFeedAlertSentTitleKeySet.size > WORLDMONITOR_FEED_ALERTS_SENT_KEY_CAP) {
     const oldest = worldMonitorFeedAlertSentTitleKeySet.values().next().value;
     if (!oldest) break;
     worldMonitorFeedAlertSentTitleKeySet.delete(oldest);
@@ -1573,6 +1647,7 @@ const worldMonitorNativeRuntime = {
   refreshPromise: null,
   signalsPromise: null,
   deepIngestPromise: null,
+  startupCatchupPromise: null,
 };
 let pendingRestartRequest = null; // { requestedAt, chatIds:Set<string> }
 let restartTriggerInFlight = false;
@@ -6530,62 +6605,20 @@ function formatRelativeAge(timestampMs) {
   return `${day}d ago`;
 }
 
-const WORLDMONITOR_ALERT_KEYWORDS = [
-  "war", "invasion", "military", "nuclear", "sanctions", "missile",
-  "airstrike", "drone strike", "troops deployed", "armed conflict", "bombing", "casualties",
-  "ceasefire", "peace treaty", "nato", "coup", "martial law",
-  "assassination", "terrorist", "terror attack", "cyber attack", "hostage", "evacuation order",
+const WORLDMONITOR_NATIVE_SEVERITY_DIRECT_TAGS = [
+  "severity",
+  "alert_level",
+  "alertlevel",
+  "threat_level",
+  "threatlevel",
+  "priority",
+  "urgency",
 ];
-const WORLDMONITOR_ALERT_EXCLUSIONS = [
-  "protein", "couples", "relationship", "dating", "diet", "fitness",
-  "recipe", "cooking", "shopping", "fashion", "celebrity", "movie",
-  "tv show", "sports", "game", "concert", "festival", "wedding",
-  "vacation", "travel tips", "life hack", "self-care", "wellness",
-];
-const WORLDMONITOR_CRITICAL_KEYWORDS = [
-  "invasion", "airstrike", "missile", "martial law", "coup",
-  "troops deployed", "armed conflict", "drone strike", "evacuation order",
-  "nuclear strike", "nuclear attack", "nuclear detonation", "nuclear weapon use",
-];
-const WORLDMONITOR_HIGH_KEYWORDS = [
-  "war", "military", "sanctions", "bombing", "casualties", "nuclear",
-  "terror attack", "hostage", "cyber attack", "ceasefire",
-];
+const WORLDMONITOR_NATIVE_SEVERITY_CATEGORY_TAGS = ["category", "subject", "label", "tag"];
+const WORLDMONITOR_NATIVE_SEVERITY_CATEGORY_ATTRS = ["term", "label", "name", "value", "severity", "priority"];
 const WORLDMONITOR_TAIWAN_KEYWORDS = [
   "taiwan", "taipei", "taiwan strait", "strait", "pla", "prc", "beijing", "china",
   "kinmen", "matsu", "penghu", "south china sea", "east china sea",
-];
-const WORLDMONITOR_TAIWAN_WELLBEING_GLOBAL_CRITICAL_KEYWORDS = [
-  "nuclear attack",
-  "nuclear strike",
-  "nuclear detonation",
-  "world war",
-  "icbm",
-  "ballistic missile",
-  "strait closure",
-  "south china sea blockade",
-  "major cyber attack",
-];
-const WORLDMONITOR_MAJOR_WORLD_EVENT_KEYWORDS = [
-  "iran",
-  "israel",
-  "russia",
-  "ukraine",
-  "china",
-  "united states",
-  "u.s.",
-  "taiwan strait",
-  "south china sea",
-  "east china sea",
-  "strait of hormuz",
-  "suez canal",
-  "nuclear",
-  "icbm",
-  "ballistic missile",
-  "global recession",
-  "oil shock",
-  "pandemic",
-  "ceasefire collapse",
 ];
 const WORLDMONITOR_COUNTRY_PATTERNS = Object.freeze([
   { code: "TW", patterns: ["taiwan", "taipei", "kinmen", "matsu", "penghu"] },
@@ -6663,20 +6696,48 @@ function normalizeWorldMonitorLink(rawUrl) {
   }
 }
 
-function worldMonitorThreatLevelForTitle(title) {
-  const lower = String(title || "").trim().toLowerCase();
-  if (!lower) return "low";
-  for (const ex of WORLDMONITOR_ALERT_EXCLUSIONS) {
-    if (ex && lower.includes(ex)) return "low";
+function worldMonitorNormalizeNativeThreatLevel(rawValue) {
+  const lower = oneLine(String(rawValue || "")).toLowerCase();
+  if (!lower) return "";
+  const clean = lower
+    .replace(/[_-]+/g, " ")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!clean) return "";
+
+  if (/\b(?:sev(?:erity)?\s*1|priority\s*1|p\s*1)\b/i.test(clean)) return "critical";
+  if (/\b(?:sev(?:erity)?\s*2|priority\s*2|p\s*2)\b/i.test(clean)) return "high";
+  if (/\b(?:sev(?:erity)?\s*3|priority\s*3|p\s*3)\b/i.test(clean)) return "medium";
+  if (/\b(?:sev(?:erity)?\s*4|priority\s*4|p\s*4)\b/i.test(clean)) return "low";
+
+  if (clean === "critical" || clean === "severe" || clean === "emergency") return "critical";
+  if (clean === "high" || clean === "major") return "high";
+  if (clean === "medium" || clean === "moderate") return "medium";
+  if (clean === "low" || clean === "minor" || clean === "info" || clean === "informational") return "low";
+
+  const hasLevelMarker = /\b(?:severity|priority|alert|threat|risk|urgency)\b/.test(clean);
+  if (hasLevelMarker && /\b(?:critical|severe|emergency)\b/.test(clean)) return "critical";
+  if (hasLevelMarker && /\b(?:high|major)\b/.test(clean)) return "high";
+  if (hasLevelMarker && /\b(?:medium|moderate)\b/.test(clean)) return "medium";
+  if (hasLevelMarker && /\b(?:low|minor|info|informational)\b/.test(clean)) return "low";
+  return "";
+}
+
+function worldMonitorThreatLevelForItem(block) {
+  const candidates = [
+    ...worldMonitorExtractAllXmlTagText(block, WORLDMONITOR_NATIVE_SEVERITY_DIRECT_TAGS),
+    ...worldMonitorExtractXmlTagAttributeValues(
+      block,
+      WORLDMONITOR_NATIVE_SEVERITY_CATEGORY_TAGS,
+      WORLDMONITOR_NATIVE_SEVERITY_CATEGORY_ATTRS,
+    ),
+    ...worldMonitorExtractAllXmlTagText(block, WORLDMONITOR_NATIVE_SEVERITY_CATEGORY_TAGS),
+  ];
+  for (const value of candidates) {
+    const level = worldMonitorNormalizeNativeThreatLevel(value);
+    if (level) return level;
   }
-  let hits = 0;
-  for (const kw of WORLDMONITOR_ALERT_KEYWORDS) {
-    if (kw && lower.includes(kw)) hits += 1;
-  }
-  if (WORLDMONITOR_CRITICAL_KEYWORDS.some((kw) => lower.includes(kw))) return "critical";
-  if (WORLDMONITOR_HIGH_KEYWORDS.some((kw) => lower.includes(kw))) return "high";
-  if (hits >= 2) return "high";
-  if (hits === 1) return "medium";
   return "low";
 }
 
@@ -6741,6 +6802,54 @@ function worldMonitorExtractFirstXmlTag(block, tagNames) {
   return "";
 }
 
+function worldMonitorExtractAllXmlTagText(block, tagNames) {
+  const src = String(block || "");
+  const names = Array.isArray(tagNames) ? tagNames : [tagNames];
+  const out = [];
+  for (const rawName of names) {
+    const name = String(rawName || "").trim();
+    if (!name) continue;
+    const re = new RegExp(`<(?:[A-Za-z0-9_-]+:)?${name}\\b[^>]*>([\\s\\S]*?)<\\/(?:[A-Za-z0-9_-]+:)?${name}>`, "gi");
+    let m;
+    while ((m = re.exec(src)) !== null) {
+      const text = stripWorldMonitorHtml(m[1]);
+      if (text) out.push(text);
+    }
+  }
+  return out;
+}
+
+function worldMonitorExtractXmlTagAttributeValues(block, tagNames, attrNames) {
+  const src = String(block || "");
+  const tags = Array.isArray(tagNames) ? tagNames : [tagNames];
+  const wanted = new Set(
+    (Array.isArray(attrNames) ? attrNames : [attrNames])
+      .map((x) => String(x || "").trim().toLowerCase())
+      .filter(Boolean),
+  );
+  const out = [];
+  for (const rawTag of tags) {
+    const tag = String(rawTag || "").trim();
+    if (!tag) continue;
+    const re = new RegExp(`<(?:[A-Za-z0-9_-]+:)?${tag}\\b([^>]*)\\/?>`, "gi");
+    let m;
+    while ((m = re.exec(src)) !== null) {
+      const attrs = String(m[1] || "");
+      const attrRe = /([a-zA-Z_:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/g;
+      let a;
+      while ((a = attrRe.exec(attrs)) !== null) {
+        const keyRaw = String(a[1] || "").trim().toLowerCase();
+        if (!keyRaw) continue;
+        const keyBase = keyRaw.includes(":") ? keyRaw.split(":").pop() : keyRaw;
+        if (!wanted.has(keyRaw) && !wanted.has(keyBase)) continue;
+        const value = decodeWorldMonitorXmlText(String(a[2] || a[3] || a[4] || "").trim());
+        if (value) out.push(value);
+      }
+    }
+  }
+  return out;
+}
+
 function worldMonitorExtractLinkFromItem(block) {
   const src = String(block || "");
   let m = src.match(/<link\b[^>]*\bhref=["']([^"']+)["'][^>]*>/i);
@@ -6763,7 +6872,7 @@ function worldMonitorExtractLinkFromItem(block) {
   return "";
 }
 
-function parseWorldMonitorFeedXml(xmlText, feed, fetchedAt) {
+function parseWorldMonitorFeedXml(xmlText, feed, fetchedAt, options = {}) {
   const src = String(xmlText || "");
   if (!src) return [];
   const items = [];
@@ -6773,6 +6882,14 @@ function parseWorldMonitorFeedXml(xmlText, feed, fetchedAt) {
   const entryMatches = src.matchAll(/<entry\b[\s\S]*?<\/entry>/gi);
   for (const m of entryMatches) blocks.push(m[0]);
   if (blocks.length === 0) return items;
+  const minPublishedAtMsRaw = Number(options?.minPublishedAtMs || 0);
+  const minPublishedAtMs = Number.isFinite(minPublishedAtMsRaw)
+    ? Math.max(0, Math.trunc(minPublishedAtMsRaw))
+    : 0;
+  const itemCapRaw = Number(options?.maxItemsPerSource || 0);
+  const itemCap = Number.isFinite(itemCapRaw) && itemCapRaw > 0
+    ? Math.max(1, Math.trunc(itemCapRaw))
+    : WORLDMONITOR_NATIVE_FEED_ITEMS_PER_SOURCE;
 
   for (const block of blocks) {
     const title = worldMonitorExtractFirstXmlTag(block, ["title"]);
@@ -6780,9 +6897,10 @@ function parseWorldMonitorFeedXml(xmlText, feed, fetchedAt) {
     if (!title || !link) continue;
     const publishedRaw = worldMonitorExtractFirstXmlTag(block, ["pubDate", "published", "updated", "dc:date", "date"]);
     const publishedAt = Number(Date.parse(publishedRaw)) || Number(fetchedAt || Date.now());
+    if (minPublishedAtMs > 0 && publishedAt > 0 && publishedAt < minPublishedAtMs) continue;
     const articleKey = normalizeWorldMonitorLink(link)
       || `${String(feed?.name || "").toLowerCase()}|${normalizeWorldMonitorTitleForKey(title)}|${utcDayKeyFromMs(publishedAt)}`;
-    const threatLevel = worldMonitorThreatLevelForTitle(title);
+    const threatLevel = worldMonitorThreatLevelForItem(block);
     const taiwanScore = worldMonitorTaiwanRelevanceScore(title);
     const countries = worldMonitorExtractCountryCodes(title);
     items.push({
@@ -6796,6 +6914,7 @@ function parseWorldMonitorFeedXml(xmlText, feed, fetchedAt) {
       firstSeenAt: Number(fetchedAt || Date.now()),
       lastSeenAt: Number(fetchedAt || Date.now()),
       threatLevel,
+      threatLevelSource: "native-feed-metadata",
       taiwanScore,
       countries,
     });
@@ -6812,7 +6931,9 @@ function parseWorldMonitorFeedXml(xmlText, feed, fetchedAt) {
     }
     if (Number(item.publishedAt || 0) > Number(prev.publishedAt || 0)) dedup.set(key, item);
   }
-  return [...dedup.values()].slice(0, WORLDMONITOR_NATIVE_FEED_ITEMS_PER_SOURCE);
+  return [...dedup.values()]
+    .sort((a, b) => Number(b.publishedAt || b.firstSeenAt || 0) - Number(a.publishedAt || a.firstSeenAt || 0))
+    .slice(0, itemCap);
 }
 
 function decodeWorldMonitorHtmlEntities(raw) {
@@ -7025,7 +7146,6 @@ function buildWorldMonitorArticleKeywords(item, title, description) {
     String(item?.title || ""),
     String(title || ""),
     String(description || ""),
-    ...WORLDMONITOR_ALERT_KEYWORDS,
     ...WORLDMONITOR_TAIWAN_KEYWORDS,
   ].join(" ");
   const tokens = normalizeWorldMonitorTitleForKey(raw)
@@ -8673,6 +8793,14 @@ async function runWorldMonitorNativeSignalsRefresh(options = {}) {
 async function runWorldMonitorNativeFeedRefresh(options = {}) {
   const minIntervalMs = Math.max(0, Number(WORLDMONITOR_NATIVE_REFRESH_MIN_INTERVAL_SEC || 0) * 1000);
   const force = options?.force === true;
+  const minPublishedAtMsRaw = Number(options?.minPublishedAtMs || 0);
+  const minPublishedAtMs = Number.isFinite(minPublishedAtMsRaw)
+    ? Math.max(0, Math.trunc(minPublishedAtMsRaw))
+    : 0;
+  const maxItemsPerSourceRaw = Number(options?.maxItemsPerSource || 0);
+  const maxItemsPerSource = Number.isFinite(maxItemsPerSourceRaw) && maxItemsPerSourceRaw > 0
+    ? Math.max(1, Math.trunc(maxItemsPerSourceRaw))
+    : WORLDMONITOR_NATIVE_FEED_ITEMS_PER_SOURCE;
   const startedAt = Date.now();
   if (
     !force
@@ -8741,7 +8869,10 @@ async function runWorldMonitorNativeFeedRefresh(options = {}) {
           } finally {
             if (timer) clearTimeout(timer);
           }
-          const parsed = parseWorldMonitorFeedXml(text, feed, fetchedAt);
+          const parsed = parseWorldMonitorFeedXml(text, feed, fetchedAt, {
+            minPublishedAtMs,
+            maxItemsPerSource,
+          });
           for (const next of parsed) {
             const key = String(next.articleKey || "").trim();
             if (!key) continue;
@@ -8751,9 +8882,8 @@ async function runWorldMonitorNativeFeedRefresh(options = {}) {
               if (!prev.publishedAt || Number(next.publishedAt || 0) > Number(prev.publishedAt || 0)) {
                 prev.publishedAt = Number(next.publishedAt || prev.publishedAt || fetchedAt) || fetchedAt;
               }
-              if (!prev.threatLevel || worldMonitorFeedAlertLevelRank(next.threatLevel) > worldMonitorFeedAlertLevelRank(prev.threatLevel)) {
-                prev.threatLevel = next.threatLevel;
-              }
+              prev.threatLevel = worldMonitorNormalizeNativeThreatLevel(next.threatLevel) || "low";
+              prev.threatLevelSource = "native-feed-metadata";
               if (Number(next.taiwanScore || 0) > Number(prev.taiwanScore || 0)) prev.taiwanScore = Number(next.taiwanScore || 0);
               if ((!Array.isArray(prev.countries) || prev.countries.length === 0) && Array.isArray(next.countries)) {
                 prev.countries = next.countries.slice(0, 6);
@@ -8801,6 +8931,8 @@ async function runWorldMonitorNativeFeedRefresh(options = {}) {
       signals_ok: Boolean(signalsResult?.ok),
       signals_refresh_at: Number(signalsResult?.refreshedAt || 0) || 0,
       signals: signalsResult?.stats && typeof signalsResult.stats === "object" ? signalsResult.stats : {},
+      min_published_at: minPublishedAtMs > 0 ? nowIso(minPublishedAtMs) : "",
+      max_items_per_source: maxItemsPerSource,
       sample_errors: errors,
     };
     worldMonitorMonitor.nativeLastRefreshAt = Date.now();
@@ -8830,7 +8962,7 @@ async function runWorldMonitorNativeFeedRefresh(options = {}) {
 }
 
 function getWorldMonitorNativeRecentItems(options = {}) {
-  const lookbackHours = Math.max(1, Number(options?.lookbackHours || WORLDMONITOR_CHECK_LOOKBACK_HOURS || 48));
+  const lookbackHours = Math.max(1, Number(options?.lookbackHours || WORLDMONITOR_CHECK_LOOKBACK_HOURS || 168));
   const minTs = Date.now() - (lookbackHours * 60 * 60 * 1000);
   return worldMonitorNativeNewsItems
     .filter((x) => Number(x?.publishedAt || x?.firstSeenAt || 0) >= minTs)
@@ -9503,7 +9635,7 @@ function isWorldMonitorAlertForwardable(alert, item = null, ctx = null) {
   const publishedAt = Number(alert?.publishedAt || item?.publishedAt || 0) || 0;
   if (publishedAt > 0) {
     const ageMs = now - publishedAt;
-    const maxAgeMs = Math.max(1, Number(WORLDMONITOR_FEED_ALERTS_MAX_ARTICLE_AGE_HOURS || 120)) * 60 * 60 * 1000;
+    const maxAgeMs = Math.max(1, Number(WORLDMONITOR_FEED_ALERTS_MAX_ARTICLE_AGE_HOURS || 6)) * 60 * 60 * 1000;
     if (ageMs > maxAgeMs) return false;
   }
 
@@ -9529,25 +9661,6 @@ function isWorldMonitorAlertForwardable(alert, item = null, ctx = null) {
     if (isWorldMonitorLowQualityArticleContext(ctx)) return false;
   }
   return true;
-}
-
-function isWorldMonitorTaiwanWellbeingAlert(alert) {
-  const title = String(alert?.title || "").trim();
-  if (!title) return false;
-  const lower = title.toLowerCase();
-  const level = String(alert?.threatLevel || "").trim().toLowerCase();
-  const rank = worldMonitorFeedAlertLevelRank(level);
-
-  if (isTaiwanRelevantHeadline(lower) && rank >= worldMonitorFeedAlertLevelRank("high")) {
-    return true;
-  }
-  if (rank >= worldMonitorFeedAlertLevelRank("critical")) {
-    return (
-      WORLDMONITOR_TAIWAN_WELLBEING_GLOBAL_CRITICAL_KEYWORDS.some((kw) => lower.includes(kw))
-      || WORLDMONITOR_MAJOR_WORLD_EVENT_KEYWORDS.some((kw) => lower.includes(kw))
-    );
-  }
-  return false;
 }
 
 function worldMonitorSelectMixedAlerts(alerts, limit = 16) {
@@ -9671,7 +9784,64 @@ function worldMonitorFeedAlertTitleKey(raw) {
     .slice(0, 220);
 }
 
-function formatWorldMonitorFeedAlertMessage(alert) {
+function buildWorldMonitorFeedAlertSummary(alert, item = null, ctx = null) {
+  const context = ctx && typeof ctx === "object" ? ctx : null;
+  const seeds = [];
+  const ctxSummary = oneLine(String(context?.summary || ""));
+  if (ctxSummary) seeds.push(ctxSummary);
+  const keyPoints = Array.isArray(context?.keyPoints)
+    ? context.keyPoints.map((x) => oneLine(x)).filter(Boolean).slice(0, 3)
+    : [];
+  if (keyPoints.length > 0) {
+    seeds.push(
+      keyPoints
+        .map((x) => (
+          /[.!?]$/.test(x.trim())
+            ? x.trim()
+            : `${x.trim()}.`
+        ))
+        .join(" "),
+    );
+  }
+
+  const fallbackSeed = oneLine(String(item?.title || alert?.title || ""));
+  const sourceSeed = seeds.join(" ").trim() || fallbackSeed;
+  const sentences = splitIntoSentencesBestEffort(sourceSeed)
+    .map((x) => oneLine(x))
+    .filter(Boolean);
+  const selected = [];
+  const seen = new Set();
+  for (const sentence of sentences) {
+    const key = normalizeWorldMonitorTitleForKey(sentence);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    selected.push(sentence.trim());
+    if (selected.length >= 3) break;
+  }
+
+  const level = String(alert?.threatLevel || item?.threatLevel || "low").trim().toLowerCase() || "low";
+  const source = oneLine(String(alert?.source || item?.source || "")).trim();
+  if (selected.length === 0 && fallbackSeed) {
+    selected.push(/[.!?]$/.test(fallbackSeed) ? fallbackSeed : `${fallbackSeed}.`);
+  }
+  if (selected.length === 1) {
+    selected.push(`This item is currently tagged ${level} by the WorldMonitor feed.`);
+  }
+  if (selected.length < 3 && source) {
+    selected.push(`Source: ${source}.`);
+  }
+
+  return selected
+    .slice(0, 3)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 680);
+}
+
+function formatWorldMonitorFeedAlertMessage(alert, options = {}) {
+  const item = options?.item && typeof options.item === "object" ? options.item : null;
+  const ctx = options?.ctx && typeof options.ctx === "object" ? options.ctx : null;
   const level = String(alert?.threatLevel || "low").trim().toLowerCase() || "low";
   const levelTag = level.toUpperCase();
   const source = oneLine(String(alert?.source || "").trim());
@@ -9679,6 +9849,7 @@ function formatWorldMonitorFeedAlertMessage(alert) {
   const rawLink = String(alert?.link || "").trim();
   const safeTitle = rawTitle.replace(/[\[\]]/g, "").trim();
   const hasLink = /^https?:\/\/\S+$/i.test(rawLink);
+  const summary = buildWorldMonitorFeedAlertSummary(alert, item, ctx);
   const header = `${fmtBold("WorldMonitor Alert")} [${levelTag}]`;
   const lines = [header];
   if (safeTitle && hasLink) {
@@ -9686,6 +9857,7 @@ function formatWorldMonitorFeedAlertMessage(alert) {
   } else if (rawTitle) {
     lines.push(rawTitle);
   }
+  if (summary) lines.push(summary);
   if (source) lines.push(`source: ${source}`);
   if (rawLink && !(safeTitle && hasLink)) lines.push(rawLink);
   return lines.join("\n");
@@ -9730,8 +9902,13 @@ function compactWorldMonitorCountryCodeList(items, limit = 3) {
   const source = Array.isArray(items) ? items : [];
   const maxItems = Math.max(1, Number(limit) || 1);
   return source
+    .map((x) => ({
+      region: String(x?.region || "??").trim().toUpperCase() || "??",
+      score: Math.round(Number(x?.score || 0)),
+    }))
+    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0) || a.region.localeCompare(b.region))
     .slice(0, maxItems)
-    .map((x) => `${String(x.region || "??").toUpperCase()}:${Math.round(Number(x.score || 0))}`)
+    .map((x) => `${x.region}:${x.score}`)
     .join(", ");
 }
 
@@ -9855,6 +10032,115 @@ function buildWorldMonitorSnapshotSummary(snapshot) {
   return `global=${globalScore}/${level}; top=${top}; factors=${factors}`;
 }
 
+function normalizeWorldMonitorIntervalReportCounters(nowMs = Date.now()) {
+  const dayKey = utcDayKeyFromMs(nowMs);
+  const prevDayKey = String(worldMonitorMonitor.intervalReportDayKey || "").trim();
+  const prevCountRaw = Number(worldMonitorMonitor.intervalReportCount || 0) || 0;
+  const prevCount = Number.isFinite(prevCountRaw) ? Math.max(0, Math.trunc(prevCountRaw)) : 0;
+  let changed = false;
+
+  if (dayKey && prevDayKey !== dayKey) {
+    worldMonitorMonitor.intervalReportDayKey = dayKey;
+    worldMonitorMonitor.intervalReportCount = 0;
+    changed = true;
+  } else if (prevCountRaw !== prevCount) {
+    worldMonitorMonitor.intervalReportCount = prevCount;
+    changed = true;
+  }
+
+  return {
+    dayKey,
+    count: Math.max(0, Number(worldMonitorMonitor.intervalReportCount || 0) || 0),
+    changed,
+  };
+}
+
+function worldMonitorIntervalReportMaxLabel() {
+  const maxPerDay = Math.max(0, Number(WORLDMONITOR_INTERVAL_REPORT_MAX_PER_DAY || 0) || 0);
+  return maxPerDay > 0 ? `${Math.trunc(maxPerDay)}` : "unlimited";
+}
+
+function evaluateWorldMonitorIntervalReportPolicy(decision, nowMs = Date.now()) {
+  const normalized = normalizeWorldMonitorIntervalReportCounters(nowMs);
+  const configuredMaxPerDay = Math.max(0, Number(WORLDMONITOR_INTERVAL_REPORT_MAX_PER_DAY || 0) || 0);
+  const hasDailyCap = configuredMaxPerDay > 0;
+  const maxPerDay = hasDailyCap ? Math.max(1, Math.trunc(configuredMaxPerDay)) : 0;
+  const configuredBaselinePerDay = Math.max(0, Number(WORLDMONITOR_INTERVAL_REPORT_BASELINE_PER_DAY || 0) || 0);
+  const baselinePerDay = hasDailyCap
+    ? Math.max(0, Math.min(maxPerDay, Math.trunc(configuredBaselinePerDay)))
+    : Math.max(0, Math.trunc(configuredBaselinePerDay));
+  const countToday = Math.max(0, Number(normalized.count || 0) || 0);
+  const minSpacingMs = Math.max(0, Number(WORLDMONITOR_INTERVAL_REPORT_MIN_INTERVAL_SEC || 0) * 1000);
+  const lastReportAt = Number(worldMonitorMonitor.intervalReportLastAt || 0) || 0;
+  const spacingRemainingMs = (minSpacingMs > 0 && lastReportAt > 0)
+    ? Math.max(0, minSpacingMs - Math.max(0, nowMs - lastReportAt))
+    : 0;
+  const significantThreshold = Math.max(
+    1,
+    Number(WORLDMONITOR_INTERVAL_REPORT_SIGNIFICANT_DELTA || WORLDMONITOR_MIN_GLOBAL_DELTA) || 1,
+  );
+  const delta = Math.max(0, Number(decision?.globalDelta || 0) || 0);
+  const significantDelta = delta >= significantThreshold;
+  const baselineDue = countToday < baselinePerDay;
+
+  if (hasDailyCap && countToday >= maxPerDay) {
+    return {
+      ...normalized,
+      shouldReport: false,
+      reason: `report daily cap (${countToday}/${maxPerDay})`,
+      baselineDue,
+      significantDelta,
+      countToday,
+      maxPerDay,
+    };
+  }
+  if (!baselineDue && spacingRemainingMs > 0) {
+    const mins = Math.max(1, Math.ceil(spacingRemainingMs / 60_000));
+    return {
+      ...normalized,
+      shouldReport: false,
+      reason: `report spacing (${mins}m remaining)`,
+      baselineDue,
+      significantDelta,
+      countToday,
+      maxPerDay,
+    };
+  }
+  if (baselineDue) {
+    return {
+      ...normalized,
+      shouldReport: true,
+      reason: hasDailyCap
+        ? `daily baseline report (${countToday + 1}/${maxPerDay})`
+        : `daily baseline report (${countToday + 1})`,
+      baselineDue,
+      significantDelta,
+      countToday,
+      maxPerDay,
+    };
+  }
+  if (!significantDelta) {
+    return {
+      ...normalized,
+      shouldReport: false,
+      reason: `delta ${delta.toFixed(1)} < ${significantThreshold}`,
+      baselineDue,
+      significantDelta,
+      countToday,
+      maxPerDay,
+    };
+  }
+  return {
+    ...normalized,
+    shouldReport: true,
+    reason: `significant delta ${delta.toFixed(1)} >= ${significantThreshold}`,
+    baselineDue,
+    significantDelta,
+    countToday,
+    maxPerDay,
+  };
+}
+
 function buildWorldMonitorAlertPrompt(snapshot, decision, source = "interval") {
   const packet = {
     monitor_source: source,
@@ -9931,40 +10217,143 @@ async function runWorldMonitorMonitorCycle(options = {}) {
 
     let enqueued = false;
     let enqueueReason = "not triggered";
+    let intervalReportPolicy = null;
+    const isIntervalSource = source === "interval";
+    const intervalMode = isIntervalSource ? WORLDMONITOR_INTERVAL_ALERT_MODE : "report";
+    const wantsHeadlines = intervalMode === "headlines" || intervalMode === "smart";
+    const wantsReport = intervalMode === "report" || intervalMode === "smart";
 
-    if (decision.shouldAlert) {
-      const cooldownMs = Math.max(0, Number(WORLDMONITOR_ALERT_COOLDOWN_SEC || 0) * 1000);
-      const lastAlertAt = Number(worldMonitorMonitor.lastAlertAt || 0) || 0;
-      const inCooldown = !forceAlert && cooldownMs > 0 && lastAlertAt > 0 && (now - lastAlertAt) < cooldownMs;
-      const duplicate = !forceAlert
-        && String(worldMonitorMonitor.lastAlertFingerprint || "").trim()
-        && String(worldMonitorMonitor.lastAlertFingerprint || "").trim() === String(decision.fingerprint || "").trim();
+    if (isIntervalSource && wantsReport && !forceAlert) {
+      intervalReportPolicy = evaluateWorldMonitorIntervalReportPolicy(decision, now);
+      if (intervalReportPolicy.changed) persistState();
+    }
+    const shouldProcessAlertActions = decision.shouldAlert || Boolean(intervalReportPolicy?.shouldReport);
 
-      if (inCooldown) {
-        enqueueReason = "cooldown";
-      } else if (duplicate) {
-        enqueueReason = "duplicate";
+    if (shouldProcessAlertActions) {
+      const actionReasons = [];
+      const decisionReasonText = String(decision.reasons.join("; ") || "").trim();
+
+      if (intervalMode === "off") {
+        enqueueReason = "interval alerts disabled";
+        worldMonitorMonitor.lastAlertAt = Date.now();
+        worldMonitorMonitor.lastAlertReason = decisionReasonText || "interval alerts disabled";
+        worldMonitorMonitor.lastAlertFingerprint = String(decision.fingerprint || "").trim();
+        persistState();
       } else {
-        const workerId = ensureWorldMonitorWorker();
-        const laneState = getWorldMonitorWorkerLaneState(workerId);
-        if (laneState.busy || laneState.queued > 0) {
-          enqueueReason = `worker busy (queued=${laneState.queued})`;
-        } else {
-          const prompt = buildWorldMonitorAlertPrompt(snapshot, decision, source);
-          await enqueuePrompt(WORLDMONITOR_ALERT_CHAT_ID, prompt, "worldmonitor-monitor", {
-            workerId,
-            setActiveWorker: false,
-            model: WORLDMONITOR_SUMMARY_MODEL,
-            reasoning: WORLDMONITOR_SUMMARY_REASONING,
-          });
-          enqueued = true;
-          enqueueReason = "enqueued";
-          worldMonitorMonitor.workerId = workerId;
-          worldMonitorMonitor.lastAlertAt = Date.now();
-          worldMonitorMonitor.lastAlertReason = decision.reasons.join("; ");
-          worldMonitorMonitor.lastAlertFingerprint = String(decision.fingerprint || "").trim();
-          persistState();
+        if (wantsHeadlines && decision.shouldAlert) {
+          const levelNow = String(snapshot?.globalLevel || "unknown").trim().toLowerCase();
+          const minLevel = isIntervalSource ? WORLDMONITOR_INTERVAL_HEADLINES_MIN_LEVEL : WORLDMONITOR_FEED_ALERTS_MIN_LEVEL;
+          const minRank = worldMonitorFeedAlertLevelRank(minLevel);
+          const levelRank = worldMonitorFeedAlertLevelRank(levelNow);
+          const cooldownMs = Math.max(0, Number(WORLDMONITOR_ALERT_COOLDOWN_SEC || 0) * 1000);
+          const lastAlertAt = Number(worldMonitorMonitor.lastAlertAt || 0) || 0;
+          const inCooldown = !forceAlert && cooldownMs > 0 && lastAlertAt > 0 && (now - lastAlertAt) < cooldownMs;
+          const duplicate = !forceAlert
+            && String(worldMonitorMonitor.lastAlertFingerprint || "").trim()
+            && String(worldMonitorMonitor.lastAlertFingerprint || "").trim() === String(decision.fingerprint || "").trim();
+
+          if (!forceAlert && isIntervalSource && minRank > 1 && levelRank < minRank) {
+            actionReasons.push(`headlines gated by level (${levelNow || "unknown"} < ${minLevel})`);
+          } else if (inCooldown) {
+            actionReasons.push("headlines cooldown");
+          } else if (duplicate) {
+            actionReasons.push("headlines duplicate");
+          } else {
+            let feedRes = { ok: false, skipped: "feed alerts disabled", sent: 0, seen: 0 };
+            if (WORLDMONITOR_FEED_ALERTS_ENABLED) {
+              feedRes = await runWorldMonitorFeedAlertsCycle({
+                source: "monitor-headlines",
+                minLevel,
+              });
+            }
+            if (feedRes?.ok) {
+              const sent = Math.max(0, Number(feedRes?.sent || 0) || 0);
+              const seen = Math.max(0, Number(feedRes?.seen || 0) || 0);
+              const skipped = String(feedRes?.skipped || "").trim();
+              actionReasons.push(
+                sent > 0
+                  ? `headlines sent (${sent}/${seen}, min=${minLevel})`
+                  : (skipped ? `headlines ${skipped}` : "headlines no new"),
+              );
+            } else {
+              actionReasons.push(
+                `headlines ${String(feedRes?.skipped || feedRes?.error || "failed").trim() || "failed"}`,
+              );
+            }
+            worldMonitorMonitor.lastAlertAt = Date.now();
+            worldMonitorMonitor.lastAlertReason = decisionReasonText || "headlines forwarded";
+            worldMonitorMonitor.lastAlertFingerprint = String(decision.fingerprint || "").trim();
+            persistState();
+          }
         }
+
+        if (wantsReport) {
+          let allowReport = true;
+          if (isIntervalSource && !forceAlert) {
+            if (!intervalReportPolicy) {
+              intervalReportPolicy = evaluateWorldMonitorIntervalReportPolicy(decision, now);
+              if (intervalReportPolicy.changed) persistState();
+            }
+            if (!intervalReportPolicy.shouldReport) {
+              allowReport = false;
+              actionReasons.push(`report ${intervalReportPolicy.reason}`);
+            }
+          }
+
+          if (allowReport) {
+            const cooldownMs = Math.max(0, Number(WORLDMONITOR_ALERT_COOLDOWN_SEC || 0) * 1000);
+            const lastAlertAt = Number(worldMonitorMonitor.lastAlertAt || 0) || 0;
+            const inCooldown = !forceAlert && !isIntervalSource && cooldownMs > 0 && lastAlertAt > 0 && (now - lastAlertAt) < cooldownMs;
+            const duplicate = !forceAlert
+              && !isIntervalSource
+              && String(worldMonitorMonitor.lastAlertFingerprint || "").trim()
+              && String(worldMonitorMonitor.lastAlertFingerprint || "").trim() === String(decision.fingerprint || "").trim();
+
+            if (inCooldown) {
+              actionReasons.push("report cooldown");
+            } else if (duplicate) {
+              actionReasons.push("report duplicate");
+            } else {
+              const workerId = ensureWorldMonitorWorker();
+              const laneState = getWorldMonitorWorkerLaneState(workerId);
+              if (laneState.busy || laneState.queued > 0) {
+                actionReasons.push(`report worker busy (queued=${laneState.queued})`);
+              } else {
+                const prompt = buildWorldMonitorAlertPrompt(snapshot, decision, source);
+                await enqueuePrompt(WORLDMONITOR_ALERT_CHAT_ID, prompt, "worldmonitor-monitor", {
+                  workerId,
+                  setActiveWorker: false,
+                  model: WORLDMONITOR_SUMMARY_MODEL,
+                  reasoning: WORLDMONITOR_SUMMARY_REASONING,
+                });
+                enqueued = true;
+                const alertAt = Date.now();
+                worldMonitorMonitor.workerId = workerId;
+                worldMonitorMonitor.lastAlertAt = alertAt;
+                worldMonitorMonitor.lastAlertReason = decisionReasonText
+                  || String(intervalReportPolicy?.reason || "interval report queued").trim();
+                worldMonitorMonitor.lastAlertFingerprint = String(decision.fingerprint || "").trim();
+                if (isIntervalSource) {
+                  const normalized = normalizeWorldMonitorIntervalReportCounters(alertAt);
+                  worldMonitorMonitor.intervalReportDayKey = normalized.dayKey || worldMonitorMonitor.intervalReportDayKey;
+                  worldMonitorMonitor.intervalReportCount = Math.max(0, Number(normalized.count || 0) || 0) + 1;
+                  worldMonitorMonitor.intervalReportLastAt = alertAt;
+                  worldMonitorMonitor.intervalReportLastReason = String(
+                    intervalReportPolicy?.reason || "interval report queued",
+                  ).trim();
+                }
+                persistState();
+                actionReasons.push(
+                  isIntervalSource
+                    ? `report enqueued (${String(intervalReportPolicy?.reason || "interval policy").trim()})`
+                    : "report enqueued",
+                );
+              }
+            }
+          }
+        }
+
+        enqueueReason = actionReasons.length > 0 ? actionReasons.join("; ") : "no actions";
       }
     }
 
@@ -10071,7 +10460,7 @@ async function runWorldMonitorComprehensiveCheck(options = {}) {
 
   try {
     const now = Date.now();
-    const lookbackMs = Math.max(1, Number(WORLDMONITOR_CHECK_LOOKBACK_HOURS || 48)) * 60 * 60 * 1000;
+    const lookbackMs = Math.max(1, Number(WORLDMONITOR_CHECK_LOOKBACK_HOURS || 168)) * 60 * 60 * 1000;
     const sinceMs = now - lookbackMs;
     const maxHeadlines = Math.max(4, Number(WORLDMONITOR_CHECK_MAX_HEADLINES || 16));
     const force = options?.forceAlert === true;
@@ -10188,7 +10577,7 @@ async function runWorldMonitorComprehensiveCheck(options = {}) {
   const packet = {
     mode: "comprehensive_manual_check",
     requested_at: nowIso(now),
-    lookback_hours: Number(WORLDMONITOR_CHECK_LOOKBACK_HOURS || 48),
+    lookback_hours: Number(WORLDMONITOR_CHECK_LOOKBACK_HOURS || 168),
     force_requested: force,
     risk_snapshot: {
       fetched_at: nowIso(riskSnapshot?.fetchedAt || now),
@@ -10282,6 +10671,102 @@ function stopWorldMonitorMonitorLoop() {
   }
 }
 
+function buildWorldMonitorStartupCatchupWindow(now = Date.now()) {
+  const hardMaxHours = Math.max(24, Math.trunc(Number(WORLDMONITOR_NATIVE_STORE_MAX_AGE_DAYS || 30) * 24) || 24);
+  const configuredMinLookback = Math.max(
+    6,
+    Math.min(hardMaxHours, Number(WORLDMONITOR_STARTUP_CATCHUP_MIN_LOOKBACK_HOURS || WORLDMONITOR_CHECK_LOOKBACK_HOURS || 168)),
+  );
+  const lastSeenAt = Math.max(
+    Number(worldMonitorMonitor.nativeLastRefreshAt || 0) || 0,
+    Number(worldMonitorMonitor.feedAlertsLastSeenAt || 0) || 0,
+    Number(worldMonitorMonitor.lastRunAt || 0) || 0,
+  );
+  const downtimeHours = lastSeenAt > 0
+    ? Math.max(0, Math.ceil(Math.max(0, now - lastSeenAt) / (60 * 60 * 1000)))
+    : 0;
+  const dynamicLookback = downtimeHours > 0 ? (downtimeHours + 6) : configuredMinLookback;
+  const lookbackHours = Math.max(configuredMinLookback, Math.min(hardMaxHours, dynamicLookback));
+  return {
+    lookbackHours,
+    minPublishedAtMs: Math.max(0, now - (lookbackHours * 60 * 60 * 1000)),
+    downtimeHours,
+    lastSeenAt,
+  };
+}
+
+async function runWorldMonitorStartupCatchup() {
+  if (!WORLDMONITOR_MONITOR_ENABLED || !WORLDMONITOR_STARTUP_CATCHUP_ENABLED) {
+    return { ok: false, skipped: "disabled" };
+  }
+  if (worldMonitorNativeRuntime.startupCatchupPromise) {
+    return worldMonitorNativeRuntime.startupCatchupPromise;
+  }
+
+  const promise = (async () => {
+    const now = Date.now();
+    const window = buildWorldMonitorStartupCatchupWindow(now);
+    const maxItemsPerSource = Math.max(
+      WORLDMONITOR_NATIVE_FEED_ITEMS_PER_SOURCE,
+      Number(WORLDMONITOR_STARTUP_CATCHUP_ITEMS_PER_SOURCE || WORLDMONITOR_NATIVE_FEED_ITEMS_PER_SOURCE) || WORLDMONITOR_NATIVE_FEED_ITEMS_PER_SOURCE,
+    );
+    const refresh = await runWorldMonitorNativeFeedRefresh({
+      force: true,
+      minPublishedAtMs: window.minPublishedAtMs,
+      maxItemsPerSource,
+    });
+    const completedAt = Date.now();
+    const compactStats = {
+      lookback_hours: window.lookbackHours,
+      downtime_hours: window.downtimeHours,
+      max_items_per_source: maxItemsPerSource,
+      refreshed_at: Number(refresh?.refreshedAt || 0) || 0,
+      duration_ms: Number(refresh?.durationMs || 0) || 0,
+      feeds_total: Math.round(Number(refresh?.stats?.feeds_total || 0) || 0),
+      feeds_ok: Math.round(Number(refresh?.stats?.feeds_ok || 0) || 0),
+      feeds_failed: Math.round(Number(refresh?.stats?.feeds_failed || 0) || 0),
+      new_items: Math.round(Number(refresh?.stats?.new_items || 0) || 0),
+      stored_items: Math.round(Number(refresh?.stats?.stored_items || worldMonitorNativeNewsItems.length) || worldMonitorNativeNewsItems.length),
+    };
+    worldMonitorMonitor.startupCatchupLastRunAt = completedAt;
+    worldMonitorMonitor.startupCatchupLastStats = compactStats;
+    if (refresh?.ok) {
+      worldMonitorMonitor.startupCatchupLastErrorAt = 0;
+      worldMonitorMonitor.startupCatchupLastError = "";
+      persistState();
+      log(
+        `WorldMonitor startup catch-up complete (lookback=${window.lookbackHours}h, downtime=${window.downtimeHours}h, per_source=${maxItemsPerSource}, new_items=${compactStats.new_items}, feeds_ok=${compactStats.feeds_ok}/${compactStats.feeds_total}).`,
+      );
+      return {
+        ok: true,
+        refreshedAt: Number(refresh?.refreshedAt || completedAt) || completedAt,
+        stats: compactStats,
+      };
+    }
+
+    const message = String(refresh?.error || "startup catch-up failed").trim() || "startup catch-up failed";
+    worldMonitorMonitor.startupCatchupLastErrorAt = completedAt;
+    worldMonitorMonitor.startupCatchupLastError = message;
+    persistState();
+    log(`WorldMonitor startup catch-up failed: ${redactError(message)}`);
+    return { ok: false, error: message, stats: compactStats };
+  })().catch((err) => {
+    const message = String(err?.message || err || "startup catch-up failed").trim() || "startup catch-up failed";
+    worldMonitorMonitor.startupCatchupLastRunAt = Date.now();
+    worldMonitorMonitor.startupCatchupLastErrorAt = Date.now();
+    worldMonitorMonitor.startupCatchupLastError = message;
+    worldMonitorMonitor.startupCatchupLastStats = {};
+    persistState();
+    log(`WorldMonitor startup catch-up failed: ${redactError(message)}`);
+    return { ok: false, error: message, stats: {} };
+  }).finally(() => {
+    worldMonitorNativeRuntime.startupCatchupPromise = null;
+  });
+
+  worldMonitorNativeRuntime.startupCatchupPromise = promise;
+  return promise;
+}
+
 function scheduleWorldMonitorMonitorLoop(delayMs) {
   if (shuttingDown || !WORLDMONITOR_MONITOR_ENABLED) return;
   stopWorldMonitorMonitorLoop();
@@ -10307,6 +10792,16 @@ function startWorldMonitorMonitorLoop() {
 async function runWorldMonitorFeedAlertsCycle(options = {}) {
   const source = String(options?.source || "interval").trim().toLowerCase() || "interval";
   const now = Date.now();
+  const configuredFeedMinLevel = worldMonitorFeedAlertLevelRank(WORLDMONITOR_FEED_ALERTS_MIN_LEVEL) > 1
+    ? WORLDMONITOR_FEED_ALERTS_MIN_LEVEL
+    : "critical";
+  const minLevelRaw = String(options?.minLevel || configuredFeedMinLevel || "critical")
+    .trim()
+    .toLowerCase();
+  const minLevel = worldMonitorFeedAlertLevelRank(minLevelRaw) > 1
+    ? minLevelRaw
+    : configuredFeedMinLevel;
+  const minLevelRank = worldMonitorFeedAlertLevelRank(minLevel);
 
   if (!WORLDMONITOR_MONITOR_ENABLED || !WORLDMONITOR_FEED_ALERTS_ENABLED) {
     return { ok: false, skipped: "disabled" };
@@ -10323,7 +10818,7 @@ async function runWorldMonitorFeedAlertsCycle(options = {}) {
       worldMonitorMonitor.feedAlertsLastErrorAt = 0;
       worldMonitorMonitor.feedAlertsLastError = "";
       persistState();
-      return { ok: true, skipped: "warmup", sent: 0 };
+      return { ok: true, skipped: "warmup", sent: 0, minLevel };
     }
 
     const sinceMs = Number(worldMonitorMonitor.feedAlertsLastSeenAt || 0) || 0;
@@ -10337,10 +10832,7 @@ async function runWorldMonitorFeedAlertsCycle(options = {}) {
       const titleKey = String(alert?.titleKey || "").trim();
       const seenAt = Number(alert?.firstSeenAt || 0) || 0;
       if (seenAt > maxSeenAt) maxSeenAt = seenAt;
-      if (worldMonitorFeedAlertLevelRank(alert?.threatLevel) < worldMonitorFeedAlertLevelRank(WORLDMONITOR_FEED_ALERTS_MIN_LEVEL)) {
-        continue;
-      }
-      if (WORLDMONITOR_FEED_ALERTS_REQUIRE_TAIWAN_WELLBEING && !isWorldMonitorTaiwanWellbeingAlert(alert)) {
+      if (worldMonitorFeedAlertLevelRank(alert?.threatLevel) < minLevelRank) {
         continue;
       }
       const item = findWorldMonitorItemForAlert(alert);
@@ -10353,7 +10845,10 @@ async function runWorldMonitorFeedAlertsCycle(options = {}) {
       if (sent >= maxPerCycle) break;
       const bestLink = resolveWorldMonitorAlertBestLink(alert, item, ctx);
       const outboundAlert = bestLink ? { ...alert, link: bestLink } : alert;
-      await sendMessage(WORLDMONITOR_FEED_ALERTS_CHAT_ID, formatWorldMonitorFeedAlertMessage(outboundAlert));
+      await sendMessage(
+        WORLDMONITOR_FEED_ALERTS_CHAT_ID,
+        formatWorldMonitorFeedAlertMessage(outboundAlert, { item, ctx }),
+      );
       rememberWorldMonitorFeedAlertKey(key);
       if (titleKey) rememberWorldMonitorFeedAlertTitleKey(titleKey);
       sent += 1;
@@ -10368,7 +10863,7 @@ async function runWorldMonitorFeedAlertsCycle(options = {}) {
     worldMonitorMonitor.feedAlertsLastError = "";
     persistState();
 
-    return { ok: true, sent, seen: alerts.length };
+    return { ok: true, sent, seen: alerts.length, minLevel };
   } catch (err) {
     const message = String(err?.message || err || "").trim() || "worldmonitor feed alerts error";
     worldMonitorMonitor.feedAlertsLastRunAt = now;
@@ -10421,6 +10916,9 @@ async function sendWorldMonitorStatus(chatId) {
   const deepIngestStats = worldMonitorMonitor.nativeDeepIngestLastStats && typeof worldMonitorMonitor.nativeDeepIngestLastStats === "object"
     ? worldMonitorMonitor.nativeDeepIngestLastStats
     : {};
+  const startupCatchupStats = worldMonitorMonitor.startupCatchupLastStats && typeof worldMonitorMonitor.startupCatchupLastStats === "object"
+    ? worldMonitorMonitor.startupCatchupLastStats
+    : {};
   const nativeFeeds = loadWorldMonitorNativeFeedManifest();
   const nativeFeedCount = Array.isArray(nativeFeeds) ? nativeFeeds.length : 0;
   const lines = [
@@ -10438,26 +10936,36 @@ async function sendWorldMonitorStatus(chatId) {
     `- native_article_context_stats: scanned=${Math.round(Number(deepIngestStats.scanned || 0) || 0)}, ok=${Math.round(Number(deepIngestStats.completed || 0) || 0)}, errors=${Math.round(Number(deepIngestStats.errors || 0) || 0)}, pending=${Math.round(Number(deepIngestStats.remaining_pending || 0) || 0)}`,
     `- native_signals_refresh: ${worldMonitorMonitor.nativeSignalsLastRefreshAt ? `${nowIso(worldMonitorMonitor.nativeSignalsLastRefreshAt)} (${formatRelativeAge(worldMonitorMonitor.nativeSignalsLastRefreshAt)})` : "never"}`,
     `- native_signals_points: market=${Array.isArray(worldMonitorNativeSignals.marketSeries) ? worldMonitorNativeSignals.marketSeries.length : 0}, crypto=${Array.isArray(worldMonitorNativeSignals.cryptoSeries) ? worldMonitorNativeSignals.cryptoSeries.length : 0}, seismic=${Array.isArray(worldMonitorNativeSignals.seismicSeries) ? worldMonitorNativeSignals.seismicSeries.length : 0}, infra=${Array.isArray(worldMonitorNativeSignals.infrastructureSeries) ? worldMonitorNativeSignals.infrastructureSeries.length : 0}, adsb=${Array.isArray(worldMonitorNativeSignals.adsbSeries) ? worldMonitorNativeSignals.adsbSeries.length : 0}, disaster=${Array.isArray(worldMonitorNativeSignals.disasterSeries) ? worldMonitorNativeSignals.disasterSeries.length : 0}, maritime=${Array.isArray(worldMonitorNativeSignals.maritimeSeries) ? worldMonitorNativeSignals.maritimeSeries.length : 0}, services=${Array.isArray(worldMonitorNativeSignals.serviceSeries) ? worldMonitorNativeSignals.serviceSeries.length : 0}, macro=${Array.isArray(worldMonitorNativeSignals.macroSeries) ? worldMonitorNativeSignals.macroSeries.length : 0}, prediction=${Array.isArray(worldMonitorNativeSignals.predictionSeries) ? worldMonitorNativeSignals.predictionSeries.length : 0}`,
+    `- startup_catchup: ${WORLDMONITOR_STARTUP_CATCHUP_ENABLED ? "enabled" : "disabled"} (min_lookback_h=${WORLDMONITOR_STARTUP_CATCHUP_MIN_LOOKBACK_HOURS}, per_source=${WORLDMONITOR_STARTUP_CATCHUP_ITEMS_PER_SOURCE})`,
+    `- startup_catchup_last_run: ${worldMonitorMonitor.startupCatchupLastRunAt ? `${nowIso(worldMonitorMonitor.startupCatchupLastRunAt)} (${formatRelativeAge(worldMonitorMonitor.startupCatchupLastRunAt)})` : "never"}`,
+    `- startup_catchup_stats: lookback_h=${Math.round(Number(startupCatchupStats.lookback_hours || 0) || 0)}, downtime_h=${Math.round(Number(startupCatchupStats.downtime_hours || 0) || 0)}, per_source=${Math.round(Number(startupCatchupStats.max_items_per_source || 0) || 0)}, feeds_ok=${Math.round(Number(startupCatchupStats.feeds_ok || 0) || 0)}/${Math.round(Number(startupCatchupStats.feeds_total || 0) || 0)}, new=${Math.round(Number(startupCatchupStats.new_items || 0) || 0)}, stored=${Math.round(Number(startupCatchupStats.stored_items || 0) || 0)}`,
     `- interval_sec: ${WORLDMONITOR_MONITOR_INTERVAL_SEC}`,
+    `- interval_alert_mode: ${WORLDMONITOR_INTERVAL_ALERT_MODE}`,
+    `- interval_headlines_min_level: ${WORLDMONITOR_INTERVAL_HEADLINES_MIN_LEVEL}`,
+    `- interval_report_policy: baseline_per_day=${WORLDMONITOR_INTERVAL_REPORT_BASELINE_PER_DAY}, max_per_day=${worldMonitorIntervalReportMaxLabel()}, min_interval_sec=${WORLDMONITOR_INTERVAL_REPORT_MIN_INTERVAL_SEC}, significant_delta>=${WORLDMONITOR_INTERVAL_REPORT_SIGNIFICANT_DELTA}`,
     `- cooldown_sec: ${WORLDMONITOR_ALERT_COOLDOWN_SEC}`,
     `- article_context: ${WORLDMONITOR_DEEP_INGEST_ENABLED ? `enabled (concurrency=${WORLDMONITOR_DEEP_INGEST_CONCURRENCY}, timeout=${WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS}ms, max_per_cycle=${WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE}, lookback_hours=${WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS})` : "disabled"}`,
     `- thresholds: global>=${WORLDMONITOR_MIN_GLOBAL_RISK_SCORE}, country>=${WORLDMONITOR_MIN_COUNTRY_RISK_SCORE}, delta>=${WORLDMONITOR_MIN_GLOBAL_DELTA}`,
-    `- feed_alerts: ${WORLDMONITOR_FEED_ALERTS_ENABLED ? `enabled (interval=${WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC}s, engine=native, min_level=${WORLDMONITOR_FEED_ALERTS_MIN_LEVEL}, taiwan_wellbeing_filter=${WORLDMONITOR_FEED_ALERTS_REQUIRE_TAIWAN_WELLBEING}, max_article_age_h=${WORLDMONITOR_FEED_ALERTS_MAX_ARTICLE_AGE_HOURS}, skip_aggregators=${WORLDMONITOR_FEED_ALERTS_SKIP_AGGREGATOR_LINKS}, skip_documents=${WORLDMONITOR_FEED_ALERTS_SKIP_DOCUMENT_LINKS}, require_context_quality=${WORLDMONITOR_FEED_ALERTS_REQUIRE_CONTEXT_QUALITY})` : "disabled"}`,
-    `- voice_alerts: ${WORLDMONITOR_ALERT_VOICE_ENABLED ? `enabled (max_chars=${WORLDMONITOR_ALERT_VOICE_MAX_CHARS})` : "disabled"}`,
-    `- check_voice: ${WORLDMONITOR_CHECK_VOICE_ENABLED ? `enabled (max_chars=${WORLDMONITOR_CHECK_VOICE_MAX_CHARS})` : "disabled"}`,
+    `- feed_alerts: ${WORLDMONITOR_FEED_ALERTS_ENABLED ? `enabled (interval=${WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC}s, engine=native, min_level=${WORLDMONITOR_FEED_ALERTS_MIN_LEVEL}, max_article_age_h=${WORLDMONITOR_FEED_ALERTS_MAX_ARTICLE_AGE_HOURS}, sent_key_cap=${WORLDMONITOR_FEED_ALERTS_SENT_KEY_CAP}, skip_aggregators=${WORLDMONITOR_FEED_ALERTS_SKIP_AGGREGATOR_LINKS}, skip_documents=${WORLDMONITOR_FEED_ALERTS_SKIP_DOCUMENT_LINKS}, require_context_quality=${WORLDMONITOR_FEED_ALERTS_REQUIRE_CONTEXT_QUALITY})` : "disabled"}`,
+    `- voice_alerts: ${WORLDMONITOR_ALERT_VOICE_ENABLED ? "enabled (uncapped)" : "disabled"}`,
+    `- check_voice: ${WORLDMONITOR_CHECK_VOICE_ENABLED ? "enabled (uncapped)" : "disabled"}`,
     `- worker: ${workerId ? `${workerId}${worker ? ` (${String(worker.name || worker.title || workerId).trim() || workerId})` : ""}` : "(none)"}`,
     `- worker_queue: busy=${laneState.busy} queued=${laneState.queued}`,
     `- last_run: ${worldMonitorMonitor.lastRunAt ? `${nowIso(worldMonitorMonitor.lastRunAt)} (${formatRelativeAge(worldMonitorMonitor.lastRunAt)})` : "never"}`,
     `- last_alert: ${worldMonitorMonitor.lastAlertAt ? `${nowIso(worldMonitorMonitor.lastAlertAt)} (${formatRelativeAge(worldMonitorMonitor.lastAlertAt)})` : "never"}`,
+    `- interval_reports_today: ${Math.max(0, Number(worldMonitorMonitor.intervalReportCount || 0) || 0)} (day=${String(worldMonitorMonitor.intervalReportDayKey || "").trim() || "n/a"})`,
+    `- interval_report_last: ${worldMonitorMonitor.intervalReportLastAt ? `${nowIso(worldMonitorMonitor.intervalReportLastAt)} (${formatRelativeAge(worldMonitorMonitor.intervalReportLastAt)})` : "never"}`,
     `- feed_last_run: ${worldMonitorMonitor.feedAlertsLastRunAt ? `${nowIso(worldMonitorMonitor.feedAlertsLastRunAt)} (${formatRelativeAge(worldMonitorMonitor.feedAlertsLastRunAt)})` : "never"}`,
     `- feed_last_seen_at: ${worldMonitorMonitor.feedAlertsLastSeenAt ? `${nowIso(worldMonitorMonitor.feedAlertsLastSeenAt)} (${formatRelativeAge(worldMonitorMonitor.feedAlertsLastSeenAt)})` : "never"}`,
     `- last_alert_reason: ${String(worldMonitorMonitor.lastAlertReason || "").trim() || "(none)"}`,
+    `- interval_report_last_reason: ${String(worldMonitorMonitor.intervalReportLastReason || "").trim() || "(none)"}`,
     `- snapshot: ${String(worldMonitorMonitor.lastSnapshotSummary || "").trim() || "(none)"}`,
     `- last_error: ${String(worldMonitorMonitor.lastError || "").trim() || "(none)"}`,
     `- feed_last_error: ${String(worldMonitorMonitor.feedAlertsLastError || "").trim() || "(none)"}`,
     `- native_last_error: ${String(worldMonitorMonitor.nativeLastRefreshError || "").trim() || "(none)"}`,
     `- native_article_context_last_error: ${String(worldMonitorMonitor.nativeDeepIngestLastError || "").trim() || "(none)"}`,
     `- native_signals_last_error: ${String(worldMonitorMonitor.nativeSignalsLastRefreshError || "").trim() || "(none)"}`,
+    `- startup_catchup_last_error: ${String(worldMonitorMonitor.startupCatchupLastError || "").trim() || "(none)"}`,
   ];
   await sendMessage(chatId, lines.join("\n"));
 }
@@ -10518,6 +11026,9 @@ async function sendStatus(chatId) {
   const worldMonitorWorkerLabel = worldMonitorWorkerId
     ? `${worldMonitorWorkerId}${worldMonitorWorker ? ` (${String(worldMonitorWorker.name || worldMonitorWorker.title || worldMonitorWorkerId).trim() || worldMonitorWorkerId})` : ""}`
     : "(none)";
+  const startupCatchupStats = worldMonitorMonitor.startupCatchupLastStats && typeof worldMonitorMonitor.startupCatchupLastStats === "object"
+    ? worldMonitorMonitor.startupCatchupLastStats
+    : {};
 
   const lines = [
     fmtBold("Status"),
@@ -10542,8 +11053,9 @@ async function sendStatus(chatId) {
     `- tts_lane: ${ttsLane?.currentJob ? "busy" : "idle"} (queued=${ttsLane?.queue?.length || 0})`,
     `- whisper_lane: ${whisperLane?.currentJob ? "busy" : "idle"} (queued=${whisperLane?.queue?.length || 0})`,
     `- worldmonitor_source_mode: native`,
-    `- worldmonitor_monitor: ${WORLDMONITOR_MONITOR_ENABLED ? "enabled" : "disabled"} (interval=${WORLDMONITOR_MONITOR_INTERVAL_SEC}s, cooldown=${WORLDMONITOR_ALERT_COOLDOWN_SEC}s)`,
-    `- worldmonitor_feed_alerts: ${WORLDMONITOR_FEED_ALERTS_ENABLED ? "enabled" : "disabled"} (interval=${WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC}s, engine=native, min_level=${WORLDMONITOR_FEED_ALERTS_MIN_LEVEL}, taiwan_wellbeing_filter=${WORLDMONITOR_FEED_ALERTS_REQUIRE_TAIWAN_WELLBEING}, max_article_age_h=${WORLDMONITOR_FEED_ALERTS_MAX_ARTICLE_AGE_HOURS}, skip_aggregators=${WORLDMONITOR_FEED_ALERTS_SKIP_AGGREGATOR_LINKS}, skip_documents=${WORLDMONITOR_FEED_ALERTS_SKIP_DOCUMENT_LINKS}, require_context_quality=${WORLDMONITOR_FEED_ALERTS_REQUIRE_CONTEXT_QUALITY})`,
+    `- worldmonitor_monitor: ${WORLDMONITOR_MONITOR_ENABLED ? "enabled" : "disabled"} (interval=${WORLDMONITOR_MONITOR_INTERVAL_SEC}s, interval_alert_mode=${WORLDMONITOR_INTERVAL_ALERT_MODE}, headlines_min_level=${WORLDMONITOR_INTERVAL_HEADLINES_MIN_LEVEL}, report_baseline=${WORLDMONITOR_INTERVAL_REPORT_BASELINE_PER_DAY}/day, report_max=${worldMonitorIntervalReportMaxLabel()}/day, report_min_interval=${WORLDMONITOR_INTERVAL_REPORT_MIN_INTERVAL_SEC}s, report_sig_delta>=${WORLDMONITOR_INTERVAL_REPORT_SIGNIFICANT_DELTA}, cooldown=${WORLDMONITOR_ALERT_COOLDOWN_SEC}s)`,
+    `- worldmonitor_feed_alerts: ${WORLDMONITOR_FEED_ALERTS_ENABLED ? "enabled" : "disabled"} (interval=${WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC}s, engine=native, min_level=${WORLDMONITOR_FEED_ALERTS_MIN_LEVEL}, max_article_age_h=${WORLDMONITOR_FEED_ALERTS_MAX_ARTICLE_AGE_HOURS}, sent_key_cap=${WORLDMONITOR_FEED_ALERTS_SENT_KEY_CAP}, skip_aggregators=${WORLDMONITOR_FEED_ALERTS_SKIP_AGGREGATOR_LINKS}, skip_documents=${WORLDMONITOR_FEED_ALERTS_SKIP_DOCUMENT_LINKS}, require_context_quality=${WORLDMONITOR_FEED_ALERTS_REQUIRE_CONTEXT_QUALITY})`,
+    `- worldmonitor_startup_catchup: ${WORLDMONITOR_STARTUP_CATCHUP_ENABLED ? "enabled" : "disabled"} (min_lookback_h=${WORLDMONITOR_STARTUP_CATCHUP_MIN_LOOKBACK_HOURS}, per_source=${WORLDMONITOR_STARTUP_CATCHUP_ITEMS_PER_SOURCE})`,
     `- worldmonitor_article_context: ${WORLDMONITOR_DEEP_INGEST_ENABLED ? "enabled" : "disabled"} (concurrency=${WORLDMONITOR_DEEP_INGEST_CONCURRENCY}, timeout=${WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS}ms, max_per_cycle=${WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE}, lookback_hours=${WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS})`,
     `- worldmonitor_worker: ${worldMonitorWorkerLabel} | busy=${worldMonitorLane.busy} queued=${worldMonitorLane.queued}`,
     `- worldmonitor_check: ${worldMonitorComprehensiveRuntime.inFlight ? `running (${formatRelativeAge(worldMonitorComprehensiveRuntime.lastStartedAt)})` : "idle"}`,
@@ -10551,6 +11063,7 @@ async function sendStatus(chatId) {
     `- worldmonitor_last_alert: ${worldMonitorMonitor.lastAlertAt ? `${formatRelativeAge(worldMonitorMonitor.lastAlertAt)}` : "never"}`,
     `- worldmonitor_feed_last_run: ${worldMonitorMonitor.feedAlertsLastRunAt ? `${formatRelativeAge(worldMonitorMonitor.feedAlertsLastRunAt)}` : "never"}`,
     `- worldmonitor_native_refresh: ${worldMonitorMonitor.nativeLastRefreshAt ? `${formatRelativeAge(worldMonitorMonitor.nativeLastRefreshAt)}` : "never"} (items=${worldMonitorNativeNewsItems.length})`,
+    `- worldmonitor_startup_catchup_last_run: ${worldMonitorMonitor.startupCatchupLastRunAt ? `${formatRelativeAge(worldMonitorMonitor.startupCatchupLastRunAt)}` : "never"} (lookback_h=${Math.round(Number(startupCatchupStats.lookback_hours || 0) || 0)}, new=${Math.round(Number(startupCatchupStats.new_items || 0) || 0)}, feeds_ok=${Math.round(Number(startupCatchupStats.feeds_ok || 0) || 0)}/${Math.round(Number(startupCatchupStats.feeds_total || 0) || 0)})`,
     `- worldmonitor_article_context_refresh: ${worldMonitorMonitor.nativeDeepIngestLastRunAt ? `${formatRelativeAge(worldMonitorMonitor.nativeDeepIngestLastRunAt)}` : "never"} (scanned=${Math.round(Number(worldMonitorMonitor?.nativeDeepIngestLastStats?.scanned || 0) || 0)}, ok=${Math.round(Number(worldMonitorMonitor?.nativeDeepIngestLastStats?.completed || 0) || 0)}, errors=${Math.round(Number(worldMonitorMonitor?.nativeDeepIngestLastStats?.errors || 0) || 0)}, pending=${Math.round(Number(worldMonitorMonitor?.nativeDeepIngestLastStats?.remaining_pending || 0) || 0)})`,
     `- worldmonitor_native_signals_refresh: ${worldMonitorMonitor.nativeSignalsLastRefreshAt ? `${formatRelativeAge(worldMonitorMonitor.nativeSignalsLastRefreshAt)}` : "never"} (market=${Array.isArray(worldMonitorNativeSignals.marketSeries) ? worldMonitorNativeSignals.marketSeries.length : 0}, crypto=${Array.isArray(worldMonitorNativeSignals.cryptoSeries) ? worldMonitorNativeSignals.cryptoSeries.length : 0}, seismic=${Array.isArray(worldMonitorNativeSignals.seismicSeries) ? worldMonitorNativeSignals.seismicSeries.length : 0}, infra=${Array.isArray(worldMonitorNativeSignals.infrastructureSeries) ? worldMonitorNativeSignals.infrastructureSeries.length : 0}, adsb=${Array.isArray(worldMonitorNativeSignals.adsbSeries) ? worldMonitorNativeSignals.adsbSeries.length : 0}, disaster=${Array.isArray(worldMonitorNativeSignals.disasterSeries) ? worldMonitorNativeSignals.disasterSeries.length : 0}, maritime=${Array.isArray(worldMonitorNativeSignals.maritimeSeries) ? worldMonitorNativeSignals.maritimeSeries.length : 0}, services=${Array.isArray(worldMonitorNativeSignals.serviceSeries) ? worldMonitorNativeSignals.serviceSeries.length : 0}, macro=${Array.isArray(worldMonitorNativeSignals.macroSeries) ? worldMonitorNativeSignals.macroSeries.length : 0}, prediction=${Array.isArray(worldMonitorNativeSignals.predictionSeries) ? worldMonitorNativeSignals.predictionSeries.length : 0})`,
     `- worldmonitor_last_error: ${String(worldMonitorMonitor.lastError || "").trim() || "(none)"}`,
@@ -10558,7 +11071,8 @@ async function sendStatus(chatId) {
     `- worldmonitor_native_error: ${String(worldMonitorMonitor.nativeLastRefreshError || "").trim() || "(none)"}`,
     `- worldmonitor_article_context_error: ${String(worldMonitorMonitor.nativeDeepIngestLastError || "").trim() || "(none)"}`,
     `- worldmonitor_native_signals_error: ${String(worldMonitorMonitor.nativeSignalsLastRefreshError || "").trim() || "(none)"}`,
-    `- worldmonitor_check_voice: ${WORLDMONITOR_CHECK_VOICE_ENABLED ? `enabled (max_chars=${WORLDMONITOR_CHECK_VOICE_MAX_CHARS})` : "disabled"}`,
+    `- worldmonitor_startup_catchup_error: ${String(worldMonitorMonitor.startupCatchupLastError || "").trim() || "(none)"}`,
+    `- worldmonitor_check_voice: ${WORLDMONITOR_CHECK_VOICE_ENABLED ? "enabled (uncapped)" : "disabled"}`,
     `- restart: ${restartState}`,
     "",
     fmtBold("Config"),
@@ -12120,10 +12634,6 @@ function makeWorldMonitorCheckVoiceSummary(text) {
   let summary = parts.join(" ").replace(/\s+/g, " ").trim();
   if (!summary) {
     summary = oneLine(src.replace(/[*_`]/g, "")).replace(/\s+/g, " ").trim();
-  }
-  const maxChars = Math.max(120, Number(WORLDMONITOR_CHECK_VOICE_MAX_CHARS || 340) || 340);
-  if (summary.length > maxChars) {
-    summary = `${summary.slice(0, Math.max(1, maxChars - 3)).trim()}...`;
   }
   return summary;
 }
@@ -14656,18 +15166,6 @@ async function processLane(laneId) {
           if (isWorldMonitorCheckJob) {
             voiceInput = makeWorldMonitorCheckVoiceSummary(voiceInput);
           }
-          if (isWorldMonitorAlertJob && Number(WORLDMONITOR_ALERT_VOICE_MAX_CHARS) > 0) {
-            const maxChars = Number(WORLDMONITOR_ALERT_VOICE_MAX_CHARS);
-            if (voiceInput.length > maxChars) {
-              voiceInput = `${voiceInput.slice(0, Math.max(1, maxChars - 3)).trim()}...`;
-            }
-          }
-          if (isWorldMonitorCheckJob && Number(WORLDMONITOR_CHECK_VOICE_MAX_CHARS) > 0) {
-            const maxChars = Number(WORLDMONITOR_CHECK_VOICE_MAX_CHARS);
-            if (voiceInput.length > maxChars) {
-              voiceInput = `${voiceInput.slice(0, Math.max(1, maxChars - 3)).trim()}...`;
-            }
-          }
           const parts = splitVoiceReplyParts(voiceInput);
           const spokenRaw = makeSpeakableTextForTts(parts.spoken || voiceInput);
           const spoken = (isWorldMonitorAlertJob || isWorldMonitorCheckJob)
@@ -16113,11 +16611,11 @@ process.on("unhandledRejection", (err) => {
       }
       const feeds = loadWorldMonitorNativeFeedManifest();
       log(
-        `WorldMonitor monitor enabled (source=native, feeds=${feeds.length}, manifest=${WORLDMONITOR_NATIVE_FEEDS_PATH}, interval=${WORLDMONITOR_MONITOR_INTERVAL_SEC}s, cooldown=${WORLDMONITOR_ALERT_COOLDOWN_SEC}s).`,
+        `WorldMonitor monitor enabled (source=native, feeds=${feeds.length}, manifest=${WORLDMONITOR_NATIVE_FEEDS_PATH}, interval=${WORLDMONITOR_MONITOR_INTERVAL_SEC}s, interval_alert_mode=${WORLDMONITOR_INTERVAL_ALERT_MODE}, headlines_min_level=${WORLDMONITOR_INTERVAL_HEADLINES_MIN_LEVEL}, report_baseline=${WORLDMONITOR_INTERVAL_REPORT_BASELINE_PER_DAY}/day, report_max=${worldMonitorIntervalReportMaxLabel()}/day, report_min_interval=${WORLDMONITOR_INTERVAL_REPORT_MIN_INTERVAL_SEC}s, report_sig_delta>=${WORLDMONITOR_INTERVAL_REPORT_SIGNIFICANT_DELTA}, cooldown=${WORLDMONITOR_ALERT_COOLDOWN_SEC}s).`,
       );
       if (WORLDMONITOR_FEED_ALERTS_ENABLED) {
         log(
-          `WorldMonitor feed-alert relay enabled (engine=native, interval=${WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC}s, max_per_cycle=${WORLDMONITOR_FEED_ALERTS_MAX_PER_CYCLE}, min_level=${WORLDMONITOR_FEED_ALERTS_MIN_LEVEL}, taiwan_wellbeing_filter=${WORLDMONITOR_FEED_ALERTS_REQUIRE_TAIWAN_WELLBEING}, max_article_age_h=${WORLDMONITOR_FEED_ALERTS_MAX_ARTICLE_AGE_HOURS}, skip_aggregators=${WORLDMONITOR_FEED_ALERTS_SKIP_AGGREGATOR_LINKS}, skip_documents=${WORLDMONITOR_FEED_ALERTS_SKIP_DOCUMENT_LINKS}, require_context_quality=${WORLDMONITOR_FEED_ALERTS_REQUIRE_CONTEXT_QUALITY}).`,
+          `WorldMonitor feed-alert relay enabled (engine=native, interval=${WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC}s, max_per_cycle=${WORLDMONITOR_FEED_ALERTS_MAX_PER_CYCLE}, min_level=${WORLDMONITOR_FEED_ALERTS_MIN_LEVEL}, max_article_age_h=${WORLDMONITOR_FEED_ALERTS_MAX_ARTICLE_AGE_HOURS}, sent_key_cap=${WORLDMONITOR_FEED_ALERTS_SENT_KEY_CAP}, skip_aggregators=${WORLDMONITOR_FEED_ALERTS_SKIP_AGGREGATOR_LINKS}, skip_documents=${WORLDMONITOR_FEED_ALERTS_SKIP_DOCUMENT_LINKS}, require_context_quality=${WORLDMONITOR_FEED_ALERTS_REQUIRE_CONTEXT_QUALITY}).`,
         );
       } else {
         log("WorldMonitor feed-alert relay disabled (WORLDMONITOR_FEED_ALERTS_ENABLED=0).");
@@ -16128,12 +16626,18 @@ process.on("unhandledRejection", (err) => {
       log(
         `WorldMonitor article-context deep ingest ${WORLDMONITOR_DEEP_INGEST_ENABLED ? "enabled" : "disabled"} (timeout=${WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS}ms, concurrency=${WORLDMONITOR_DEEP_INGEST_CONCURRENCY}, max_per_cycle=${WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE}, lookback_hours=${WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS}, summary_words=${WORLDMONITOR_DEEP_INGEST_SUMMARY_MAX_WORDS}).`,
       );
+      log(
+        `WorldMonitor startup catch-up ${WORLDMONITOR_STARTUP_CATCHUP_ENABLED ? "enabled" : "disabled"} (min_lookback_hours=${WORLDMONITOR_STARTUP_CATCHUP_MIN_LOOKBACK_HOURS}, per_source=${WORLDMONITOR_STARTUP_CATCHUP_ITEMS_PER_SOURCE}).`,
+      );
     } else {
       log("WorldMonitor monitor disabled (WORLDMONITOR_MONITOR_ENABLED=0).");
     }
 
     await prewarmAudioKeepalives();
     await skipStaleUpdates();
+    if (WORLDMONITOR_MONITOR_ENABLED && WORLDMONITOR_STARTUP_CATCHUP_ENABLED) {
+      void runWorldMonitorStartupCatchup();
+    }
     startWorldMonitorMonitorLoop();
     startWorldMonitorFeedAlertsLoop();
 

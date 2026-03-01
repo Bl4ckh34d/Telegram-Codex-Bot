@@ -134,7 +134,10 @@ How it works:
   - macro risk regime snapshot (Yahoo + Alternative.me + mempool.space)
   - prediction-market uncertainty snapshot (Polymarket Gamma API)
   - infrastructure stress proxies from headline clusters (ports, pipelines, subsea cables)
-- Forwards only alert-level headlines you choose (for example `critical`)
+- Assigns headline severity from feed metadata fields (for example severity/priority/category labels)
+- Forwards headlines throughout the day at or above your configured minimum severity (for example `critical`)
+- Feed alerts are deduped (including normalized title-level dedupe across sources)
+- Feed alert messages use a linked headline plus a short 2-3 sentence article summary
 - Triggers only on threshold/cooldown/dedupe rules
 - Queues a Codex prompt on a dedicated WorldMonitor worker when possible
 - Sends the resulting alert summary directly in Telegram chat (text + optional short TTS voice)
@@ -197,11 +200,14 @@ Most-used toggles:
 - `WORLDMONITOR_DEEP_INGEST_RETRY_COOLDOWN_SEC`, `WORLDMONITOR_DEEP_INGEST_MAX_TEXT_CHARS`, `WORLDMONITOR_DEEP_INGEST_SUMMARY_MAX_WORDS`, `WORLDMONITOR_DEEP_INGEST_SUMMARY_MAX_CHARS` - summary quality/cost controls
 - `WORLDMONITOR_WORKDIR` - repo path for dedicated WorldMonitor worker
 - `WORLDMONITOR_MONITOR_INTERVAL_SEC` and `WORLDMONITOR_ALERT_COOLDOWN_SEC` - check cadence + anti-spam cooldown
+- `WORLDMONITOR_INTERVAL_ALERT_MODE` - interval monitor output mode: `smart` (default), `headlines`, `report`, or `off`
+- `WORLDMONITOR_INTERVAL_HEADLINES_MIN_LEVEL` - in interval `smart/headlines` mode, only forward headline links when global level is at least this severity
+- `WORLDMONITOR_INTERVAL_REPORT_BASELINE_PER_DAY`, `WORLDMONITOR_INTERVAL_REPORT_MAX_PER_DAY`, `WORLDMONITOR_INTERVAL_REPORT_MIN_INTERVAL_SEC`, `WORLDMONITOR_INTERVAL_REPORT_SIGNIFICANT_DELTA` - full report policy (default baseline 1/day, no hard cap when max_per_day=0, additional same-day reports require significant delta)
 - `WORLDMONITOR_ALERT_VOICE_ENABLED` and `WORLDMONITOR_ALERT_VOICE_MAX_CHARS` - optional voice alert output tuning
-- `WORLDMONITOR_FEED_ALERTS_ENABLED` - forward WorldMonitor feed `ALERT` headlines/links to Telegram
-- `WORLDMONITOR_FEED_ALERTS_MIN_LEVEL` - minimum feed alert severity to forward (`critical`, `high`, ...)
+- `WORLDMONITOR_FEED_ALERTS_ENABLED` - forward WorldMonitor feed `ALERT` headlines/links + short summaries to Telegram
+- `WORLDMONITOR_FEED_ALERTS_MIN_LEVEL` - minimum feed alert severity to forward (`critical` by default)
 - `WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC` - feed alert relay cadence
-- `WORLDMONITOR_FEED_ALERTS_MAX_PER_CYCLE`, `WORLDMONITOR_FEED_ALERTS_CHAT_ID` - throughput and destination chat controls
+- `WORLDMONITOR_FEED_ALERTS_MAX_PER_CYCLE`, `WORLDMONITOR_FEED_ALERTS_CHAT_ID`, `WORLDMONITOR_FEED_ALERTS_MAX_ARTICLE_AGE_HOURS`, `WORLDMONITOR_FEED_ALERTS_SENT_KEY_CAP` - throughput, destination, freshness window, and dedupe memory controls
 - `WORLDMONITOR_CHECK_LOOKBACK_HOURS`, `WORLDMONITOR_CHECK_MAX_HEADLINES`, `WORLDMONITOR_CHECK_TAIWAN_COUNTRY_CODE` - `/wmcheck` comprehensive report scope (global + Taiwan)
 
 Prompts:
