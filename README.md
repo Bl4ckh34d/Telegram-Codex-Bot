@@ -1,40 +1,41 @@
-# Telegram-Codex-Bot (AIDOLON) 🤖🎙️🧠
+# Telegram-Codex-Bot (AIDOLON)
 
-Talk to the Codex CLI from Telegram. Text in, text out. Voice in, voice out. Screenshots. Attachments. Multi-repo routing so you’re not stuck waiting on one giant job. ✨
+Use Codex from Telegram with text, voice, images, screenshots, multi-workspace routing, and file attachments.
 
-This project is built for personal use on your own machine: it runs as a long-polling Telegram bot and executes the Codex CLI locally.
+This bot is built for local personal use. It long-polls Telegram and runs Codex CLI on your machine.
 
-## What You Get (The Fun Parts) 😎
+## What it does
 
-- 🧠 Codex-in-Telegram: send a message, get an answer
-- 🎙️ Voice notes: Whisper transcribes them locally, then Codex handles the prompt
-- 🔊 Optional voice replies: auto-reply to voice notes with TTS voice messages
-- 🖼️ Vision: ask about images you send, or screenshots the bot captures
-- 🖥️ Multi-monitor screenshots: `/screenshot` grabs every monitor if you have more than one
-- 🧵 Multi-worker orchestration: separate “workspaces” per repo so long jobs don’t block everything
-- 🔁 Session resume + compress: keep long work going without constantly re-explaining yourself
-- 🧰 Attachments: the assistant can generate files and send them to you in chat
-- 🔒 A few safety rails: chat allowlist, single-instance lock, stale-update skip
+- Telegram chat to Codex prompt loop
+- Voice note transcription (Whisper)
+- Optional voice replies (TTS)
+- Image and screenshot analysis
+- Multi-worker orchestration across repos
+- Session resume and compression
+- File attachment upload from assistant output
+- Optional native WorldMonitor feed monitoring
 
-## Quickstart 🚀
+## Quickstart
 
-1. Create a Telegram bot and grab the token.
-2. Find your Telegram chat id.
-3. Copy `.env.example` to `.env` and fill in the basics:
+1. Create a Telegram bot and get the token.
+2. Get your Telegram chat ID.
+3. Copy `.env.example` to `.env`.
+4. Set at least:
    - `TELEGRAM_BOT_TOKEN`
    - `TELEGRAM_CHAT_ID`
-4. Start the bot.
+5. Start the bot.
+
+## Requirements
+
+- Node.js 18+
+- Codex CLI installed and authenticated
 
 Notes:
-- Windows is the “first-class” environment here (screenshot capture is Windows-only).
-- Voice notes need Whisper installed locally (the repo includes a setup script).
-- TTS needs ffmpeg available (or configured).
+- Windows is the first-class runtime here.
+- Screenshot capture is Windows-only.
+- Whisper and TTS are optional and can be disabled in `.env`.
 
-## Run It (For Real) 🏁
-
-Requirements:
-- Node.js 18+ (recommended)
-- Codex CLI installed and logged in
+## Run
 
 Windows (recommended):
 
@@ -43,15 +44,7 @@ copy .env.example .env
 start.cmd
 ```
 
-Whisper (voice note transcription):
-
-```bat
-setup-whisper-venv.cmd
-```
-
-TTS:
-- Enable `TTS_ENABLED=1` in `.env`
-- The Windows launcher will try to bootstrap TTS deps automatically when needed
+`start.cmd` can bootstrap Whisper and TTS dependencies when those features are enabled.
 
 Non-Windows:
 
@@ -59,189 +52,180 @@ Non-Windows:
 node bot.js
 ```
 
-## Commands (The Greatest Hits) 🎛️
+On non-Windows platforms, set up Whisper/TTS dependencies yourself if enabled.
 
-Basics:
-- `/help` - help text
-- `/status` - worker + queue status
-- `/wmstatus` - WorldMonitor monitor status + last alert snapshot
-- `/news [force|raw]` - run a WorldMonitor risk check immediately
-- `/cancel` - stop active run(s) for this chat
-- `/restart` - restart the bot process
+## Command Reference
 
-Workspaces (multi-repo, parallel workers):
-- `/workers` - list your workspaces
-- `/use <worker>` - switch active workspace
-- `/spawn <path> [title]` - create a new repo workspace
-- `/retire <worker>` - remove a workspace
+Current slash commands supported by the bot:
 
-Vision:
-- Send an image with a caption: caption becomes the question
-- Send an image without caption, then ask a question as plain text (it uses the last image)
-- `/ask <question>` - force “use the last image”
-- `/see <question>` - take screenshot(s), then analyze them
+Core:
+- `/start` or `/help` - show help
+- `/status` - worker and queue status
+- `/workers` - list workspaces/workers
+- `/use <worker_id|name|title>` - switch active workspace
+- `/spawn <local-path> [title]` - create a repo workspace
+- `/retire <worker_id|name|title>` - remove a workspace
+- `/queue` - show queued prompts
+- `/cancel` or `/stop` - cancel active run
+- `/clear` - clear queued prompts
+- `/wipe` - wipe runtime artifacts and reset chat context
+- `/restart` - restart process when workers are idle and queue is empty
 
-TTS:
-- `/tts <text>` - force a voice note reply
+Codex command staging flow:
+- `/codex` or `/commands` - show command menu
+- `/cmd <args>` - stage a raw Codex CLI command
+- `/confirm` or `/run` - execute staged command
+- `/reject` or `/deny` or `/cancelcmd` - cancel staged command
 
 Sessions:
-- `/resume` - list sessions
-- `/resume <id> [text]` - resume a session (optionally with a prompt)
+- `/resume` - list recent sessions
+- `/resume <session_id> [text]` - resume a session, optionally with text
 - `/new` - clear active resumed session
-- `/compress [hint]` - ask Codex to compress/summarize the active session
+- `/compress [hint]` - compress active session context
 
-Attachments:
-- `/sendfile <path> [caption]` - send a file from `ATTACH_ROOT`
+Vision and media:
+- `/screenshot` - capture screenshot(s), one per monitor
+- `/see <question>` - take screenshot(s) and analyze
+- `/ask <question>` - analyze your last sent image
+- `/imgclear` - clear last image context
+- `/tts <text>` - send TTS voice message
 
-## Workspaces + Router (Why This Bot Feels Snappy) 🧵
+Files:
+- `/sendfile <relative-path> [caption]` - send file from `ATTACH_ROOT`
 
-The big workflow problem with a single Codex loop is head-of-line blocking: one long job and everything else queues behind it.
+WorldMonitor:
+- `/news [force] [count]` - ranked headlines from native feed store
+- `/newsreport [force|raw]` - WorldMonitor AI check (global + Taiwan)
+- `/newsstatus` - monitor status and last alert data
 
-This bot runs multiple Codex “workers” in parallel:
-- One worker = one Codex session lane + one working directory (“workspace”)
-- Each worker runs one job at a time
-- Different workers run at the same time
+Model selection:
+- `/model` - pick model and reasoning effort for this chat
 
-Routing:
-- The bot uses an LLM router to pick the best worker for each message
-- If you reply to a previous bot message, that acts as a strong hint to keep the same worker
-- The router only proposes creating a new repo worker when you include an explicit local path
+Natural language shortcuts are also mapped to commands (for example `c` -> `/commands`).
 
-Hard cap:
-- By default you get 5 Codex workers max (configurable)
-- If the cap is hit and a new workspace is needed, the bot asks you to retire one (button click), then continues
+## Workspaces and routing
 
-Tip:
-- On startup, the bot will usually create a dedicated workspace for its own repo (so it can self-edit fast). You can retire it if you don’t want it.
+Each worker is a separate Codex lane with its own working directory.
 
-## WorldMonitor Alerts 🌍
+- One worker runs one job at a time.
+- Multiple workers run in parallel.
+- Router mode can auto-pick a worker per message.
+- Replying to a previous bot message strongly hints routing to that same worker.
 
-This bot now supports a native WorldMonitor-style feed engine, so you do not need to run the WorldMonitor app in the browser.
+Worker count is capped by `ORCH_MAX_CODEX_WORKERS` (default: 5).
 
-How it works:
-- Loads feed sources from `worldmonitor_native_feeds.json` (generated snapshot of free WorldMonitor feeds)
-- Fetches RSS/Atom feeds on interval, stores headline/link/timestamps in local runtime history
-- Deep-ingests full article pages, builds compact article summaries, and stores them as report context
-- Builds risk scores and Taiwan-focused context from accumulated history
-- Adds non-paid telemetry snapshots into context:
-  - market/FX/commodity snapshots (Yahoo public chart endpoint)
-  - crypto snapshots (CoinGecko public endpoint)
-  - seismic activity snapshots (USGS public feed)
-  - ADS-B theater posture proxy (OpenSky public states endpoint, Asia theater windows)
-  - disaster/humanitarian pressure snapshot (GDACS RSS feed)
-  - maritime warning pressure snapshot (NGA broadcast warnings API)
-  - critical service health snapshot (major public status pages)
-  - macro risk regime snapshot (Yahoo + Alternative.me + mempool.space)
-  - prediction-market uncertainty snapshot (Polymarket Gamma API)
-  - infrastructure stress proxies from headline clusters (ports, pipelines, subsea cables)
-- Assigns headline severity from feed metadata fields (for example severity/priority/category labels)
-- Forwards headlines throughout the day at or above your configured minimum severity (for example `critical`)
-- Feed alerts are deduped (including normalized title-level dedupe across sources)
-- Feed alert messages use a linked headline plus a short 2-3 sentence article summary
-- Triggers only on threshold/cooldown/dedupe rules
-- Queues a Codex prompt on a dedicated WorldMonitor worker when possible
-- Sends the resulting alert summary directly in Telegram chat (text + optional short TTS voice)
+## Voice flow
 
-## Voice Notes (Whisper) 🎙️
+Voice notes:
+1. Telegram voice note is downloaded.
+2. Whisper transcribes locally.
+3. Transcript is routed like any text prompt.
 
-When you send a voice note:
-1. The bot downloads it
-2. Local Whisper transcribes it
-3. The transcript is routed like any normal message
+Voice replies:
+- Enable `TTS_ENABLED=1`.
+- If you want automatic voice replies for incoming voice notes, set `TTS_REPLY_TO_VOICE=1`.
 
-This runs in its own lane so voice transcription doesn’t block other bot work.
+## Vision and screenshots
 
-## Voice Replies (TTS) 🔊
+- Send an image with a caption to ask directly about that image.
+- Send an image first, then ask using `/ask`.
+- `/see` captures screenshots and includes them in the vision request.
 
-If enabled, the bot can reply to voice notes with a Telegram voice message (instead of a wall of text).
+## Attachments
 
-It uses a “voice-style” prompt so answers stay TTS-friendly. The preferred output format is:
-- SPOKEN: short, clean, easy to listen to
-- TEXT_ONLY: details that should not be spoken aloud (commands, paths, long lists, etc)
+Manual:
+- `/sendfile <relative-path> [caption]`
 
-## Screenshots + Vision 🖼️🖥️
-
-- `/screenshot` sends one screenshot per monitor (primary first).
-- `/see <question>` captures screenshots and includes them in the vision prompt.
-
-## Attachments 📎
-
-The assistant can send you files in two ways:
-
-1. Manual:
-- `/sendfile <relative-path> [caption]` (relative to `ATTACH_ROOT`)
-
-2. Assistant-driven:
-- The assistant can include lines like:
+Assistant-driven:
+- The assistant can emit lines like:
   - `ATTACH: relative/path.ext | optional caption`
-  - The bot uploads the files and strips those lines from the visible message
+- The bot uploads those files and removes ATTACH lines from the visible chat message.
 
-## Configuration (The Stuff You Actually Touch) ⚙️
+## WorldMonitor (native mode)
+
+The bot uses a native feed engine. You do not need the browser WorldMonitor app.
+
+When enabled (`WORLDMONITOR_MONITOR_ENABLED=1`), it can:
+- Fetch RSS/Atom feeds from `worldmonitor_native_feeds.json`
+- Maintain a local deduped headline/history store
+- Build enriched context (including optional deep article ingest)
+- Push threshold-based alerts to Telegram
+- Run scheduled or on-demand checks (`/news`, `/newsreport`)
+
+## Configuration
+
+Use `.env.example` as the full source of truth for supported keys and defaults.
 
 Minimum required:
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 
-Most-used toggles:
-- `WHISPER_ENABLED` - voice note transcription on/off
-- `TTS_ENABLED` and `TTS_REPLY_TO_VOICE` - voice replies
-- `VISION_ENABLED` - image + screenshot analysis
-- `ORCH_MAX_CODEX_WORKERS` and `ORCH_ROUTER_ENABLED` - multi-worker routing
-- `WORLDMONITOR_MONITOR_ENABLED` - background WorldMonitor polling
-- `WORLDMONITOR_NATIVE_FEEDS_PATH` - feed manifest used in native mode
-- `WORLDMONITOR_NATIVE_FEED_TIMEOUT_MS`, `WORLDMONITOR_NATIVE_FEED_FETCH_CONCURRENCY` - native fetch behavior
-- `WORLDMONITOR_NATIVE_STORE_MAX_ITEMS`, `WORLDMONITOR_NATIVE_STORE_MAX_AGE_DAYS` - local history retention
-- `WORLDMONITOR_NATIVE_SIGNAL_TIMEOUT_MS` - timeout for non-news signal fetchers
-- `WORLDMONITOR_NATIVE_SIGNALS_REFRESH_MIN_INTERVAL_SEC`, `WORLDMONITOR_NATIVE_SEISMIC_REFRESH_MIN_INTERVAL_SEC`, `WORLDMONITOR_NATIVE_ADSB_REFRESH_MIN_INTERVAL_SEC`, `WORLDMONITOR_NATIVE_DISASTER_REFRESH_MIN_INTERVAL_SEC`, `WORLDMONITOR_NATIVE_MARITIME_REFRESH_MIN_INTERVAL_SEC`, `WORLDMONITOR_NATIVE_SERVICE_REFRESH_MIN_INTERVAL_SEC`, `WORLDMONITOR_NATIVE_MACRO_REFRESH_MIN_INTERVAL_SEC`, `WORLDMONITOR_NATIVE_PREDICTION_REFRESH_MIN_INTERVAL_SEC` - signal refresh cadence
-- `WORLDMONITOR_NATIVE_SIGNALS_MAX_AGE_DAYS` - signal history retention
-- `WORLDMONITOR_DEEP_INGEST_ENABLED` - enable full-article scraping/summarization context
-- `WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS`, `WORLDMONITOR_DEEP_INGEST_CONCURRENCY` - deep ingest fetch behavior
-- `WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE`, `WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS` - enrichment bounds (`0` means no hard cap / full retained window)
-- `WORLDMONITOR_DEEP_INGEST_RETRY_COOLDOWN_SEC`, `WORLDMONITOR_DEEP_INGEST_MAX_TEXT_CHARS`, `WORLDMONITOR_DEEP_INGEST_SUMMARY_MAX_WORDS`, `WORLDMONITOR_DEEP_INGEST_SUMMARY_MAX_CHARS` - summary quality/cost controls
-- `WORLDMONITOR_WORKDIR` - repo path for dedicated WorldMonitor worker
-- `WORLDMONITOR_MONITOR_INTERVAL_SEC` and `WORLDMONITOR_ALERT_COOLDOWN_SEC` - check cadence + anti-spam cooldown
-- `WORLDMONITOR_INTERVAL_ALERT_MODE` - interval monitor output mode: `smart` (default), `headlines`, `report`, or `off`
-- `WORLDMONITOR_INTERVAL_HEADLINES_MIN_LEVEL` - in interval `smart/headlines` mode, only forward headline links when global level is at least this severity
-- `WORLDMONITOR_INTERVAL_REPORT_BASELINE_PER_DAY`, `WORLDMONITOR_INTERVAL_REPORT_MAX_PER_DAY`, `WORLDMONITOR_INTERVAL_REPORT_MIN_INTERVAL_SEC`, `WORLDMONITOR_INTERVAL_REPORT_SIGNIFICANT_DELTA` - full report policy (default baseline 1/day, no hard cap when max_per_day=0, additional same-day reports require significant delta)
-- `WORLDMONITOR_ALERT_VOICE_ENABLED` and `WORLDMONITOR_ALERT_VOICE_MAX_CHARS` - optional voice alert output tuning
-- `WORLDMONITOR_FEED_ALERTS_ENABLED` - forward WorldMonitor feed `ALERT` headlines/links + short summaries to Telegram
-- `WORLDMONITOR_FEED_ALERTS_MIN_LEVEL` - minimum feed alert severity to forward (`critical` by default)
-- `WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC` - feed alert relay cadence
-- `WORLDMONITOR_FEED_ALERTS_MAX_PER_CYCLE`, `WORLDMONITOR_FEED_ALERTS_CHAT_ID`, `WORLDMONITOR_FEED_ALERTS_MAX_ARTICLE_AGE_HOURS`, `WORLDMONITOR_FEED_ALERTS_SENT_KEY_CAP` - throughput, destination, freshness window, and dedupe memory controls
-- `WORLDMONITOR_CHECK_LOOKBACK_HOURS`, `WORLDMONITOR_CHECK_MAX_HEADLINES`, `WORLDMONITOR_CHECK_TAIWAN_COUNTRY_CODE` - `/news` comprehensive report scope (global + Taiwan)
+High-impact bot settings:
+- `ALLOW_GROUP_CHAT`, `TELEGRAM_ALLOWED_CHAT_IDS`
+- `BOT_REQUIRE_TTY`
+- `TELEGRAM_SET_COMMANDS`, `TELEGRAM_COMMAND_SCOPE`
+
+Codex execution:
+- `CODEX_WORKDIR`
+- `CODEX_MODEL`, `CODEX_MODEL_CHOICES`
+- `CODEX_REASONING_EFFORT`
+- `CODEX_SANDBOX`, `CODEX_APPROVAL_POLICY`, `CODEX_DANGEROUS_FULL_ACCESS`
+- `CODEX_TIMEOUT_MS`
+
+Orchestration:
+- `ORCH_MAX_CODEX_WORKERS`
+- `ORCH_ROUTER_ENABLED`
+- `ORCH_ROUTER_MAX_CONCURRENCY`
+- `ORCH_ROUTER_MODEL`, `ORCH_ROUTER_REASONING_EFFORT`
+- `ORCH_ROUTER_PROMPT_FILE`
+
+Media and voice:
+- `WHISPER_ENABLED`, `WHISPER_MODEL`, `WHISPER_LANGUAGE`
+- `VISION_ENABLED`
+- `TTS_ENABLED`, `TTS_REPLY_TO_VOICE`
+- `TTS_MODEL`, `TTS_REFERENCE_AUDIO`, `TTS_FFMPEG_BIN`
+
+WorldMonitor core:
+- `WORLDMONITOR_MONITOR_ENABLED`
+- `WORLDMONITOR_NATIVE_FEEDS_PATH`
+- `WORLDMONITOR_MONITOR_INTERVAL_SEC`
+- `WORLDMONITOR_INTERVAL_ALERT_MODE`
+- `WORLDMONITOR_FEED_ALERTS_ENABLED`
+- `WORLDMONITOR_CHECK_LOOKBACK_HOURS`
+- `WORLDMONITOR_CHECK_MAX_HEADLINES`
 
 Prompts:
-- `codex_prompt.txt` - normal text mode
-- `codex_prompt_voice.txt` - voice replies (TTS-friendly)
-- `codex_prompt_router.txt` - routing decisions (do not do work, only choose a worker)
+- `CODEX_PROMPT_FILE`
+- `CODEX_VOICE_PROMPT_FILE`
+- `ORCH_ROUTER_PROMPT_FILE`
 
-## Privacy + Safety Notes 🔒
+## Prompt files
 
-This bot is designed to run on a personal machine, for a small allowlisted set of chats.
+- `codex_prompt.txt` - default text mode behavior
+- `codex_prompt_voice.txt` - voice/TTS style responses
+- `codex_prompt_router.txt` - worker routing policy
 
-- `.env` is gitignored (keep it that way)
-- `runtime/` is gitignored (logs, chat logs, screenshots, outputs, state)
-- By default, only the configured chat id is allowed
-- Group chats are blocked unless you opt in
+## Privacy and safety
 
-Important: by default this bot runs Codex in full-access mode. That’s the point for a personal automation bot, but you should treat it like “giving shell access to an assistant.” Use it in an environment you trust.
+- Do not commit `.env`.
+- Do not commit anything under `runtime/`.
+- By default, only configured chat IDs are allowed.
+- Group chats are blocked unless explicitly enabled.
 
-Foreground behavior:
-- By default, `BOT_REQUIRE_TTY=1` so the bot refuses to start without an interactive terminal.
-- If you intentionally want headless/background mode, set `BOT_REQUIRE_TTY=0`.
+This bot can run Codex with broad machine access depending on your config. Run it only in an environment you trust.
 
-## Troubleshooting 🧯
+## Troubleshooting
 
-- “poll error: fetch failed”
-  - Usually a transient network/Telegram hiccup. The bot retries automatically.
-- “Fatal startup error: TypeError: fetch failed” on `getMe`
-  - On some Windows networks, IPv6 resolution can time out. Keep `TELEGRAM_DNS_RESULT_ORDER=auto` (or set `ipv4first`) in `.env`.
-  - Startup now retries `getMe`, but persistent failures still indicate network/proxy/firewall issues.
-- Telegram command autocomplete not updating
-  - Make sure set-commands is enabled, then restart the bot.
-- “unexpected argument …”
-  - Often means an older bot window/process is still running. Stop old instances and restart.
+- `poll error: fetch failed`
+  - Usually transient network or Telegram API issue. The bot retries.
+- Startup `getMe` fetch timeout/failure
+  - Keep `TELEGRAM_DNS_RESULT_ORDER=auto` (or `ipv4first` on problematic networks).
+  - Check firewall/proxy rules if failures persist.
+- Telegram command list not updating
+  - Keep `TELEGRAM_SET_COMMANDS=1` and restart.
+- Unexpected CLI argument errors
+  - Usually an older bot process is still running. Stop old process and restart.
 
 ## License
 
-Whatever license is in this repo applies. If there isn’t one yet and you want one, say the word and I’ll add it.
+Use the repo license. If you want a specific license added, add one explicitly.

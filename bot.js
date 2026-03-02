@@ -356,6 +356,7 @@ const NATURAL_COMMAND_ALIASES = Object.freeze({
   retire: "/retire",
   queue: "/queue",
   news: "/news",
+  newsreport: "/newsreport",
   cancel: "/cancel",
   stop: "/stop",
   clear: "/clear",
@@ -378,7 +379,7 @@ const NATURAL_COMMAND_ALIASES = Object.freeze({
   tts: "/tts",
   wipe: "/wipe",
   restart: "/restart",
-  wmstatus: "/wmstatus",
+  newsstatus: "/newsstatus",
 });
 
 const NATURAL_NO_ARG_COMMANDS = new Set([
@@ -402,7 +403,7 @@ const NATURAL_NO_ARG_COMMANDS = new Set([
   "/imgclear",
   "/model",
   "/wipe",
-  "/wmstatus",
+  "/newsstatus",
 ]);
 
 const NATURAL_PREFIX_REQUIRED_COMMANDS = new Set([
@@ -426,6 +427,7 @@ const NATURAL_DIRECT_COMMANDS = new Set([
   "/workers",
   "/queue",
   "/news",
+  "/newsreport",
   "/cancel",
   "/stop",
   "/clear",
@@ -441,7 +443,7 @@ const NATURAL_DIRECT_COMMANDS = new Set([
   "/model",
   "/wipe",
   "/restart",
-  "/wmstatus",
+  "/newsstatus",
 ]);
 
 function senderLabel(msg) {
@@ -1008,6 +1010,42 @@ const WORLDMONITOR_NATIVE_FEED_ITEMS_PER_SOURCE = toInt(process.env.WORLDMONITOR
 const WORLDMONITOR_NATIVE_STORE_MAX_ITEMS = toInt(process.env.WORLDMONITOR_NATIVE_STORE_MAX_ITEMS, 16_000, 500, 100_000);
 const WORLDMONITOR_NATIVE_STORE_MAX_AGE_DAYS = toInt(process.env.WORLDMONITOR_NATIVE_STORE_MAX_AGE_DAYS, 30, 2, 365);
 const WORLDMONITOR_NATIVE_REFRESH_MIN_INTERVAL_SEC = toInt(process.env.WORLDMONITOR_NATIVE_REFRESH_MIN_INTERVAL_SEC, 240, 30, 3600);
+const WORLDMONITOR_NEWS_LIST_MAX_ITEMS = toInt(process.env.WORLDMONITOR_NEWS_LIST_MAX_ITEMS, 50, 1, 200);
+const WORLDMONITOR_NEWS_LIST_REFRESH_STALE_SEC = toInt(process.env.WORLDMONITOR_NEWS_LIST_REFRESH_STALE_SEC, 180, 0, 3600);
+const WORLDMONITOR_TRANSLATE_HEADLINES_TO_EN = toBool(
+  process.env.WORLDMONITOR_TRANSLATE_HEADLINES_TO_EN,
+  true,
+);
+const WORLDMONITOR_TRANSLATE_HEADLINES_TIMEOUT_MS = toTimeoutMs(
+  process.env.WORLDMONITOR_TRANSLATE_HEADLINES_TIMEOUT_MS,
+  4000,
+  0,
+  MAX_TIMEOUT_MS,
+);
+const WORLDMONITOR_TRANSLATE_HEADLINES_CONCURRENCY = toInt(
+  process.env.WORLDMONITOR_TRANSLATE_HEADLINES_CONCURRENCY,
+  4,
+  1,
+  12,
+);
+const WORLDMONITOR_TRANSLATE_HEADLINES_CACHE_SIZE = toInt(
+  process.env.WORLDMONITOR_TRANSLATE_HEADLINES_CACHE_SIZE,
+  5000,
+  200,
+  100000,
+);
+const WORLDMONITOR_BLOCKED_OUTLET_NAMES = parseList(
+  process.env.WORLDMONITOR_BLOCKED_OUTLETS || "Bild,Blick,The Telegraph,Fox News",
+)
+  .map((x) => String(x || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, " ").trim())
+  .filter(Boolean);
+const WORLDMONITOR_BLOCKED_OUTLET_NAME_SET = new Set(WORLDMONITOR_BLOCKED_OUTLET_NAMES);
+const WORLDMONITOR_BLOCKED_OUTLET_DOMAINS = parseList(
+  process.env.WORLDMONITOR_BLOCKED_OUTLET_DOMAINS || "bild.de,blick.ch,telegraph.co.uk,foxnews.com",
+)
+  .map((x) => String(x || "").trim().toLowerCase().replace(/^\.+/, "").replace(/\.+$/, "").replace(/^www\./, ""))
+  .filter(Boolean);
+const WORLDMONITOR_BLOCKED_OUTLET_DOMAIN_SET = new Set(WORLDMONITOR_BLOCKED_OUTLET_DOMAINS);
 const WORLDMONITOR_NATIVE_SIGNAL_TIMEOUT_MS = toTimeoutMs(process.env.WORLDMONITOR_NATIVE_SIGNAL_TIMEOUT_MS, 10_000, 0, MAX_TIMEOUT_MS);
 const WORLDMONITOR_NATIVE_SIGNALS_MAX_AGE_DAYS = toInt(process.env.WORLDMONITOR_NATIVE_SIGNALS_MAX_AGE_DAYS, 90, 7, 365);
 const WORLDMONITOR_NATIVE_SIGNALS_REFRESH_MIN_INTERVAL_SEC = toInt(process.env.WORLDMONITOR_NATIVE_SIGNALS_REFRESH_MIN_INTERVAL_SEC, 300, 60, 3600);
@@ -1340,6 +1378,7 @@ const worldMonitorNativeNewsItems = Array.isArray(worldMonitorNativeStoreRaw?.it
       return next;
     })
     .filter(Boolean)
+    .filter((item) => !isWorldMonitorBlockedOutletItem(item))
     .slice(-WORLDMONITOR_NATIVE_STORE_MAX_ITEMS)
   : [];
 const worldMonitorNativeSignalsRaw = readJson(WORLDMONITOR_NATIVE_SIGNALS_PATH, {
@@ -1642,6 +1681,8 @@ const worldMonitorNativeRuntime = {
   deepIngestPromise: null,
   startupCatchupPromise: null,
 };
+const worldMonitorHeadlineTranslationCache = new Map();
+const worldMonitorHeadlineTranslationInFlight = new Map();
 let pendingRestartRequest = null; // { requestedAt, chatIds:Set<string> }
 let restartTriggerInFlight = false;
 const updateFailureCounts = new Map(); // update_id -> consecutive handler failures
@@ -2700,13 +2741,16 @@ async function triggerRestartNow(reason = "") {
     `Restart requested (reason=${restartReasonTag}, active=${counts.active}, queued=${counts.queued}, notify_chats=${notifyChats.length}).`,
     "restart",
   );
-  let text = "Restarting bot now...";
-  if (reason === "forced") {
-    text = "Force restart requested. Restarting bot now...";
-  } else if (reason === "idle" || !reason) {
-    text = "All workers are finished. Restarting bot now...";
+  const normalizedReason = String(reason || "").trim().toLowerCase();
+  let text = "Restart confirmed. Restarting bot now...";
+  if (normalizedReason === "forced") {
+    text = "Force restart confirmed. Restarting bot now...";
+  } else if (normalizedReason === "job completion") {
+    text = "Task completed. Restart confirmed. Restarting bot now...";
+  } else if (normalizedReason === "idle" || !normalizedReason) {
+    text = "All workers are finished. Restart confirmed. Restarting bot now...";
   } else {
-    text = `All workers are finished (${reason}). Restarting bot now...`;
+    text = `All workers are finished (${reason}). Restart confirmed. Restarting bot now...`;
   }
   for (const chatId of notifyChats) {
     try {
@@ -5251,8 +5295,9 @@ function getTelegramCommandList() {
     { command: "spawn", description: "create a repo workspace" },
     { command: "retire", description: "remove a workspace" },
     { command: "queue", description: "show queued prompts" },
-    { command: "news", description: "worldmonitor global+taiwan AI check" },
-    { command: "wmstatus", description: "worldmonitor monitor status" },
+    { command: "news", description: "show ranked worldmonitor headlines" },
+    { command: "newsreport", description: "worldmonitor global+taiwan AI check" },
+    { command: "newsstatus", description: "worldmonitor monitor status" },
     { command: "codex", description: "show codex command menu" },
     { command: "commands", description: "show codex command menu" },
     { command: "cmd", description: "stage a raw codex CLI command" },
@@ -5279,18 +5324,48 @@ function getTelegramCommandList() {
   ];
 }
 
+function getTelegramCommandScopesForSync() {
+  const allowed = new Set([
+    "default",
+    "all_private_chats",
+    "all_group_chats",
+    "all_chat_administrators",
+  ]);
+  const requested = TELEGRAM_COMMAND_SCOPES.length > 0 ? TELEGRAM_COMMAND_SCOPES : ["default"];
+  const ordered = ["default", ...requested];
+  const out = [];
+  const seen = new Set();
+  for (const rawScope of ordered) {
+    const scope = String(rawScope || "").trim().toLowerCase();
+    if (!scope || seen.has(scope)) continue;
+    if (!allowed.has(scope)) continue;
+    seen.add(scope);
+    out.push(scope);
+  }
+  if (out.length === 0) out.push("default");
+  return out;
+}
+
 async function setTelegramCommands() {
   const commands = getTelegramCommandList();
-  const scopes = TELEGRAM_COMMAND_SCOPES.length > 0 ? TELEGRAM_COMMAND_SCOPES : ["default"];
-  const uniqueScopes = [];
-  for (const s of scopes) {
-    const key = String(s || "").trim().toLowerCase();
-    if (!key) continue;
-    if (!uniqueScopes.includes(key)) uniqueScopes.push(key);
-  }
-  if (uniqueScopes.length === 0) uniqueScopes.push("default");
 
-  for (const scope of uniqueScopes) {
+  // Remove stale per-chat overrides so global command scopes stay authoritative.
+  for (const rawChatId of ALLOWED_CHAT_IDS) {
+    const chatId = String(rawChatId || "").trim();
+    if (!chatId) continue;
+    try {
+      await telegramApi("deleteMyCommands", {
+        body: {
+          scope: { type: "chat", chat_id: chatId },
+        },
+      });
+    } catch (err) {
+      log(`deleteMyCommands(chat:${chatId}) failed: ${redactError(err?.message || err)}`);
+    }
+  }
+
+  const scopes = getTelegramCommandScopesForSync();
+  for (const scope of scopes) {
     const body = { commands };
     if (scope && scope !== "default") {
       body.scope = { type: scope };
@@ -5892,6 +5967,22 @@ function parseNaturalCommand(text) {
   let arg = parts.slice(1).join(" ").trim();
   if (cmd === "/news") {
     const politeArg = arg.replace(/[.!?]+$/g, "").trim().toLowerCase();
+    if (/^(?:please|pls|now|today|latest|last(?:\s+24h)?|last\s+24\s+hours?)$/.test(politeArg)) {
+      arg = "";
+    } else if (arg) {
+      const parsedNewsArg = parseNewsListCommandArg(arg);
+      if (parsedNewsArg.ok) {
+        arg = String(parsedNewsArg.argText || "").trim();
+      } else if (!prefixMode) {
+        // Don't hijack regular conversation that happens to begin with "news".
+        return null;
+      } else {
+        arg = "";
+      }
+    }
+  }
+  if (cmd === "/newsreport") {
+    const politeArg = arg.replace(/[.!?]+$/g, "").trim().toLowerCase();
     if (/^(?:please|pls|now|today|latest)$/.test(politeArg)) {
       arg = "";
     } else if (arg) {
@@ -5899,7 +5990,6 @@ function parseNaturalCommand(text) {
       if (parsedNewsArg.ok) {
         arg = String(parsedNewsArg.argText || "").trim();
       } else if (!prefixMode) {
-        // Don't hijack regular conversation that happens to begin with "news".
         return null;
       } else {
         arg = "";
@@ -5943,19 +6033,10 @@ function parseNaturalCommand(text) {
 }
 
 const BACKGROUND_LOCAL_COMMANDS = new Set([
-  "/help",
-  "/codex",
-  "/commands",
-  "/status",
-  "/workers",
-  "/queue",
+  // Keep slash commands synchronous by default so users get immediate,
+  // in-order command responses instead of delayed background output.
+  // /news can take longer when a feed refresh runs, so process it in background.
   "/news",
-  "/screenshot",
-  "/sendfile",
-  "/model",
-  "/wmstatus",
-  "/imgclear",
-  "/wipe",
 ]);
 
 function shouldRunCommandInBackground(parsed) {
@@ -6011,9 +6092,10 @@ async function sendHelp(chatId) {
     "- /workers - list workspaces/workers",
     "- /use <worker_id, name, or title> - switch active workspace",
     "- /queue - show queued prompts",
-    "- /news [force|raw] - WorldMonitor AI check (global + Taiwan)",
-    "- Say \"give me the news\" - runs the same WorldMonitor check flow",
-    "- /wmstatus - show WorldMonitor monitor state and last alerts",
+    "- /news [force] [count] - severity-ranked WorldMonitor headlines (today first, then previous days)",
+    "- /newsreport [force|raw] - WorldMonitor AI check (global + Taiwan)",
+    "- Say \"give me the news\" - runs the same /newsreport check flow",
+    "- /newsstatus - show WorldMonitor monitor state and last alerts",
     "- /cancel - stop current AIDOLON run",
     "- /clear - clear queued prompts",
     "- /wipe - wipe runtime files and reset this chat context",
@@ -6063,6 +6145,89 @@ function parseNewsCommandArg(argText) {
     forceAlert,
     rawMode,
     argText: argNormalized,
+  };
+}
+
+function parseNewsListCommandArg(argText) {
+  const raw = String(argText || "").trim().toLowerCase();
+  if (!raw) {
+    return {
+      ok: true,
+      forceRefresh: false,
+      maxItems: WORLDMONITOR_NEWS_LIST_MAX_ITEMS,
+      argText: "",
+    };
+  }
+
+  const normalized = raw
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const tokens = normalized ? normalized.split(" ").filter(Boolean) : [];
+  if (tokens.length === 0) {
+    return {
+      ok: true,
+      forceRefresh: false,
+      maxItems: WORLDMONITOR_NEWS_LIST_MAX_ITEMS,
+      argText: "",
+    };
+  }
+
+  let forceRefresh = false;
+  let maxItems = WORLDMONITOR_NEWS_LIST_MAX_ITEMS;
+  const allowed = new Set([
+    "force",
+    "refresh",
+    "update",
+    "latest",
+    "today",
+    "now",
+    "last",
+    "24h",
+    "24hr",
+    "24hrs",
+    "24",
+    "hours",
+    "hour",
+    "h",
+    "articles",
+    "article",
+    "news",
+    "please",
+    "pls",
+    "top",
+    "show",
+    "limit",
+    "max",
+  ]);
+
+  for (const token of tokens) {
+    if (token === "force" || token === "refresh" || token === "update") {
+      forceRefresh = true;
+      continue;
+    }
+    if (/^\d+$/.test(token)) {
+      maxItems = toInt(Number(token), WORLDMONITOR_NEWS_LIST_MAX_ITEMS, 1, 200);
+      continue;
+    }
+    if (!allowed.has(token)) {
+      return {
+        ok: false,
+        forceRefresh,
+        maxItems: WORLDMONITOR_NEWS_LIST_MAX_ITEMS,
+        argText: "",
+      };
+    }
+  }
+
+  const argParts = [];
+  if (forceRefresh) argParts.push("force");
+  if (maxItems !== WORLDMONITOR_NEWS_LIST_MAX_ITEMS) argParts.push(String(maxItems));
+  return {
+    ok: true,
+    forceRefresh,
+    maxItems,
+    argText: argParts.join(" "),
   };
 }
 
@@ -6144,7 +6309,9 @@ function looksLikeNewsCommandMetaText(text) {
 
   const commandMentions = [
     /\b\/news\b/,
+    /\b\/newsreport\b/,
     /\bslash\s+news\b/,
+    /\bslash\s+newsreport\b/,
     /\b(?:news|headlines)\s+(?:request|feature|function|command|commands|handler|trigger|workflow|mode)\b/,
     /\b(?:request|feature|function|command|commands|handler|trigger|workflow|mode)\b.*\b(?:news|headlines)\b/,
   ];
@@ -6213,14 +6380,14 @@ async function maybeHandlePendingNaturalNewsFollowup(chatId, text, { replyToMess
   const parsedArg = parseNaturalNewsArgFromText(lower, { allowBareValue: true });
   if (parsedArg.ok) {
     clearPendingNaturalNewsFollowup(chatId);
-    await handleNewsCommand(chatId, parsedArg.argText);
+    await handleNewsReportCommand(chatId, parsedArg.argText);
     return true;
   }
 
   clearPendingNaturalNewsFollowup(chatId);
   await sendMessage(
     chatId,
-    "I run WorldMonitor checks for news now. Use /news, /news force, or /news raw.",
+    "Use /news for severity-ranked headlines, or /newsreport (/newsreport force or /newsreport raw) for checks.",
     { replyToMessageId },
   );
   return true;
@@ -6235,7 +6402,7 @@ async function maybeHandleNaturalNewsRequest(chatId, text, { replyToMessageId = 
   if (!request.matched) return false;
 
   clearPendingNaturalNewsFollowup(chatId);
-  await handleNewsCommand(chatId, request.argText);
+  await handleNewsReportCommand(chatId, request.argText);
   return true;
 }
 
@@ -6414,7 +6581,267 @@ async function runWorldMonitorCheckCommand(chatId, argText, options = {}) {
   });
 }
 
+function worldMonitorHeadlineTranslationKey(title) {
+  return normalizeWorldMonitorTitleForKey(oneLine(String(title || "")).trim());
+}
+
+function rememberWorldMonitorHeadlineTranslation(key, value) {
+  if (!key) return;
+  if (worldMonitorHeadlineTranslationCache.has(key)) {
+    worldMonitorHeadlineTranslationCache.delete(key);
+  }
+  worldMonitorHeadlineTranslationCache.set(key, value);
+  while (worldMonitorHeadlineTranslationCache.size > WORLDMONITOR_TRANSLATE_HEADLINES_CACHE_SIZE) {
+    const oldest = worldMonitorHeadlineTranslationCache.keys().next().value;
+    if (!oldest) break;
+    worldMonitorHeadlineTranslationCache.delete(oldest);
+  }
+}
+
+function parseWorldMonitorHeadlineTranslationPayload(payload) {
+  let parsed = null;
+  try {
+    parsed = JSON.parse(String(payload || ""));
+  } catch {
+    return { title: "", sourceLang: "" };
+  }
+  const chunks = Array.isArray(parsed?.[0]) ? parsed[0] : [];
+  const title = chunks
+    .map((chunk) => (Array.isArray(chunk) ? String(chunk[0] || "") : ""))
+    .join("")
+    .replace(/\s+/g, " ")
+    .trim();
+  const sourceLang = String(parsed?.[2] || "").trim().toLowerCase();
+  return { title, sourceLang };
+}
+
+async function translateWorldMonitorHeadlineToEnglish(rawTitle, options = {}) {
+  const normalizedTitle = oneLine(String(rawTitle || "")).trim();
+  if (!normalizedTitle) {
+    return {
+      title: "",
+      sourceLang: "",
+      translated: false,
+      ok: false,
+      skipped: "empty",
+    };
+  }
+  if (!WORLDMONITOR_TRANSLATE_HEADLINES_TO_EN) {
+    return {
+      title: normalizedTitle,
+      sourceLang: "",
+      translated: false,
+      ok: true,
+      skipped: "disabled",
+    };
+  }
+
+  const cacheKey = worldMonitorHeadlineTranslationKey(normalizedTitle);
+  if (cacheKey && worldMonitorHeadlineTranslationCache.has(cacheKey)) {
+    const cached = worldMonitorHeadlineTranslationCache.get(cacheKey) || {};
+    return {
+      title: String(cached.title || normalizedTitle).trim() || normalizedTitle,
+      sourceLang: String(cached.sourceLang || "").trim(),
+      translated: cached.translated === true,
+      ok: true,
+      cacheHit: true,
+    };
+  }
+  if (cacheKey && worldMonitorHeadlineTranslationInFlight.has(cacheKey)) {
+    return await worldMonitorHeadlineTranslationInFlight.get(cacheKey);
+  }
+
+  const timeoutMs = Number(options?.timeoutMs || WORLDMONITOR_TRANSLATE_HEADLINES_TIMEOUT_MS);
+  const translationPromise = (async () => {
+    try {
+      const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=${encodeURIComponent(normalizedTitle)}`;
+      const response = await fetchTextUrl(url, { timeoutMs });
+      const parsed = parseWorldMonitorHeadlineTranslationPayload(response?.text || "");
+      const translatedTitle = oneLine(String(parsed?.title || "")).trim();
+      const sourceLang = oneLine(String(parsed?.sourceLang || "")).toLowerCase().trim();
+      const sourceLangBase = sourceLang.split(/[-_]/)[0];
+      const title = translatedTitle || normalizedTitle;
+      const translated = Boolean(
+        (sourceLangBase && sourceLangBase !== "en" && sourceLangBase !== "und")
+        || (translatedTitle && worldMonitorHeadlineTranslationKey(translatedTitle) !== cacheKey),
+      );
+      if (cacheKey) {
+        rememberWorldMonitorHeadlineTranslation(cacheKey, {
+          title,
+          sourceLang,
+          translated,
+          at: Date.now(),
+        });
+      }
+      return { title, sourceLang, translated, ok: true };
+    } catch {
+      return {
+        title: normalizedTitle,
+        sourceLang: "",
+        translated: false,
+        ok: false,
+        skipped: "translate_failed",
+      };
+    }
+  })();
+
+  if (cacheKey) {
+    worldMonitorHeadlineTranslationInFlight.set(cacheKey, translationPromise);
+  }
+  try {
+    return await translationPromise;
+  } finally {
+    if (cacheKey) {
+      worldMonitorHeadlineTranslationInFlight.delete(cacheKey);
+    }
+  }
+}
+
+async function translateWorldMonitorHeadlineBatchToEnglish(headlines, options = {}) {
+  const items = Array.isArray(headlines) ? headlines : [];
+  const unique = [];
+  const seenKeys = new Set();
+  for (const headline of items) {
+    const title = oneLine(String(headline || "")).trim();
+    if (!title) continue;
+    const key = worldMonitorHeadlineTranslationKey(title);
+    if (!key || seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    unique.push({ key, title });
+  }
+  const translatedByKey = new Map();
+  if (unique.length === 0) return translatedByKey;
+  const concurrency = Math.max(
+    1,
+    Number(options?.concurrency || WORLDMONITOR_TRANSLATE_HEADLINES_CONCURRENCY || 1) || 1,
+  );
+  let cursor = 0;
+  async function workerLoop() {
+    for (;;) {
+      const idx = cursor;
+      cursor += 1;
+      if (idx >= unique.length) break;
+      const row = unique[idx];
+      const translated = await translateWorldMonitorHeadlineToEnglish(row.title, options);
+      translatedByKey.set(row.key, oneLine(String(translated?.title || row.title)).trim() || row.title);
+    }
+  }
+  const workers = [];
+  for (let i = 0; i < concurrency; i += 1) {
+    workers.push(workerLoop());
+  }
+  await Promise.all(workers);
+  return translatedByKey;
+}
+
+async function runWorldMonitorNewsListCommand(chatId, argText) {
+  const parsed = parseNewsListCommandArg(argText);
+  if (!parsed.ok) {
+    await sendMessage(chatId, "Usage: /news [force] [count]");
+    return;
+  }
+
+  const targetMaxItems = toInt(parsed.maxItems, WORLDMONITOR_NEWS_LIST_MAX_ITEMS, 1, 200);
+  const refreshLookbackHours = Math.max(48, Number(WORLDMONITOR_CHECK_LOOKBACK_HOURS || 168));
+  const refreshSinceMs = Date.now() - (refreshLookbackHours * 60 * 60 * 1000);
+  const nowMs = Date.now();
+  const lastRefreshAt = Number(worldMonitorMonitor.nativeLastRefreshAt || 0) || 0;
+  const hasCachedItems = Array.isArray(worldMonitorNativeNewsItems) && worldMonitorNativeNewsItems.length > 0;
+  const staleWindowMs = WORLDMONITOR_NEWS_LIST_REFRESH_STALE_SEC > 0
+    ? WORLDMONITOR_NEWS_LIST_REFRESH_STALE_SEC * 1000
+    : 0;
+  const staleByAge = staleWindowMs > 0 && (!lastRefreshAt || (nowMs - lastRefreshAt) >= staleWindowMs);
+  const shouldRefresh = parsed.forceRefresh === true || !hasCachedItems || staleByAge;
+
+  let refreshError = "";
+  if (shouldRefresh) {
+    const refresh = await runWorldMonitorNativeFeedRefresh({
+      force: parsed.forceRefresh === true,
+      minPublishedAtMs: refreshSinceMs,
+    });
+    refreshError = !refresh?.ok ? String(refresh?.error || "").trim() : "";
+  }
+
+  const selected = selectWorldMonitorNewsListItems({
+    maxItems: targetMaxItems,
+    startDay: utcDayKeyNow(),
+  });
+  const shownItems = Array.isArray(selected?.items) ? selected.items : [];
+  if (shownItems.length === 0) {
+    const lines = [
+      `${fmtBold("News")} no tracked articles found for today or recent fallback days.`,
+    ];
+    if (refreshError) {
+      lines.push(`Refresh warning: ${refreshError}`);
+    }
+    await sendMessage(chatId, lines.join("\n"));
+    return;
+  }
+
+  const poolSize = Math.max(0, Number(selected?.poolSize || 0) || 0);
+  const hiddenCount = Math.max(0, poolSize - shownItems.length);
+  const dayCount = Math.max(0, Array.isArray(selected?.dayKeys) ? selected.dayKeys.length : 0);
+
+  const lines = [
+    `${fmtBold("News")} showing ${shownItems.length} article${shownItems.length === 1 ? "" : "s"} ranked critical -> high -> medium -> low${dayCount > 0 ? ` across ${dayCount} day${dayCount === 1 ? "" : "s"}` : ""}.`,
+  ];
+  if (refreshError) {
+    lines.push(`Refresh warning: ${refreshError}`);
+  }
+  if (hiddenCount > 0) {
+    lines.push(`Use /news ${Math.min(200, poolSize)} to show more, or /news force to refresh.`);
+  }
+  lines.push("");
+  const translatedTitleByKey = await translateWorldMonitorHeadlineBatchToEnglish(
+    shownItems.map((x) => oneLine(String(x?.title || "").trim())),
+  );
+
+  for (let i = 0; i < shownItems.length; i += 1) {
+    const item = shownItems[i];
+    const level = String(item?.threatLevel || "low").trim().toLowerCase() || "low";
+    const source = oneLine(String(item?.source || "Unknown").trim() || "Unknown");
+    const rawTitle = oneLine(String(item?.title || "").trim());
+    const titleKey = worldMonitorHeadlineTranslationKey(rawTitle);
+    const title = titleKey
+      ? (translatedTitleByKey.get(titleKey) || rawTitle || "(untitled)")
+      : (rawTitle || "(untitled)");
+    const ts = Number(item?.publishedAt || item?.firstSeenAt || 0) || 0;
+    const age = ts > 0 ? formatRelativeAge(ts) : "time unknown";
+    const link = normalizeWorldMonitorLink(item?.link || "");
+    lines.push(`${i + 1}. [${level}] ${formatWorldMonitorHeadlineLink(title, link)}`);
+    lines.push(`   ${source} | ${age}`);
+  }
+
+  await sendMessage(chatId, lines.join("\n"));
+}
+
+function formatWorldMonitorHeadlineLink(title, link) {
+  const safeTitle = oneLine(String(title || "").trim())
+    .replace(/\[/g, "(")
+    .replace(/\]/g, ")")
+    || "(untitled)";
+  const safeLink = normalizeWorldMonitorLink(link || "");
+  if (!safeLink) return safeTitle;
+  return `[${safeTitle}](${safeLink})`;
+}
+
 async function handleNewsCommand(chatId, argText) {
+  clearPendingNaturalNewsFollowup(chatId);
+  const parsed = parseNewsListCommandArg(argText);
+  if (!parsed.ok) {
+    await sendMessage(chatId, "Usage: /news [force] [count]");
+    return;
+  }
+
+  const ack = parsed.forceRefresh
+    ? "News request received. Refreshing feeds and preparing severity-ranked headlines..."
+    : "News request received. Preparing severity-ranked headlines...";
+  await sendMessage(chatId, ack);
+
+  await runWorldMonitorNewsListCommand(chatId, parsed.argText);
+}
+
+async function handleNewsReportCommand(chatId, argText) {
   clearPendingNaturalNewsFollowup(chatId);
   await runWorldMonitorCheckCommand(chatId, argText, { announceStart: true });
 }
@@ -6551,6 +6978,66 @@ function normalizeWorldMonitorLink(rawUrl) {
   } catch {
     return raw;
   }
+}
+
+function normalizeWorldMonitorOutletName(rawName) {
+  return String(rawName || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function normalizeWorldMonitorOutletHost(rawHost) {
+  let host = String(rawHost || "").trim().toLowerCase();
+  if (!host) return "";
+  host = host.replace(/^\.+/, "").replace(/\.+$/, "");
+  if (!host) return "";
+  host = host.split(":")[0];
+  if (!host) return "";
+  return host.startsWith("www.") ? host.slice(4) : host;
+}
+
+function worldMonitorOutletHostFromUrl(rawUrl) {
+  const url = normalizeWorldMonitorLink(rawUrl || "");
+  if (!url) return "";
+  try {
+    return normalizeWorldMonitorOutletHost(String(new URL(url).hostname || ""));
+  } catch {
+    return "";
+  }
+}
+
+function isWorldMonitorBlockedOutletName(rawName) {
+  const normalized = normalizeWorldMonitorOutletName(rawName);
+  if (!normalized) return false;
+  if (WORLDMONITOR_BLOCKED_OUTLET_NAME_SET.has(normalized)) return true;
+  for (const blocked of WORLDMONITOR_BLOCKED_OUTLET_NAME_SET) {
+    if (!blocked) continue;
+    if (normalized.includes(blocked)) return true;
+  }
+  return false;
+}
+
+function isWorldMonitorBlockedOutletHost(rawHost) {
+  const normalizedHost = normalizeWorldMonitorOutletHost(rawHost);
+  if (!normalizedHost) return false;
+  for (const blocked of WORLDMONITOR_BLOCKED_OUTLET_DOMAIN_SET) {
+    if (!blocked) continue;
+    if (normalizedHost === blocked || normalizedHost.endsWith(`.${blocked}`)) return true;
+  }
+  return false;
+}
+
+function isWorldMonitorBlockedOutletSource({ name = "", url = "", host = "" } = {}) {
+  if (isWorldMonitorBlockedOutletName(name)) return true;
+  const candidateHost = normalizeWorldMonitorOutletHost(host) || worldMonitorOutletHostFromUrl(url);
+  return isWorldMonitorBlockedOutletHost(candidateHost);
+}
+
+function isWorldMonitorBlockedOutletItem(item) {
+  const source = String(item?.source || "").trim();
+  const link = String(item?.link || "").trim();
+  return isWorldMonitorBlockedOutletSource({ name: source, url: link });
 }
 
 function worldMonitorNormalizeNativeThreatLevel(rawValue) {
@@ -6752,6 +7239,8 @@ function parseWorldMonitorFeedXml(xmlText, feed, fetchedAt, options = {}) {
     const title = worldMonitorExtractFirstXmlTag(block, ["title"]);
     const link = worldMonitorExtractLinkFromItem(block);
     if (!title || !link) continue;
+    const sourceName = String(feed?.name || "Unknown").trim() || "Unknown";
+    if (isWorldMonitorBlockedOutletSource({ name: sourceName, url: link })) continue;
     const publishedRaw = worldMonitorExtractFirstXmlTag(block, ["pubDate", "published", "updated", "dc:date", "date"]);
     const publishedAt = Number(Date.parse(publishedRaw)) || Number(fetchedAt || Date.now());
     if (minPublishedAtMs > 0 && publishedAt > 0 && publishedAt < minPublishedAtMs) continue;
@@ -6762,7 +7251,7 @@ function parseWorldMonitorFeedXml(xmlText, feed, fetchedAt, options = {}) {
     const countries = worldMonitorExtractCountryCodes(title);
     items.push({
       articleKey,
-      source: String(feed?.name || "Unknown").trim() || "Unknown",
+      source: sourceName,
       feedSection: String(feed?.section || "").trim().toLowerCase(),
       feedCategory: String(feed?.category || "").trim().toLowerCase(),
       title: String(title || "").trim(),
@@ -7360,6 +7849,7 @@ function loadWorldMonitorNativeFeedManifest() {
     const url = normalizeWorldMonitorLink(String(item.url || "").trim());
     const name = String(item.name || "").trim();
     if (!name || !url) continue;
+    if (isWorldMonitorBlockedOutletSource({ name, url })) continue;
     const key = url.toLowerCase();
     if (dedup.has(key)) continue;
     dedup.set(key, {
@@ -7378,6 +7868,7 @@ function pruneWorldMonitorNativeStore(nowMs = Date.now()) {
   const minTime = Number(nowMs || Date.now()) - maxAgeMs;
   const kept = [];
   for (const item of worldMonitorNativeNewsItems) {
+    if (isWorldMonitorBlockedOutletItem(item)) continue;
     const lastSeen = Number(item?.lastSeenAt || item?.firstSeenAt || item?.publishedAt || 0) || 0;
     if (lastSeen < minTime) continue;
     kept.push(item);
@@ -8822,8 +9313,106 @@ function getWorldMonitorNativeRecentItems(options = {}) {
   const lookbackHours = Math.max(1, Number(options?.lookbackHours || WORLDMONITOR_CHECK_LOOKBACK_HOURS || 168));
   const minTs = Date.now() - (lookbackHours * 60 * 60 * 1000);
   return worldMonitorNativeNewsItems
+    .filter((x) => !isWorldMonitorBlockedOutletItem(x))
     .filter((x) => Number(x?.publishedAt || x?.firstSeenAt || 0) >= minTs)
     .sort((a, b) => Number(b.publishedAt || b.firstSeenAt || 0) - Number(a.publishedAt || a.firstSeenAt || 0));
+}
+
+function worldMonitorItemTimestampMs(item) {
+  const ts = Number(item?.publishedAt || item?.firstSeenAt || 0);
+  return Number.isFinite(ts) && ts > 0 ? ts : 0;
+}
+
+function worldMonitorSortBySeverityThenRecency(items) {
+  const list = Array.isArray(items) ? items.slice() : [];
+  return list.sort((a, b) => {
+    const aRank = worldMonitorFeedAlertLevelRank(a?.threatLevel || "low");
+    const bRank = worldMonitorFeedAlertLevelRank(b?.threatLevel || "low");
+    if (bRank !== aRank) return bRank - aRank;
+    const tsDelta = worldMonitorItemTimestampMs(b) - worldMonitorItemTimestampMs(a);
+    if (tsDelta !== 0) return tsDelta;
+    const sourceDelta = String(a?.source || "").localeCompare(String(b?.source || ""), undefined, { sensitivity: "base" });
+    if (sourceDelta !== 0) return sourceDelta;
+    return String(a?.title || "").localeCompare(String(b?.title || ""), undefined, { sensitivity: "base" });
+  });
+}
+
+function selectWorldMonitorNewsListItems(options = {}) {
+  const sourceItems = Array.isArray(options?.items) ? options.items : worldMonitorNativeNewsItems;
+  const maxItems = toInt(options?.maxItems, WORLDMONITOR_NEWS_LIST_MAX_ITEMS, 1, 200);
+  const maxDaysBack = toInt(options?.maxDaysBack, WORLDMONITOR_NATIVE_STORE_MAX_AGE_DAYS, 1, WORLDMONITOR_NATIVE_STORE_MAX_AGE_DAYS);
+  const requestedStartDay = String(options?.startDay || utcDayKeyNow()).trim();
+  const startDay = isUtcDayKey(requestedStartDay) ? requestedStartDay : utcDayKeyNow();
+
+  const dedup = new Map();
+  for (const item of sourceItems) {
+    if (isWorldMonitorBlockedOutletItem(item)) continue;
+    const ts = worldMonitorItemTimestampMs(item);
+    if (ts <= 0) continue;
+    const dayKey = utcDayKeyFromMs(ts);
+    if (!dayKey) continue;
+    const dedupeKey = String(item?.articleKey || "").trim()
+      || normalizeWorldMonitorLink(item?.link || "")
+      || `${normalizeWorldMonitorTitleForKey(item?.title || "")}|${dayKey}`;
+    if (!dedupeKey) continue;
+    const prev = dedup.get(dedupeKey);
+    if (!prev || ts > worldMonitorItemTimestampMs(prev)) dedup.set(dedupeKey, item);
+  }
+  if (dedup.size <= 0) {
+    return {
+      items: [],
+      dayKeys: [],
+      poolSize: 0,
+    };
+  }
+
+  const itemsByDay = new Map();
+  for (const item of dedup.values()) {
+    const ts = worldMonitorItemTimestampMs(item);
+    if (ts <= 0) continue;
+    const dayKey = utcDayKeyFromMs(ts);
+    if (!dayKey) continue;
+    const list = itemsByDay.get(dayKey);
+    if (list) {
+      list.push(item);
+    } else {
+      itemsByDay.set(dayKey, [item]);
+    }
+  }
+
+  const pool = [];
+  const pickedDayKeys = [];
+  let dayCursor = startDay;
+  for (let i = 0; i < maxDaysBack && dayCursor; i += 1) {
+    const dayItems = itemsByDay.get(dayCursor);
+    if (Array.isArray(dayItems) && dayItems.length > 0) {
+      pool.push(...dayItems);
+      pickedDayKeys.push(dayCursor);
+      if (pool.length >= maxItems) break;
+    }
+    const prevDay = addUtcDays(dayCursor, -1);
+    if (!prevDay || prevDay === dayCursor) break;
+    dayCursor = prevDay;
+  }
+
+  // If today/fallback window had nothing, fall back to newest available days.
+  if (pool.length <= 0) {
+    const fallbackDays = [...itemsByDay.keys()].sort((a, b) => b.localeCompare(a));
+    for (const dayKey of fallbackDays) {
+      const dayItems = itemsByDay.get(dayKey);
+      if (!Array.isArray(dayItems) || dayItems.length <= 0) continue;
+      pool.push(...dayItems);
+      pickedDayKeys.push(dayKey);
+      if (pool.length >= maxItems) break;
+    }
+  }
+
+  const ordered = worldMonitorSortBySeverityThenRecency(pool);
+  return {
+    items: ordered.slice(0, maxItems),
+    dayKeys: pickedDayKeys,
+    poolSize: pool.length,
+  };
 }
 
 function getWorldMonitorNativeFactors(items) {
@@ -8942,6 +9531,7 @@ function buildWorldMonitorNativeFeedAlerts(sinceMs = 0) {
   const minSeen = Math.max(0, Number(sinceMs || 0) || 0);
   const groups = new Map();
   for (const item of worldMonitorNativeNewsItems) {
+    if (isWorldMonitorBlockedOutletItem(item)) continue;
     const seenAt = Number(item?.firstSeenAt || item?.publishedAt || 0) || 0;
     if (seenAt <= 0 || seenAt < minSeen) continue;
     const title = String(item?.title || "").trim();
@@ -9431,13 +10021,7 @@ function isTaiwanRelevantHeadline(text) {
 }
 
 function worldMonitorAlertUrlHost(rawUrl) {
-  const url = normalizeWorldMonitorLink(rawUrl || "");
-  if (!url) return "";
-  try {
-    return String(new URL(url).hostname || "").trim().toLowerCase();
-  } catch {
-    return "";
-  }
+  return worldMonitorOutletHostFromUrl(rawUrl);
 }
 
 function isWorldMonitorAggregatorHost(host) {
@@ -9594,6 +10178,8 @@ function buildWorldMonitorComprehensivePrompt(packet) {
     "Output format exactly:",
     "HEADLINE:",
     "- One sentence, <= 20 words.",
+    "EVIDENCE_CHAIN:",
+    "- 3 to 5 bullets in the form: [level] concrete headline/signal (source) -> what it indicates -> why it changes risk.",
     "GLOBAL:",
     "- 3 to 4 bullets in the form: signal -> why it matters now.",
     "TAIWAN:",
@@ -9601,6 +10187,7 @@ function buildWorldMonitorComprehensivePrompt(packet) {
     "RISK:",
     "- Global level: <critical|high|medium|low> (score X/100, trend up|flat|down).",
     "- Taiwan posture: <escalating|elevated|stable|easing> with a short reason.",
+    "- Key triggers: 1-2 short lines naming strongest trigger conditions that were met.",
     "WATCH_24H:",
     "- 3 concrete indicators to monitor in the next 24 hours.",
     "BOTTOM_LINE:",
@@ -9610,8 +10197,12 @@ function buildWorldMonitorComprehensivePrompt(packet) {
     "Rules:",
     "- Use full country names, never ISO codes (no TW/UA/etc).",
     "- Keep language clear and easy to read aloud (TTS-friendly).",
+    "- In EVIDENCE_CHAIN, use at least 3 concrete items from feed_alerts, key_evidence, gdelt, or signal_context.",
+    "- Include at least 2 headline-level references (title + source) when available.",
+    "- Include one brief counter-signal if data shows one.",
     "- If article_context summaries are present, prioritize them over headline-only interpretation.",
-    "- Keep total output under 280 words.",
+    "- Never invent facts, links, or numbers not in the packet.",
+    "- Keep total output under 340 words.",
     "- If data is missing or stale, mention that briefly.",
     "",
     `TELEMETRY_PACKET=${JSON.stringify(packet)}`,
@@ -9661,7 +10252,7 @@ function buildWorldMonitorFeedAlertSummary(alert, item = null, ctx = null) {
     );
   }
 
-  const fallbackSeed = oneLine(String(item?.title || alert?.title || ""));
+  const fallbackSeed = oneLine(String(alert?.title || item?.title || ""));
   const sourceSeed = seeds.join(" ").trim() || fallbackSeed;
   const sentences = splitIntoSentencesBestEffort(sourceSeed)
     .map((x) => oneLine(x))
@@ -10019,18 +10610,27 @@ function buildWorldMonitorAlertPrompt(snapshot, decision, source = "interval") {
     "Output format:",
     "ALERT_LEVEL: low|medium|high",
     "SUMMARY: 2-4 lines on what changed and why it matters now.",
+    "PRIMARY_TRIGGERS:",
+    "- 2-4 bullets in the form: trigger condition -> evidence -> operational impact.",
+    "EVIDENCE:",
+    "- 3-5 bullets. Each bullet must cite one concrete headline or telemetry datapoint from the packet.",
     "IMPLICATIONS:",
     "- bullet 1",
     "- bullet 2",
     "WATCHLIST:",
     "- 3-5 concrete indicators to track in the next 6-24h.",
+    "CONFIDENCE: low|medium|high",
     "",
     "Rules:",
     "- Use only the provided telemetry packet.",
+    "- In PRIMARY_TRIGGERS include strongest threshold crossings (global risk, country spikes, or delta) when available.",
+    "- In EVIDENCE include threat level and source when available (example: [critical] Headline (Source) -> why).",
     "- If confidence is low, say so explicitly.",
     "- Use full country names (for example, 'Ukraine') and avoid ISO codes like 'UA'.",
     "- Write in plain spoken language that sounds natural in text-to-speech.",
-    "- Keep total output under 220 words.",
+    "- Do not invent headlines, links, or causal claims beyond the packet.",
+    "- If evidence is sparse, say so and cite data gaps.",
+    "- Keep total output under 280 words.",
     "",
     `TELEMETRY_PACKET=${JSON.stringify(packet)}`,
   ].join("\n");
@@ -10430,6 +11030,58 @@ async function runWorldMonitorComprehensiveCheck(options = {}) {
     if (articleContext) row.article_context = articleContext;
     return row;
   };
+  const mapEvidenceRow = (x, scope = "global") => {
+    const firstSeenAt = Number(x?.firstSeenAt || 0) || now;
+    const item = findWorldMonitorItemForAlert(x);
+    const articleContext = compactWorldMonitorArticleContext(getWorldMonitorItemArticleContext(item));
+    const row = {
+      scope: String(scope || "global").trim().toLowerCase() || "global",
+      title: String(x?.title || "").trim(),
+      source: String(x?.source || "").trim(),
+      threat_level: String(x?.threatLevel || "").trim().toLowerCase(),
+      first_seen_at: nowIso(firstSeenAt),
+      age_hours: Math.round((Math.max(0, now - firstSeenAt) / (60 * 60 * 1000)) * 10) / 10,
+      link: String(x?.link || "").trim(),
+    };
+    if (articleContext?.summary) {
+      row.context_summary = String(articleContext.summary || "").trim().slice(0, 260);
+    }
+    if (Array.isArray(articleContext?.key_points) && articleContext.key_points.length > 0) {
+      row.context_key_points = articleContext.key_points.slice(0, 2);
+    }
+    return row;
+  };
+  const keyEvidence = (() => {
+    const seen = new Set();
+    const merged = [];
+    const pushUnique = (alert, scope) => {
+      const a = alert && typeof alert === "object" ? alert : null;
+      if (!a) return;
+      const key = String(a.key || "").trim()
+        || normalizeWorldMonitorLink(a.link || "")
+        || worldMonitorFeedAlertTitleKey({ title: String(a.title || "") });
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      merged.push({ alert: a, scope });
+    };
+    for (const alert of topGlobalAlerts) pushUnique(alert, "global");
+    for (const alert of taiwanAlerts) pushUnique(alert, "taiwan");
+    for (const alert of recentAlerts) {
+      if (worldMonitorFeedAlertLevelRank(alert?.threatLevel) < 4) continue;
+      pushUnique(alert, "global");
+      if (merged.length >= 14) break;
+    }
+    return merged
+      .sort((a, b) => (
+        worldMonitorFeedAlertLevelRank(b?.alert?.threatLevel)
+        - worldMonitorFeedAlertLevelRank(a?.alert?.threatLevel)
+      ) || (
+        (Number(b?.alert?.firstSeenAt || 0) || 0)
+        - (Number(a?.alert?.firstSeenAt || 0) || 0)
+      ))
+      .slice(0, 8)
+      .map((row) => mapEvidenceRow(row.alert, row.scope));
+  })();
 
   const packet = {
     mode: "comprehensive_manual_check",
@@ -10455,6 +11107,7 @@ async function runWorldMonitorComprehensiveCheck(options = {}) {
       top_global: topGlobalAlerts.map(mapAlertRow),
       taiwan_related: taiwanAlerts.map(mapAlertRow),
     },
+    key_evidence: keyEvidence,
     taiwan_brief: {
       country_code: WORLDMONITOR_CHECK_TAIWAN_COUNTRY_CODE,
       country_name: String(taiwanBrief?.countryName || "Taiwan").trim(),
@@ -10516,6 +11169,11 @@ async function runWorldMonitorComprehensiveCheck(options = {}) {
   }
 
   return { ok: true, queued: true };
+  } catch (err) {
+    const message = String(err?.message || err || "").trim() || "comprehensive check failed";
+    log(`worldmonitor comprehensive check failed: ${redactError(message)}`);
+    await sendMessage(chatId, `WorldMonitor comprehensive check failed: ${message}`);
+    return { ok: false, error: message };
   } finally {
     worldMonitorComprehensiveRuntime.inFlight = false;
   }
@@ -10701,7 +11359,12 @@ async function runWorldMonitorFeedAlertsCycle(options = {}) {
       if (titleKey && worldMonitorFeedAlertSentTitleKeySet.has(titleKey)) continue;
       if (sent >= maxPerCycle) break;
       const bestLink = resolveWorldMonitorAlertBestLink(alert, item, ctx);
-      const outboundAlert = bestLink ? { ...alert, link: bestLink } : alert;
+      const translatedHeadline = await translateWorldMonitorHeadlineToEnglish(String(alert?.title || ""));
+      const translatedTitle = oneLine(String(translatedHeadline?.title || "")).trim();
+      const outboundAlertBase = bestLink ? { ...alert, link: bestLink } : { ...alert };
+      const outboundAlert = translatedTitle
+        ? { ...outboundAlertBase, title: translatedTitle }
+        : outboundAlertBase;
       await sendMessage(
         WORLDMONITOR_FEED_ALERTS_CHAT_ID,
         formatWorldMonitorFeedAlertMessage(outboundAlert, { item, ctx }),
@@ -11025,7 +11688,7 @@ async function sendWorkers(chatId) {
     "/use <worker_id, name, or title> - switch active workspace",
     "/spawn <local-path> [title] - create a new repo workspace",
     "/retire <worker_id, name, or title> - remove a workspace",
-    "/wmstatus - worldmonitor monitor state",
+    "/newsstatus - worldmonitor monitor state",
   );
 
   await sendMessage(chatId, lines.join("\n"));
@@ -11786,7 +12449,10 @@ async function handleParsedCommand(chatId, parsed) {
     case "/news":
       await handleNewsCommand(chatId, parsed.arg || "");
       return true;
-    case "/wmstatus":
+    case "/newsreport":
+      await handleNewsReportCommand(chatId, parsed.arg || "");
+      return true;
+    case "/newsstatus":
       await sendWorldMonitorStatus(chatId);
       return true;
     case "/cancel":
@@ -12461,6 +13127,9 @@ function makeWorldMonitorTextTtsFriendly(text) {
   // Make section markers read naturally.
   out = out.replace(/\bALERT_LEVEL\s*:\s*/gi, "Alert level ");
   out = out.replace(/\bSUMMARY\s*:\s*/gi, "Summary ");
+  out = out.replace(/\bPRIMARY_TRIGGERS\s*:\s*/gi, "Primary triggers ");
+  out = out.replace(/\bEVIDENCE_CHAIN\s*:\s*/gi, "Evidence chain ");
+  out = out.replace(/\bEVIDENCE\s*:\s*/gi, "Evidence ");
   out = out.replace(/\bIMPLICATIONS\s*:\s*/gi, "Implications ");
   out = out.replace(/\bWATCHLIST\s*:\s*/gi, "Watch list ");
 
