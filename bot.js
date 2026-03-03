@@ -13445,6 +13445,7 @@ function applyCommonTtsPronunciationFixes(text) {
 
   out = replaceDegreesUnit(out, "C", "Celsius");
   out = replaceDegreesUnit(out, "F", "Fahrenheit");
+  out = replaceDegreesUnit(out, "K", "Kelvin");
 
   // Convert plain clock tokens (e.g. 06:00) while avoiding ISO stamps and UTC offsets.
   out = out.replace(/(^|[^A-Za-z0-9+-])([01]?\d|2[0-3]):([0-5]\d)(?!\d)/g, (_match, prefix, hhRaw, mmRaw) => {
