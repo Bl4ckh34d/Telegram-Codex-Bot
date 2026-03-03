@@ -14,6 +14,7 @@ This bot is built for local personal use. It long-polls Telegram and runs Codex 
 - Session resume and compression
 - File attachment upload from assistant output
 - Optional native WorldMonitor feed monitoring
+- Scheduled daily weather briefing (text + voice)
 
 ## Quickstart
 
@@ -66,6 +67,7 @@ Core:
 - `/spawn <local-path> [title]` - create a repo workspace
 - `/retire <worker_id|name|title>` - remove a workspace
 - `/queue` - show queued prompts
+- `/weather [city]` - weather update for today and tomorrow (text + voice when enabled)
 - `/cancel` or `/stop` - cancel active run
 - `/clear` - clear queued prompts
 - `/wipe` - wipe runtime artifacts and reset chat context
@@ -124,6 +126,18 @@ Voice notes:
 Voice replies:
 - Enable `TTS_ENABLED=1`.
 - If you want automatic voice replies for incoming voice notes, set `TTS_REPLY_TO_VOICE=1`.
+
+## Daily weather briefing
+
+- Optional automatic weather briefing at `06:00` (Asia/Taipei).
+- Includes both today and tomorrow forecasts.
+- Uses Celsius only.
+- Sends text plus a voice message when `TTS_ENABLED=1` and `WEATHER_DAILY_VOICE_ENABLED=1`.
+- On-demand slash command: `/weather [city]`.
+- Location behavior:
+  - If `WEATHER_DAILY_LAT` and `WEATHER_DAILY_LON` are set, that configured location is used.
+  - If they are not set, `/weather` asks you to share your Telegram location once and saves it per chat.
+  - Telegram bots cannot read phone GPS automatically without an explicit location share from the user.
 
 ## Vision and screenshots
 
@@ -193,6 +207,14 @@ WorldMonitor core:
 - `WORLDMONITOR_FEED_ALERTS_ENABLED`
 - `WORLDMONITOR_CHECK_LOOKBACK_HOURS`
 - `WORLDMONITOR_CHECK_MAX_HEADLINES`
+
+Daily weather:
+- `WEATHER_DAILY_ENABLED`
+- `WEATHER_DAILY_CHAT_ID`
+- `WEATHER_DAILY_HOUR`, `WEATHER_DAILY_MINUTE`
+- `WEATHER_DAILY_LOCATION_NAME`, `WEATHER_DAILY_LAT`, `WEATHER_DAILY_LON`
+- `WEATHER_DAILY_VOICE_ENABLED`
+- `WEATHER_FORECAST_TIMEOUT_MS`, `WEATHER_GEOCODING_TIMEOUT_MS`
 
 Prompts:
 - `CODEX_PROMPT_FILE`
