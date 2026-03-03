@@ -13428,6 +13428,168 @@ function formatClockTimeForTts(hoursRaw, minutesRaw) {
   return `${hour12} ${minutes} ${period}`;
 }
 
+const TTS_CARDINAL_UNDER_20 = [
+  "zero",
+  "one",
+  "two",
+  "three",
+  "four",
+  "five",
+  "six",
+  "seven",
+  "eight",
+  "nine",
+  "ten",
+  "eleven",
+  "twelve",
+  "thirteen",
+  "fourteen",
+  "fifteen",
+  "sixteen",
+  "seventeen",
+  "eighteen",
+  "nineteen",
+];
+
+const TTS_CARDINAL_TENS = [
+  "",
+  "",
+  "twenty",
+  "thirty",
+  "forty",
+  "fifty",
+  "sixty",
+  "seventy",
+  "eighty",
+  "ninety",
+];
+
+const TTS_CARDINAL_SCALES = [
+  { value: 1000000000000000, word: "quadrillion" },
+  { value: 1000000000000, word: "trillion" },
+  { value: 1000000000, word: "billion" },
+  { value: 1000000, word: "million" },
+  { value: 1000, word: "thousand" },
+];
+
+const TTS_ORDINAL_SPECIALS = new Map([
+  ["zero", "zeroth"],
+  ["one", "first"],
+  ["two", "second"],
+  ["three", "third"],
+  ["four", "fourth"],
+  ["five", "fifth"],
+  ["six", "sixth"],
+  ["seven", "seventh"],
+  ["eight", "eighth"],
+  ["nine", "ninth"],
+  ["ten", "tenth"],
+  ["eleven", "eleventh"],
+  ["twelve", "twelfth"],
+  ["thirteen", "thirteenth"],
+  ["fourteen", "fourteenth"],
+  ["fifteen", "fifteenth"],
+  ["sixteen", "sixteenth"],
+  ["seventeen", "seventeenth"],
+  ["eighteen", "eighteenth"],
+  ["nineteen", "nineteenth"],
+  ["twenty", "twentieth"],
+  ["thirty", "thirtieth"],
+  ["forty", "fortieth"],
+  ["fifty", "fiftieth"],
+  ["sixty", "sixtieth"],
+  ["seventy", "seventieth"],
+  ["eighty", "eightieth"],
+  ["ninety", "ninetieth"],
+  ["hundred", "hundredth"],
+  ["thousand", "thousandth"],
+  ["million", "millionth"],
+  ["billion", "billionth"],
+  ["trillion", "trillionth"],
+  ["quadrillion", "quadrillionth"],
+]);
+
+function cardinalUnderThousandToWords(value) {
+  const n = Math.trunc(Number(value));
+  if (!Number.isSafeInteger(n) || n < 0 || n >= 1000) return "";
+  if (n < 20) return TTS_CARDINAL_UNDER_20[n];
+
+  const parts = [];
+  const hundreds = Math.trunc(n / 100);
+  const rest = n % 100;
+  if (hundreds > 0) parts.push(`${TTS_CARDINAL_UNDER_20[hundreds]} hundred`);
+  if (rest > 0) {
+    if (rest < 20) {
+      parts.push(TTS_CARDINAL_UNDER_20[rest]);
+    } else {
+      const tens = Math.trunc(rest / 10);
+      const ones = rest % 10;
+      parts.push(ones > 0 ? `${TTS_CARDINAL_TENS[tens]}-${TTS_CARDINAL_UNDER_20[ones]}` : TTS_CARDINAL_TENS[tens]);
+    }
+  }
+  return parts.join(" ");
+}
+
+function integerToCardinalWords(value) {
+  if (!Number.isSafeInteger(value)) return "";
+  if (value === 0) return "zero";
+
+  const abs = Math.abs(value);
+  let remainder = abs;
+  const parts = [];
+
+  for (const scale of TTS_CARDINAL_SCALES) {
+    if (remainder < scale.value) continue;
+    const chunk = Math.trunc(remainder / scale.value);
+    remainder %= scale.value;
+    const chunkWords = cardinalUnderThousandToWords(chunk);
+    if (!chunkWords) return "";
+    parts.push(`${chunkWords} ${scale.word}`);
+  }
+
+  if (remainder > 0) {
+    const tail = cardinalUnderThousandToWords(remainder);
+    if (!tail) return "";
+    parts.push(tail);
+  }
+
+  const joined = parts.join(" ");
+  return value < 0 ? `minus ${joined}` : joined;
+}
+
+function cardinalWordToOrdinalWord(word) {
+  const raw = String(word || "").trim().toLowerCase();
+  if (!raw) return raw;
+  if (TTS_ORDINAL_SPECIALS.has(raw)) return TTS_ORDINAL_SPECIALS.get(raw);
+
+  if (raw.includes("-")) {
+    const parts = raw.split("-");
+    if (parts.length > 1) {
+      const head = parts.slice(0, -1).join("-");
+      const tail = parts[parts.length - 1];
+      const tailOrdinal = cardinalWordToOrdinalWord(tail);
+      if (head && tailOrdinal) return `${head}-${tailOrdinal}`;
+    }
+  }
+
+  if (raw.endsWith("y") && raw.length > 1) return `${raw.slice(0, -1)}ieth`;
+  return `${raw}th`;
+}
+
+function integerToOrdinalWords(value) {
+  if (!Number.isSafeInteger(value)) return "";
+  const cardinal = integerToCardinalWords(value);
+  if (!cardinal) return "";
+
+  const sign = cardinal.startsWith("minus ") ? "minus " : "";
+  const base = sign ? cardinal.slice("minus ".length) : cardinal;
+  const words = base.split(" ").filter(Boolean);
+  if (words.length === 0) return cardinal;
+
+  words[words.length - 1] = cardinalWordToOrdinalWord(words[words.length - 1]);
+  return `${sign}${words.join(" ")}`.trim();
+}
+
 function applyCommonTtsPronunciationFixes(text) {
   let out = String(text || "");
   if (!out) return "";
@@ -13446,6 +13608,17 @@ function applyCommonTtsPronunciationFixes(text) {
   out = replaceDegreesUnit(out, "C", "Celsius");
   out = replaceDegreesUnit(out, "F", "Fahrenheit");
   out = replaceDegreesUnit(out, "K", "Kelvin");
+
+  // Convert ordinals like 1st, 2nd, 11th, 103rd, 29,362nd to spoken words.
+  out = out.replace(/(^|[^A-Za-z0-9])(-?\d{1,3}(?:,\d{3})*|-?\d+)(st|nd|rd|th)\b/gi, (match, prefix, numberRaw) => {
+    const cleaned = String(numberRaw || "").replace(/,/g, "");
+    if (!/^-?\d+$/.test(cleaned)) return match;
+    const value = Number(cleaned);
+    if (!Number.isSafeInteger(value)) return match;
+    const spoken = integerToOrdinalWords(value);
+    if (!spoken) return match;
+    return `${prefix}${spoken}`;
+  });
 
   // Convert plain clock tokens (e.g. 06:00) while avoiding ISO stamps and UTC offsets.
   out = out.replace(/(^|[^A-Za-z0-9+-])([01]?\d|2[0-3]):([0-5]\d)(?!\d)/g, (_match, prefix, hhRaw, mmRaw) => {
