@@ -1165,6 +1165,20 @@ const WORLDMONITOR_CHECK_ANNOUNCE_QUEUED = toBool(process.env.WORLDMONITOR_CHECK
 const WORLDMONITOR_CHECK_VOICE_ENABLED = toBool(process.env.WORLDMONITOR_CHECK_VOICE_ENABLED, true);
 // 0 disables WorldMonitor check pre-truncation before TTS chunking.
 const WORLDMONITOR_CHECK_VOICE_MAX_CHARS = toInt(process.env.WORLDMONITOR_CHECK_VOICE_MAX_CHARS, 0, 0, 1200);
+const WEATHER_DAILY_ENABLED = toBool(process.env.WEATHER_DAILY_ENABLED, true);
+const WEATHER_DAILY_CHAT_ID = String(process.env.WEATHER_DAILY_CHAT_ID || PRIMARY_CHAT_ID).trim() || PRIMARY_CHAT_ID;
+const WEATHER_DAILY_HOUR = toInt(process.env.WEATHER_DAILY_HOUR, 6, 0, 23);
+const WEATHER_DAILY_MINUTE = toInt(process.env.WEATHER_DAILY_MINUTE, 0, 0, 59);
+const WEATHER_DAILY_TIMEZONE = "Asia/Taipei";
+const WEATHER_DAILY_LOCATION_NAME = String(process.env.WEATHER_DAILY_LOCATION_NAME || "").trim();
+const WEATHER_DAILY_LAT_RAW = Number(process.env.WEATHER_DAILY_LAT);
+const WEATHER_DAILY_LON_RAW = Number(process.env.WEATHER_DAILY_LON);
+const WEATHER_DAILY_LAT = Number.isFinite(WEATHER_DAILY_LAT_RAW) ? WEATHER_DAILY_LAT_RAW : null;
+const WEATHER_DAILY_LON = Number.isFinite(WEATHER_DAILY_LON_RAW) ? WEATHER_DAILY_LON_RAW : null;
+const WEATHER_DAILY_VOICE_ENABLED = toBool(process.env.WEATHER_DAILY_VOICE_ENABLED, true);
+const WEATHER_DAILY_NOTIFY_ERRORS = toBool(process.env.WEATHER_DAILY_NOTIFY_ERRORS, true);
+const WEATHER_FORECAST_TIMEOUT_MS = toTimeoutMs(process.env.WEATHER_FORECAST_TIMEOUT_MS, 12_000, 0, MAX_TIMEOUT_MS);
+const WEATHER_GEOCODING_TIMEOUT_MS = toTimeoutMs(process.env.WEATHER_GEOCODING_TIMEOUT_MS, 10_000, 0, MAX_TIMEOUT_MS);
 const NATURAL_NEWS_FOLLOWUP_TTL_MS = 5 * 60 * 1000;
 const NATURAL_SAFE_COMMAND_INTENT_THRESHOLD_RAW = Number(process.env.NATURAL_SAFE_COMMAND_INTENT_THRESHOLD);
 const NATURAL_SAFE_COMMAND_INTENT_THRESHOLD = Number.isFinite(NATURAL_SAFE_COMMAND_INTENT_THRESHOLD_RAW)
@@ -1277,6 +1291,8 @@ const state = readJson(STATE_PATH, {
   chatPrefs: {},
   redditDigest: {},
   worldMonitorMonitor: {},
+  weatherDaily: {},
+  weatherLocationsByChat: {},
   orch: {},
 });
 let lastUpdateId = Number(state.lastUpdateId || 0);
@@ -1292,6 +1308,27 @@ const redditDigest = state && typeof state.redditDigest === "object" && state.re
 const worldMonitorMonitorRaw = state && typeof state.worldMonitorMonitor === "object" && state.worldMonitorMonitor
   ? state.worldMonitorMonitor
   : {};
+const weatherDailyRaw = state && typeof state.weatherDaily === "object" && state.weatherDaily
+  ? state.weatherDaily
+  : {};
+const weatherLocationsByChatRaw = state && typeof state.weatherLocationsByChat === "object" && state.weatherLocationsByChat
+  ? state.weatherLocationsByChat
+  : {};
+const weatherLocationsByChat = {};
+for (const [rawChatId, rawEntry] of Object.entries(weatherLocationsByChatRaw)) {
+  const chatKey = String(rawChatId || "").trim();
+  if (!chatKey || !rawEntry || typeof rawEntry !== "object") continue;
+  const lat = Number(rawEntry.latitude);
+  const lon = Number(rawEntry.longitude);
+  if (!Number.isFinite(lat) || lat < -90 || lat > 90 || !Number.isFinite(lon) || lon < -180 || lon > 180) continue;
+  weatherLocationsByChat[chatKey] = {
+    latitude: lat,
+    longitude: lon,
+    name: String(rawEntry.name || "").trim(),
+    timezone: String(rawEntry.timezone || "").trim(),
+    updatedAt: Number(rawEntry.updatedAt || 0) || 0,
+  };
+}
 const worldMonitorMonitor = {
   workerId: String(worldMonitorMonitorRaw.workerId || "").trim(),
   lastRunAt: Number(worldMonitorMonitorRaw.lastRunAt || 0) || 0,
@@ -1358,6 +1395,15 @@ const worldMonitorMonitor = {
     && typeof worldMonitorMonitorRaw.startupCatchupLastStats === "object"
     ? { ...worldMonitorMonitorRaw.startupCatchupLastStats }
     : {},
+};
+const weatherDailyState = {
+  lastRunAt: Number(weatherDailyRaw.lastRunAt || 0) || 0,
+  lastSentAt: Number(weatherDailyRaw.lastSentAt || 0) || 0,
+  lastSentDayKey: isUtcDayKey(weatherDailyRaw.lastSentDayKey)
+    ? String(weatherDailyRaw.lastSentDayKey || "").trim()
+    : "",
+  lastErrorAt: Number(weatherDailyRaw.lastErrorAt || 0) || 0,
+  lastError: String(weatherDailyRaw.lastError || "").trim(),
 };
 const worldMonitorFeedAlertSentKeySet = new Set(worldMonitorMonitor.feedAlertsSentKeys);
 const worldMonitorFeedAlertSentTitleKeySet = new Set(worldMonitorMonitor.feedAlertsSentTitleKeys);
@@ -1662,6 +1708,7 @@ const pendingCommandsById = new Map();
 const pendingCommandIdByChat = new Map();
 const backgroundCommandChainByChat = new Map();
 const pendingNaturalNewsByChat = new Map(); // chatId -> { at }
+const pendingWeatherLocationByChat = new Map(); // chatId -> { at }
 const worldMonitorRuntime = {
   timer: null,
   inFlight: false,
@@ -1680,6 +1727,11 @@ const worldMonitorNativeRuntime = {
   signalsPromise: null,
   deepIngestPromise: null,
   startupCatchupPromise: null,
+};
+const weatherDailyRuntime = {
+  timer: null,
+  inFlight: false,
+  nextRunAt: 0,
 };
 const worldMonitorHeadlineTranslationCache = new Map();
 const worldMonitorHeadlineTranslationInFlight = new Map();
@@ -1837,6 +1889,8 @@ function persistState() {
       chatPrefs,
       redditDigest,
       worldMonitorMonitor,
+      weatherDaily: weatherDailyState,
+      weatherLocationsByChat,
       orch: {
         version: 1,
         workers: orchWorkers,
@@ -4024,6 +4078,58 @@ function listUtcDays(startDay, endDay) {
   return out;
 }
 
+const TAIPEI_UTC_OFFSET_MINUTES = 8 * 60;
+
+function taipeiPseudoDateFromMs(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n)) return new Date(NaN);
+  return new Date(n + (TAIPEI_UTC_OFFSET_MINUTES * 60 * 1000));
+}
+
+function taipeiDayKeyFromMs(ms) {
+  const d = taipeiPseudoDateFromMs(ms);
+  if (!Number.isFinite(d.getTime())) return "";
+  const y = String(d.getUTCFullYear()).padStart(4, "0");
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function taipeiClockTimeFromMs(ms) {
+  const d = taipeiPseudoDateFromMs(ms);
+  if (!Number.isFinite(d.getTime())) return "";
+  const hh = String(d.getUTCHours()).padStart(2, "0");
+  const mm = String(d.getUTCMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
+function utcMsFromTaipeiLocalDay(dayKey, hour, minute = 0, second = 0) {
+  const key = String(dayKey || "").trim();
+  if (!isUtcDayKey(key)) return 0;
+  const dt = parseDayKeyLocal(key);
+  if (!dt) return 0;
+  return Date.UTC(
+    dt.getFullYear(),
+    dt.getMonth(),
+    dt.getDate(),
+    Math.max(0, Math.min(23, Math.trunc(Number(hour) || 0))),
+    Math.max(0, Math.min(59, Math.trunc(Number(minute) || 0))),
+    Math.max(0, Math.min(59, Math.trunc(Number(second) || 0))),
+  ) - (TAIPEI_UTC_OFFSET_MINUTES * 60 * 1000);
+}
+
+function computeNextWeatherDailyRunAt(nowMs = Date.now()) {
+  const now = Number(nowMs);
+  if (!Number.isFinite(now)) return Date.now() + 60_000;
+  const todayKey = taipeiDayKeyFromMs(now);
+  let nextAt = utcMsFromTaipeiLocalDay(todayKey, WEATHER_DAILY_HOUR, WEATHER_DAILY_MINUTE, 0);
+  if (!Number.isFinite(nextAt) || nextAt <= 0) return now + 60_000;
+  if (nextAt <= (now + 1000)) {
+    nextAt += 24 * 60 * 60 * 1000;
+  }
+  return nextAt;
+}
+
 function getRedditDigestCursorForChat(chatId) {
   const key = String(chatId || "").trim();
   if (!key) return "";
@@ -5295,6 +5401,7 @@ function getTelegramCommandList() {
     { command: "spawn", description: "create a repo workspace" },
     { command: "retire", description: "remove a workspace" },
     { command: "queue", description: "show queued prompts" },
+    { command: "weather", description: "show weather update (/weather [city])" },
     { command: "news", description: "show ranked worldmonitor headlines" },
     { command: "newsreport", description: "worldmonitor global+taiwan AI check" },
     { command: "newsstatus", description: "worldmonitor monitor status" },
@@ -6092,6 +6199,7 @@ async function sendHelp(chatId) {
     "- /workers - list workspaces/workers",
     "- /use <worker_id, name, or title> - switch active workspace",
     "- /queue - show queued prompts",
+    "- /weather [city] - today/tomorrow forecast (voice when TTS is enabled)",
     "- /news [force] [count] - severity-ranked WorldMonitor headlines (today first, then previous days)",
     "- /newsreport [force|raw] - WorldMonitor AI check (global + Taiwan)",
     "- Say \"give me the news\" - runs the same /newsreport check flow",
@@ -11425,6 +11533,490 @@ function startWorldMonitorFeedAlertsLoop() {
   scheduleWorldMonitorFeedAlertsLoop(initialDelayMs);
 }
 
+function describeOpenMeteoWeatherCode(rawCode) {
+  const code = Math.trunc(Number(rawCode));
+  if (!Number.isFinite(code)) return "Unknown conditions";
+  if (code === 0) return "Clear sky";
+  if (code === 1) return "Mainly clear";
+  if (code === 2) return "Partly cloudy";
+  if (code === 3) return "Overcast";
+  if (code === 45 || code === 48) return "Fog";
+  if ([51, 53, 55].includes(code)) return "Drizzle";
+  if ([56, 57].includes(code)) return "Freezing drizzle";
+  if ([61, 63, 65].includes(code)) return "Rain";
+  if ([66, 67].includes(code)) return "Freezing rain";
+  if ([71, 73, 75].includes(code)) return "Snow";
+  if (code === 77) return "Snow grains";
+  if ([80, 81, 82].includes(code)) return "Rain showers";
+  if ([85, 86].includes(code)) return "Snow showers";
+  if (code === 95) return "Thunderstorm";
+  if (code === 96 || code === 99) return "Thunderstorm with hail";
+  return "Unknown conditions";
+}
+
+function isValidWeatherCoordinates(latitude, longitude) {
+  const lat = Number(latitude);
+  const lon = Number(longitude);
+  return Number.isFinite(lat) && lat >= -90 && lat <= 90 && Number.isFinite(lon) && lon >= -180 && lon <= 180;
+}
+
+function parseWeatherCityArg(argText) {
+  const raw = String(argText || "").trim();
+  if (!raw) return "";
+  const tokens = parseArgString(raw);
+  if (tokens.length > 0) {
+    return tokens.join(" ").trim();
+  }
+  return raw.replace(/^["']|["']$/g, "").trim();
+}
+
+function formatOpenMeteoLocationName(result, fallback = "") {
+  if (!result || typeof result !== "object") return String(fallback || "").trim();
+  const name = String(result.name || "").trim();
+  const admin1 = String(result.admin1 || "").trim();
+  const country = String(result.country || "").trim();
+  const parts = [];
+  if (name) parts.push(name);
+  if (admin1 && admin1.toLowerCase() !== name.toLowerCase()) parts.push(admin1);
+  if (country && country.toLowerCase() !== name.toLowerCase() && country.toLowerCase() !== admin1.toLowerCase()) parts.push(country);
+  const label = parts.join(", ").trim();
+  return label || String(fallback || "").trim();
+}
+
+function buildWeatherLocationSummary(location) {
+  if (!location || typeof location !== "object") return "(unset)";
+  const name = String(location.name || "").trim() || "weather location";
+  const lat = Number(location.latitude);
+  const lon = Number(location.longitude);
+  if (!isValidWeatherCoordinates(lat, lon)) return name;
+  return `${name} (${lat.toFixed(4)}, ${lon.toFixed(4)})`;
+}
+
+function getConfiguredWeatherLocation() {
+  if (!isValidWeatherCoordinates(WEATHER_DAILY_LAT, WEATHER_DAILY_LON)) return null;
+  return {
+    source: "config",
+    name: String(WEATHER_DAILY_LOCATION_NAME || "").trim() || "Configured location",
+    latitude: Number(WEATHER_DAILY_LAT),
+    longitude: Number(WEATHER_DAILY_LON),
+    timezone: "auto",
+  };
+}
+
+function getSavedWeatherLocationForChat(chatId) {
+  const key = String(chatId || "").trim();
+  if (!key) return null;
+  const entry = weatherLocationsByChat[key];
+  if (!entry || typeof entry !== "object") return null;
+  const latitude = Number(entry.latitude);
+  const longitude = Number(entry.longitude);
+  if (!isValidWeatherCoordinates(latitude, longitude)) return null;
+  return {
+    source: "chat-gps",
+    name: String(entry.name || "").trim() || "Shared location",
+    latitude,
+    longitude,
+    timezone: String(entry.timezone || "").trim() || "auto",
+  };
+}
+
+function setSavedWeatherLocationForChat(chatId, location) {
+  const key = String(chatId || "").trim();
+  if (!key || !location || typeof location !== "object") return false;
+  const latitude = Number(location.latitude);
+  const longitude = Number(location.longitude);
+  if (!isValidWeatherCoordinates(latitude, longitude)) return false;
+  weatherLocationsByChat[key] = {
+    name: String(location.name || "").trim() || "Shared location",
+    latitude,
+    longitude,
+    timezone: String(location.timezone || "").trim() || "auto",
+    updatedAt: Date.now(),
+  };
+  persistState();
+  return true;
+}
+
+function resolveDefaultWeatherLocationForChat(chatId) {
+  const configured = getConfiguredWeatherLocation();
+  if (configured) return configured;
+  return getSavedWeatherLocationForChat(chatId);
+}
+
+async function resolveWeatherLocationFromCity(cityQuery, options = {}) {
+  const query = String(cityQuery || "").trim();
+  if (!query) throw new Error("City name is required.");
+  const params = new URLSearchParams({
+    name: query,
+    count: "5",
+    language: "en",
+    format: "json",
+  });
+  const url = `https://geocoding-api.open-meteo.com/v1/search?${params.toString()}`;
+  const payload = await fetchJsonUrl(url, {
+    headers: { Accept: "application/json" },
+    timeoutMs: WEATHER_GEOCODING_TIMEOUT_MS,
+    signal: options?.signal,
+  });
+  const results = Array.isArray(payload?.results) ? payload.results : [];
+  const hit = results.find((item) => isValidWeatherCoordinates(item?.latitude, item?.longitude)) || null;
+  if (!hit) {
+    throw new Error(`No weather location matched "${query}".`);
+  }
+  return {
+    source: "city",
+    name: formatOpenMeteoLocationName(hit, query) || query,
+    latitude: Number(hit.latitude),
+    longitude: Number(hit.longitude),
+    timezone: String(hit.timezone || "").trim() || "auto",
+  };
+}
+
+async function resolveWeatherLocationFromCoordinates(latitude, longitude, options = {}) {
+  const lat = Number(latitude);
+  const lon = Number(longitude);
+  if (!isValidWeatherCoordinates(lat, lon)) return null;
+  const params = new URLSearchParams({
+    latitude: String(lat),
+    longitude: String(lon),
+    count: "1",
+    language: "en",
+    format: "json",
+  });
+  const url = `https://geocoding-api.open-meteo.com/v1/reverse?${params.toString()}`;
+  const payload = await fetchJsonUrl(url, {
+    headers: { Accept: "application/json" },
+    timeoutMs: WEATHER_GEOCODING_TIMEOUT_MS,
+    signal: options?.signal,
+  });
+  const results = Array.isArray(payload?.results) ? payload.results : [];
+  const hit = results.find((item) => isValidWeatherCoordinates(item?.latitude, item?.longitude)) || null;
+  if (!hit) return null;
+  return {
+    name: formatOpenMeteoLocationName(hit, "Shared location"),
+    timezone: String(hit.timezone || "").trim() || "auto",
+  };
+}
+
+function formatCelsius(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "";
+  return `${Math.round(n)}°C`;
+}
+
+function formatMm(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "";
+  const rounded = Math.round(Math.max(0, n) * 10) / 10;
+  return `${rounded % 1 === 0 ? Math.trunc(rounded) : rounded} mm`;
+}
+
+function buildWeatherBriefing(payload, { locationName = "Weather" } = {}) {
+  const daily = payload && typeof payload.daily === "object" && payload.daily ? payload.daily : {};
+  const dayKeys = Array.isArray(daily.time) ? daily.time : [];
+  const weatherCodes = Array.isArray(daily.weather_code) ? daily.weather_code : [];
+  const maxTemps = Array.isArray(daily.temperature_2m_max) ? daily.temperature_2m_max : [];
+  const minTemps = Array.isArray(daily.temperature_2m_min) ? daily.temperature_2m_min : [];
+  const rainProbMax = Array.isArray(daily.precipitation_probability_max) ? daily.precipitation_probability_max : [];
+  const rainSum = Array.isArray(daily.precipitation_sum) ? daily.precipitation_sum : [];
+  if (dayKeys.length < 2) {
+    throw new Error("Weather API response is missing today/tomorrow data.");
+  }
+
+  const forecastLines = [];
+  for (let i = 0; i < 2; i += 1) {
+    const label = i === 0 ? "Today" : "Tomorrow";
+    const condition = describeOpenMeteoWeatherCode(weatherCodes[i]);
+    const low = formatCelsius(minTemps[i]);
+    const high = formatCelsius(maxTemps[i]);
+    const rainProb = Number(rainProbMax[i]);
+    const rainMm = Number(rainSum[i]);
+    const pieces = [`${label}: ${condition}.`];
+    if (low && high) {
+      pieces.push(`Temperature ${low} to ${high}.`);
+    } else if (high) {
+      pieces.push(`High around ${high}.`);
+    } else if (low) {
+      pieces.push(`Low around ${low}.`);
+    }
+    if (Number.isFinite(rainProb)) {
+      pieces.push(`Rain chance up to ${Math.max(0, Math.round(rainProb))}%.`);
+    }
+    if (Number.isFinite(rainMm)) {
+      if (rainMm <= 0.05) {
+        pieces.push("Little to no rainfall expected.");
+      } else {
+        pieces.push(`Rainfall around ${formatMm(rainMm)}.`);
+      }
+    }
+    forecastLines.push(pieces.join(" "));
+  }
+
+  const current = payload && typeof payload.current === "object" && payload.current ? payload.current : {};
+  const currentTemp = formatCelsius(current.temperature_2m);
+  const currentCondition = describeOpenMeteoWeatherCode(current.weather_code);
+  const timezone = String(payload?.timezone || "").trim();
+  const updatedAt = String(current.time || "").trim();
+  const locationLabel = String(locationName || "").trim() || "Weather";
+
+  const textLines = [
+    fmtBold(`${locationLabel} Weather`),
+    updatedAt
+      ? `Updated: ${updatedAt}${timezone ? ` (${timezone})` : ""}`
+      : timezone
+        ? `Timezone: ${timezone}`
+        : "Timezone: local",
+  ];
+  const spokenLines = [
+    `${locationLabel} weather update.`,
+  ];
+  if (currentTemp) {
+    const nowLine = `Now: ${currentCondition}, ${currentTemp}.`;
+    textLines.push(nowLine);
+    spokenLines.push(nowLine);
+  }
+  textLines.push(...forecastLines);
+  spokenLines.push(...forecastLines);
+
+  const firstDay = String(dayKeys[0] || "").trim();
+  return {
+    text: textLines.join("\n"),
+    spoken: spokenLines.join(" "),
+    dayKey: isUtcDayKey(firstDay) ? firstDay : "",
+  };
+}
+
+async function fetchWeatherBriefing(location, options = {}) {
+  if (!location || typeof location !== "object") {
+    throw new Error("Weather location is not configured.");
+  }
+  const latitude = Number(location.latitude);
+  const longitude = Number(location.longitude);
+  if (!isValidWeatherCoordinates(latitude, longitude)) {
+    throw new Error("Weather location is invalid.");
+  }
+  const timezone = String(location.timezone || "").trim() || "auto";
+  const params = new URLSearchParams({
+    latitude: String(latitude),
+    longitude: String(longitude),
+    timezone,
+    current: "temperature_2m,weather_code",
+    daily: "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum",
+    forecast_days: "3",
+    temperature_unit: "celsius",
+    precipitation_unit: "mm",
+    wind_speed_unit: "kmh",
+  });
+  const url = `https://api.open-meteo.com/v1/forecast?${params.toString()}`;
+  const payload = await fetchJsonUrl(url, {
+    headers: { Accept: "application/json" },
+    timeoutMs: WEATHER_FORECAST_TIMEOUT_MS,
+    signal: options?.signal,
+  });
+  return buildWeatherBriefing(payload, {
+    locationName: String(location.name || "").trim() || "Weather",
+  });
+}
+
+function buildWeatherLocationRequestKeyboard() {
+  return {
+    keyboard: [[{ text: "Share weather location", request_location: true }]],
+    resize_keyboard: true,
+    one_time_keyboard: true,
+    selective: true,
+  };
+}
+
+async function promptForWeatherLocationShare(chatId) {
+  const key = String(chatId || "").trim();
+  if (!key) return;
+  pendingWeatherLocationByChat.set(key, { at: Date.now() });
+  await sendMessage(
+    key,
+    "No default weather location is set yet. Share your current location, or run /weather <city>.",
+    { replyMarkup: buildWeatherLocationRequestKeyboard() },
+  );
+}
+
+async function handleWeatherLocationMessage(msg) {
+  const chatId = String(msg?.chat?.id || "").trim();
+  if (!chatId) return false;
+  if (!pendingWeatherLocationByChat.has(chatId)) return false;
+
+  const latitude = Number(msg?.location?.latitude);
+  const longitude = Number(msg?.location?.longitude);
+  if (!isValidWeatherCoordinates(latitude, longitude)) {
+    pendingWeatherLocationByChat.delete(chatId);
+    await sendMessage(chatId, "That location was invalid. Run /weather again and share your location.", {
+      replyMarkup: { remove_keyboard: true },
+    });
+    return true;
+  }
+
+  let locationName = "Shared location";
+  let timezone = "auto";
+  try {
+    const resolved = await resolveWeatherLocationFromCoordinates(latitude, longitude);
+    if (resolved) {
+      if (String(resolved.name || "").trim()) locationName = String(resolved.name || "").trim();
+      if (String(resolved.timezone || "").trim()) timezone = String(resolved.timezone || "").trim();
+    }
+  } catch {
+    // Keep fallback label/timezone when reverse geocoding fails.
+  }
+
+  const saved = {
+    source: "chat-gps",
+    name: locationName,
+    latitude,
+    longitude,
+    timezone,
+  };
+  setSavedWeatherLocationForChat(chatId, saved);
+  pendingWeatherLocationByChat.delete(chatId);
+
+  try {
+    const briefing = await fetchWeatherBriefing(saved);
+    await sendMessage(chatId, `Saved weather location: ${buildWeatherLocationSummary(saved)}.`, {
+      replyMarkup: { remove_keyboard: true },
+    });
+    await sendMessage(chatId, briefing.text);
+    if (TTS_ENABLED) {
+      await enqueueTts(chatId, briefing.spoken, "weather-command", {
+        skipResultText: true,
+      });
+    }
+  } catch (err) {
+    const message = String(err?.message || err || "weather update failed").trim() || "weather update failed";
+    await sendMessage(chatId, `Saved weather location: ${buildWeatherLocationSummary(saved)}.`, {
+      replyMarkup: { remove_keyboard: true },
+    });
+    await sendMessage(chatId, `Weather update failed: ${oneLine(message)}`);
+  }
+  return true;
+}
+
+async function handleWeatherCommand(chatId, argText = "") {
+  const cityQuery = parseWeatherCityArg(argText);
+  try {
+    let location = null;
+    if (cityQuery) {
+      location = await resolveWeatherLocationFromCity(cityQuery);
+    } else {
+      location = resolveDefaultWeatherLocationForChat(chatId);
+      if (!location) {
+        await promptForWeatherLocationShare(chatId);
+        return;
+      }
+    }
+    pendingWeatherLocationByChat.delete(String(chatId || "").trim());
+    const briefing = await fetchWeatherBriefing(location);
+    await sendMessage(chatId, briefing.text);
+    if (TTS_ENABLED) {
+      await enqueueTts(chatId, briefing.spoken, "weather-command", {
+        skipResultText: true,
+      });
+    }
+  } catch (err) {
+    const message = String(err?.message || err || "weather update failed").trim() || "weather update failed";
+    await sendMessage(chatId, `Weather update failed: ${oneLine(message)}`);
+  }
+}
+
+async function runWeatherDailyCycle(options = {}) {
+  const source = String(options?.source || "interval").trim().toLowerCase() || "interval";
+  const force = options?.force === true;
+  const chatId = String(options?.chatId || WEATHER_DAILY_CHAT_ID).trim();
+  const now = Date.now();
+  const dayKey = taipeiDayKeyFromMs(now);
+
+  if (!WEATHER_DAILY_ENABLED && !force) return { ok: false, skipped: "disabled" };
+  if (!chatId) return { ok: false, skipped: "missing_chat_id" };
+  if (weatherDailyRuntime.inFlight) return { ok: false, skipped: "busy" };
+  if (!force && dayKey && dayKey === String(weatherDailyState.lastSentDayKey || "").trim()) {
+    weatherDailyState.lastRunAt = now;
+    persistState();
+    return { ok: true, skipped: "already_sent", dayKey };
+  }
+
+  weatherDailyRuntime.inFlight = true;
+  try {
+    const location = resolveDefaultWeatherLocationForChat(chatId);
+    if (!location) {
+      throw new Error(
+        "No default weather location is configured. Set WEATHER_DAILY_LAT and WEATHER_DAILY_LON, or run /weather and share your location once.",
+      );
+    }
+    const briefing = await fetchWeatherBriefing(location);
+    await sendMessage(chatId, briefing.text);
+    let voiceQueued = false;
+    if (WEATHER_DAILY_VOICE_ENABLED && TTS_ENABLED) {
+      voiceQueued = await enqueueTts(chatId, briefing.spoken, "weather-daily", {
+        skipResultText: true,
+      });
+    }
+    weatherDailyState.lastRunAt = now;
+    weatherDailyState.lastSentAt = Date.now();
+    weatherDailyState.lastSentDayKey = dayKey || String(briefing?.dayKey || "").trim();
+    weatherDailyState.lastErrorAt = 0;
+    weatherDailyState.lastError = "";
+    persistState();
+    return { ok: true, sent: true, source, dayKey: weatherDailyState.lastSentDayKey, voiceQueued };
+  } catch (err) {
+    const message = String(err?.message || err || "daily weather update failed").trim() || "daily weather update failed";
+    weatherDailyState.lastRunAt = now;
+    weatherDailyState.lastErrorAt = Date.now();
+    weatherDailyState.lastError = message;
+    persistState();
+    if (WEATHER_DAILY_NOTIFY_ERRORS) {
+      try {
+        await sendMessage(chatId, `Daily weather update failed: ${oneLine(message)}`);
+      } catch {
+        // best effort
+      }
+    }
+    return { ok: false, error: message, source };
+  } finally {
+    weatherDailyRuntime.inFlight = false;
+  }
+}
+
+function stopWeatherDailyLoop() {
+  if (weatherDailyRuntime.timer) {
+    clearTimeout(weatherDailyRuntime.timer);
+    weatherDailyRuntime.timer = null;
+  }
+  weatherDailyRuntime.nextRunAt = 0;
+}
+
+function scheduleWeatherDailyLoop(delayMs = 0) {
+  if (shuttingDown || !WEATHER_DAILY_ENABLED) return;
+  if (!WEATHER_DAILY_CHAT_ID) return;
+  stopWeatherDailyLoop();
+  const customDelay = Number(delayMs);
+  const ms = Number.isFinite(customDelay) && customDelay > 0
+    ? Math.max(1000, Math.trunc(customDelay))
+    : Math.max(1000, computeNextWeatherDailyRunAt(Date.now()) - Date.now());
+  weatherDailyRuntime.nextRunAt = Date.now() + ms;
+  weatherDailyRuntime.timer = setTimeout(() => {
+    weatherDailyRuntime.timer = null;
+    weatherDailyRuntime.nextRunAt = 0;
+    void (async () => {
+      const res = await runWeatherDailyCycle({ source: "interval" });
+      if (!res?.ok && String(res?.error || "").trim()) {
+        log(`weather daily cycle failed: ${redactError(res.error)}`);
+      }
+      scheduleWeatherDailyLoop(0);
+    })();
+  }, ms);
+}
+
+function startWeatherDailyLoop() {
+  if (!WEATHER_DAILY_ENABLED) return;
+  if (!WEATHER_DAILY_CHAT_ID) return;
+  scheduleWeatherDailyLoop(0);
+}
+
 async function sendWorldMonitorStatus(chatId) {
   const workerId = String(worldMonitorMonitor.workerId || "").trim()
     || (WORLDMONITOR_MONITOR_ENABLED ? ensureWorldMonitorWorker() : "");
@@ -11549,6 +12141,14 @@ async function sendStatus(chatId) {
   const startupCatchupStats = worldMonitorMonitor.startupCatchupLastStats && typeof worldMonitorMonitor.startupCatchupLastStats === "object"
     ? worldMonitorMonitor.startupCatchupLastStats
     : {};
+  const weatherNextRunLabel = Number(weatherDailyRuntime.nextRunAt || 0) > 0
+    ? nowIso(Number(weatherDailyRuntime.nextRunAt || 0))
+    : "not scheduled";
+  const configuredWeatherLocation = getConfiguredWeatherLocation();
+  const configuredWeatherLocationLabel = configuredWeatherLocation
+    ? buildWeatherLocationSummary(configuredWeatherLocation)
+    : "(unset)";
+  const sharedWeatherLocationChats = Object.keys(weatherLocationsByChat).length;
 
   const lines = [
     fmtBold("Status"),
@@ -11593,6 +12193,10 @@ async function sendStatus(chatId) {
     `- worldmonitor_native_signals_error: ${String(worldMonitorMonitor.nativeSignalsLastRefreshError || "").trim() || "(none)"}`,
     `- worldmonitor_startup_catchup_error: ${String(worldMonitorMonitor.startupCatchupLastError || "").trim() || "(none)"}`,
     `- worldmonitor_check_voice: ${WORLDMONITOR_CHECK_VOICE_ENABLED ? "enabled (uncapped)" : "disabled"}`,
+    `- weather_daily: ${WEATHER_DAILY_ENABLED ? "enabled" : "disabled"} (chat=${WEATHER_DAILY_CHAT_ID || "(unset)"}, time=${String(WEATHER_DAILY_HOUR).padStart(2, "0")}:${String(WEATHER_DAILY_MINUTE).padStart(2, "0")} ${WEATHER_DAILY_TIMEZONE}, configured_location=${configuredWeatherLocationLabel}, shared_gps_chats=${sharedWeatherLocationChats}, voice=${WEATHER_DAILY_VOICE_ENABLED ? "on" : "off"})`,
+    `- weather_daily_next: ${weatherNextRunLabel}`,
+    `- weather_daily_last_sent: ${weatherDailyState.lastSentAt ? `${formatRelativeAge(weatherDailyState.lastSentAt)} (day=${String(weatherDailyState.lastSentDayKey || "").trim() || "n/a"})` : "never"}`,
+    `- weather_daily_last_error: ${String(weatherDailyState.lastError || "").trim() || "(none)"}`,
     `- restart: ${restartState}`,
     "",
     fmtBold("Config"),
@@ -12090,6 +12694,7 @@ function wipeChatState(chatId) {
   out.queuedRemoved = dropQueuedJobsForChat(key);
   out.pendingCommandCleared = Boolean(clearPendingCommandForChat(key));
   clearPendingNaturalNewsFollowup(key);
+  pendingWeatherLocationByChat.delete(key);
 
   const dropChatKey = (obj) => {
     if (!obj || typeof obj !== "object") return false;
@@ -12102,6 +12707,7 @@ function wipeChatState(chatId) {
   if (dropChatKey(lastImages)) changed = true;
   if (dropChatKey(chatPrefs)) changed = true;
   if (dropChatKey(redditDigest)) changed = true;
+  if (dropChatKey(weatherLocationsByChat)) changed = true;
   if (dropChatKey(orchActiveWorkerByChat)) changed = true;
   if (dropChatKey(orchSessionByChatWorker)) changed = true;
   if (dropChatKey(orchReplyRouteByChat)) changed = true;
@@ -12445,6 +13051,9 @@ async function handleParsedCommand(chatId, parsed) {
     }
     case "/queue":
       await sendQueue(chatId);
+      return true;
+    case "/weather":
+      await handleWeatherCommand(chatId, parsed.arg || "");
       return true;
     case "/news":
       await handleNewsCommand(chatId, parsed.arg || "");
@@ -12799,8 +13408,51 @@ async function enqueuePrompt(chatId, inputText, source, options = {}) {
 function normalizeTtsText(text) {
   const trimmed = String(text || "").trim();
   if (!trimmed) return "";
-  const squashed = trimmed.replace(/\s+/g, " ").trim();
+  const fixed = applyCommonTtsPronunciationFixes(trimmed);
+  const squashed = fixed.replace(/\s+/g, " ").trim();
   return squashed;
+}
+
+function formatClockTimeForTts(hoursRaw, minutesRaw) {
+  const hours = Number(hoursRaw);
+  const minutes = Number(minutesRaw);
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return `${hoursRaw}:${minutesRaw}`;
+
+  if (hours === 0 && minutes === 0) return "midnight";
+  if (hours === 12 && minutes === 0) return "noon";
+
+  const hour12 = hours % 12 === 0 ? 12 : hours % 12;
+  const period = hours < 12 ? "a m" : "p m";
+  if (minutes === 0) return `${hour12} o'clock ${period}`;
+  if (minutes < 10) return `${hour12} oh ${minutes} ${period}`;
+  return `${hour12} ${minutes} ${period}`;
+}
+
+function applyCommonTtsPronunciationFixes(text) {
+  let out = String(text || "");
+  if (!out) return "";
+
+  const replaceDegreesUnit = (input, unitPattern, unitLabel) => {
+    let result = String(input || "");
+    result = result.replace(new RegExp(`(-?\\d+(?:\\.\\d+)?)\\s*°\\s*${unitPattern}\\b`, "gi"), (_match, valueRaw) => {
+      const value = Number(valueRaw);
+      const singular = Number.isFinite(value) && Math.abs(value) === 1;
+      return `${valueRaw} ${singular ? "degree" : "degrees"} ${unitLabel}`;
+    });
+    result = result.replace(new RegExp(`°\\s*${unitPattern}\\b`, "gi"), `degrees ${unitLabel}`);
+    return result;
+  };
+
+  out = replaceDegreesUnit(out, "C", "Celsius");
+  out = replaceDegreesUnit(out, "F", "Fahrenheit");
+
+  // Convert plain clock tokens (e.g. 06:00) while avoiding ISO stamps and UTC offsets.
+  out = out.replace(/(^|[^A-Za-z0-9+-])([01]?\d|2[0-3]):([0-5]\d)(?!\d)/g, (_match, prefix, hhRaw, mmRaw) => {
+    const spoken = formatClockTimeForTts(hhRaw, mmRaw);
+    return `${prefix}${spoken}`;
+  });
+
+  return out;
 }
 
 function splitVoiceReplyParts(text) {
@@ -16922,6 +17574,12 @@ async function handleIncomingMessage(msg) {
     }
   }
 
+  if (msg.location && typeof msg.location === "object") {
+    logChat("in", chatId, "[location-message]", { source: "location", user });
+    const locationHandled = await handleWeatherLocationMessage(msg);
+    if (locationHandled) return;
+  }
+
   const text = String(msg.text || "").trim();
   if (!text) {
     logChat("in", chatId, "[non-text-message]", { source: "non-text", user });
@@ -17105,6 +17763,7 @@ async function shutdown(code = 0, reason = "") {
     stopWhisperKeepalive("Bot shutdown.", { allowAutoRestart: false });
     stopWorldMonitorMonitorLoop();
     stopWorldMonitorFeedAlertsLoop();
+    stopWeatherDailyLoop();
   } catch {
     // best effort
   }
@@ -17225,6 +17884,22 @@ process.on("unhandledRejection", (err) => {
     } else {
       log("WorldMonitor monitor disabled (WORLDMONITOR_MONITOR_ENABLED=0).");
     }
+    if (WEATHER_DAILY_ENABLED) {
+      if (!WEATHER_DAILY_CHAT_ID) {
+        log("Daily weather report is enabled but WEATHER_DAILY_CHAT_ID is empty.");
+      } else {
+        const nextAt = computeNextWeatherDailyRunAt(Date.now());
+        const configuredWeatherLocation = getConfiguredWeatherLocation();
+        const configuredWeatherLabel = configuredWeatherLocation
+          ? buildWeatherLocationSummary(configuredWeatherLocation)
+          : "unset (will use per-chat shared GPS location)";
+        log(
+          `Daily weather report enabled (configured_location=${configuredWeatherLabel}, shared_gps_chats=${Object.keys(weatherLocationsByChat).length}, time=${String(WEATHER_DAILY_HOUR).padStart(2, "0")}:${String(WEATHER_DAILY_MINUTE).padStart(2, "0")} ${WEATHER_DAILY_TIMEZONE}, voice=${WEATHER_DAILY_VOICE_ENABLED}, next_run=${nowIso(nextAt)}).`,
+        );
+      }
+    } else {
+      log("Daily weather report disabled (WEATHER_DAILY_ENABLED=0).");
+    }
 
     await prewarmAudioKeepalives();
     await skipStaleUpdates();
@@ -17233,6 +17908,7 @@ process.on("unhandledRejection", (err) => {
     }
     startWorldMonitorMonitorLoop();
     startWorldMonitorFeedAlertsLoop();
+    startWeatherDailyLoop();
 
     if (STARTUP_MESSAGE) {
       await sendMessage(PRIMARY_CHAT_ID, `${fmtBold("AIDOLON")} online. Use /help.`);
