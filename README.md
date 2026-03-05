@@ -71,6 +71,7 @@ Core:
 - `/weather [city]` - weather update for today and tomorrow (text + voice when enabled)
 - `/cancel` or `/stop` - cancel active run
 - `/clear` - clear queued prompts
+- `/prune` - prune runtime artifacts/logs (keeps chat context)
 - `/wipe` - wipe runtime artifacts and reset chat context
 - `/restart` - restart process when workers are idle and queue is empty
 
@@ -92,6 +93,9 @@ Vision and media:
 - `/ask <question>` - analyze your last sent image
 - `/imgclear` - clear last image context
 - `/tts <text>` - send TTS voice message
+- `/tts [preset:<name>] <text>` - send one voice message with a one-off preset
+- `/abtest [text]` - send one sample per voice preset for A/B listening
+- `/voice [name|list|default]` - pick/set live TTS voice preset (no restart)
 
 Files:
 - `/sendfile <relative-path> [caption]` - send file from `ATTACH_ROOT`
@@ -135,6 +139,14 @@ Voice notes:
 Voice replies:
 - Enable `TTS_ENABLED=1`.
 - If you want automatic voice replies for incoming voice notes, set `TTS_REPLY_TO_VOICE=1`.
+- Use `/voice` to switch styles while running; no bot restart needed.
+- Sci-fi presets are intentionally stylized:
+  - `hologram-ai`: brighter hologram shimmer with stronger gain staging.
+  - `starship-comms`: radio-band comms with NASA-style start/end beeps and short interference bursts.
+  - `cyber-oracle`: synthetic oracle tone with wider modulation and louder output.
+  - `alien-terminal`: layered dual-voice alien timbre with robotic grit.
+- `starship-comms` default beep assets live in `resources/tts/` and can be overridden via env vars.
+- Preset `anonymous` keeps the previous legacy post-processing chain for A/B comparisons.
 
 ## Daily weather briefing
 
@@ -255,6 +267,7 @@ Media and voice:
 - `VISION_ENABLED`
 - `TTS_ENABLED`, `TTS_REPLY_TO_VOICE`
 - `TTS_MODEL`, `TTS_REFERENCE_AUDIO`, `TTS_FFMPEG_BIN`
+- `TTS_STARSHIP_BEEP_START`, `TTS_STARSHIP_BEEP_END`
 
 WorldMonitor core:
 - `WORLDMONITOR_MONITOR_ENABLED`

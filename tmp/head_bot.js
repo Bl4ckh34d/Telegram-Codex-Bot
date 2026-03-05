@@ -403,11 +403,7 @@ const NATURAL_COMMAND_ALIASES = Object.freeze({
   see: "/see",
   imgclear: "/imgclear",
   model: "/model",
-  voice: "/voice",
   tts: "/tts",
-  abtest: "/abtest",
-  voicetest: "/abtest",
-  prune: "/prune",
   wipe: "/wipe",
   restart: "/restart",
   newsstatus: "/newsstatus",
@@ -433,9 +429,6 @@ const NATURAL_NO_ARG_COMMANDS = new Set([
   "/new",
   "/imgclear",
   "/model",
-  "/voice",
-  "/abtest",
-  "/prune",
   "/wipe",
   "/newsstatus",
 ]);
@@ -475,9 +468,6 @@ const NATURAL_DIRECT_COMMANDS = new Set([
   "/compress",
   "/imgclear",
   "/model",
-  "/voice",
-  "/abtest",
-  "/prune",
   "/wipe",
   "/restart",
   "/newsstatus",
@@ -1047,12 +1037,6 @@ const TTS_POSTPROCESS_ENABLED = toBool(process.env.TTS_POSTPROCESS_ENABLED, fals
 const TTS_POSTPROCESS_PRESET = String(process.env.TTS_POSTPROCESS_PRESET || "").trim().toLowerCase();
 // Raw ffmpeg audio filtergraph string passed to `-af` (overrides preset when set).
 const TTS_POSTPROCESS_FFMPEG_AF = String(process.env.TTS_POSTPROCESS_FFMPEG_AF || "").trim();
-const TTS_STARSHIP_BEEP_START = resolveMaybeRelativePath(
-  process.env.TTS_STARSHIP_BEEP_START || path.join("resources", "tts", "a11-comms-start.wav"),
-);
-const TTS_STARSHIP_BEEP_END = resolveMaybeRelativePath(
-  process.env.TTS_STARSHIP_BEEP_END || path.join("resources", "tts", "a11-comms-end.wav"),
-);
 const TTS_POSTPROCESS_DEBUG = toBool(process.env.TTS_POSTPROCESS_DEBUG, false);
 
 let ATTACH_ENABLED = toBool(process.env.ATTACH_ENABLED, true);
@@ -2073,14 +2057,12 @@ function persistState() {
 
 function getChatPrefs(chatId) {
   const key = String(chatId || "").trim();
-  if (!key) return { model: "", reasoning: "", ttsPreset: "" };
+  if (!key) return { model: "", reasoning: "" };
   const entry = chatPrefs[key];
-  if (!entry || typeof entry !== "object") return { model: "", reasoning: "", ttsPreset: "" };
-  const ttsPreset = normalizeTtsPresetName(entry.ttsPreset, { allowDefault: true });
+  if (!entry || typeof entry !== "object") return { model: "", reasoning: "" };
   return {
     model: String(entry.model || "").trim(),
     reasoning: String(entry.reasoning || "").trim(),
-    ttsPreset: ttsPreset === "default" ? "" : ttsPreset,
   };
 }
 
@@ -2088,24 +2070,10 @@ function setChatPrefs(chatId, patch) {
   const key = String(chatId || "").trim();
   if (!key) return;
   const prev = getChatPrefs(key);
-  const hasPatch = patch && typeof patch === "object";
-  const hasPreset = hasPatch && Object.prototype.hasOwnProperty.call(patch, "ttsPreset");
-  const normalizedPreset = hasPreset
-    ? normalizeTtsPresetName(patch.ttsPreset, { allowDefault: true })
-    : normalizeTtsPresetName(prev.ttsPreset, { allowDefault: true });
-  const next = {
+  chatPrefs[key] = {
     model: String(patch?.model ?? prev.model ?? "").trim(),
     reasoning: String(patch?.reasoning ?? prev.reasoning ?? "").trim(),
-    ttsPreset: normalizedPreset === "default" ? "" : normalizedPreset,
   };
-  if (!next.model && !next.reasoning && !next.ttsPreset) {
-    if (Object.prototype.hasOwnProperty.call(chatPrefs, key)) {
-      delete chatPrefs[key];
-      persistState();
-    }
-    return;
-  }
-  chatPrefs[key] = next;
   persistState();
 }
 
@@ -5887,7 +5855,6 @@ function getTelegramCommandList() {
     { command: "cancel", description: "cancel the active codex run" },
     { command: "stop", description: "cancel the active codex run" },
     { command: "clear", description: "clear queued prompts" },
-    { command: "prune", description: "prune runtime artifacts and logs" },
     { command: "wipe", description: "wipe runtime artifacts and chat context" },
     { command: "screenshot", description: "send a screenshot image" },
     { command: "sendfile", description: "send a file attachment" },
@@ -5898,9 +5865,7 @@ function getTelegramCommandList() {
     { command: "see", description: "take a screenshot and ask about it" },
     { command: "imgclear", description: "clear last image context" },
     { command: "model", description: "pick model + reasoning effort" },
-    { command: "voice", description: "pick/set live TTS voice preset" },
     { command: "tts", description: "speak text as a Telegram voice message" },
-    { command: "abtest", description: "A/B test all voice presets" },
     { command: "restart", description: "restart only when all workers are idle" },
   ];
 }
@@ -6518,13 +6483,6 @@ function parseNaturalCommand(text) {
   if (/^(?:please\s+)?(?:show|open)\s+(?:the\s+)?(?:commands?|command menu)(?:\s+please)?[.!?]*$/i.test(squashed)) {
     return { cmd: "/commands", arg: "" };
   }
-  if (
-    /\ba[\s/-]?b(?:\s+test)?\b/i.test(squashed) &&
-    /\bvoice\b/i.test(squashed) &&
-    /\b(?:preset|presets|profile|profiles|compare|comparison)\b/i.test(squashed)
-  ) {
-    return { cmd: "/abtest", arg: "" };
-  }
 
   let candidate = squashed;
   let prefixMode = false;
@@ -6687,7 +6645,6 @@ async function sendHelp(chatId) {
     "- /newsstatus - show WorldMonitor monitor state and last alerts",
     "- /cancel - stop current AIDOLON run",
     "- /clear - clear queued prompts",
-    "- /prune - prune runtime files/logs (keeps chat context)",
     "- /wipe - wipe runtime files and reset this chat context",
     "",
     fmtBold("CLI flow"),
@@ -6710,9 +6667,7 @@ async function sendHelp(chatId) {
     "- /see <question> - take a screenshot and analyze it",
     "- /ask <question> - analyze your last sent image",
     "- /imgclear - clear the last image context",
-    "- /voice [name|list|default] - pick/set TTS voice preset (live, no restart)",
     "- /tts <text> - send a TTS voice message (requires TTS_ENABLED=1)",
-    "- /abtest [text] - send one sample per voice preset for A/B listening",
     "- /sendfile <path> [caption] - send a file attachment (from ATTACH_ROOT)",
     "",
     fmtBold("Other"),
@@ -12822,9 +12777,6 @@ async function sendStatus(chatId) {
   const prefs = getChatPrefs(chatId);
   const effectiveModel = String(prefs.model || CODEX_MODEL || "").trim() || "(default)";
   const effectiveReasoning = String(prefs.reasoning || CODEX_REASONING_EFFORT || "").trim() || "(default)";
-  const chatVoicePreset = normalizeTtsPresetName(prefs.ttsPreset, { allowDefault: true });
-  const effectiveVoicePreset = resolveTtsPresetForChat(chatId);
-  const defaultVoicePreset = getDefaultTtsPresetName();
   const codexWorkers = listCodexWorkers();
   const ttsLane = getLane(ORCH_TTS_LANE_ID);
   const whisperLane = getLane(ORCH_WHISPER_LANE_ID);
@@ -12891,7 +12843,6 @@ async function sendStatus(chatId) {
     `- active_session: ${activeSession ? shortSessionId(activeSession) : "(none)"}`,
     `- model: ${effectiveModel}${prefs.model ? " (chat override)" : ""}`,
     `- reasoning: ${effectiveReasoning}${prefs.reasoning ? " (chat override)" : ""}`,
-    `- voice_preset: ${effectiveVoicePreset}${chatVoicePreset ? " (chat override)" : ` (default=${defaultVoicePreset})`}`,
     "",
     fmtBold("Orchestrator"),
     `- workers: ${codexWorkers.length}/${ORCH_MAX_CODEX_WORKERS}`,
@@ -13183,79 +13134,6 @@ async function refreshModelPickerMessage(chatId, messageId) {
   }
 }
 
-function buildVoicePresetPickerPayload(chatId) {
-  const prefs = getChatPrefs(chatId);
-  const chatPreset = normalizeTtsPresetName(prefs.ttsPreset, { allowDefault: true });
-  const effective = resolveTtsPresetForChat(chatId);
-  const defaultPreset = getDefaultTtsPresetName();
-  const effectiveDesc = getTtsPresetDescription(effective);
-  const defaultDesc = getTtsPresetDescription(defaultPreset);
-  const chatLabel = chatPreset && chatPreset !== "default" ? chatPreset : "(none)";
-  const chatDesc = chatPreset && chatPreset !== "default" ? getTtsPresetDescription(chatPreset) : "";
-
-  const lines = [
-    fmtBold("Voice preset (this chat)"),
-    `- effective: ${effective}${effectiveDesc ? ` (${effectiveDesc})` : ""}`,
-    `- chat_override: ${chatLabel}${chatDesc ? ` (${chatDesc})` : ""}`,
-    `- bot_default: ${defaultPreset}${defaultDesc ? ` (${defaultDesc})` : ""}`,
-    "",
-    "Tap a preset to apply immediately (no restart).",
-  ];
-
-  const keyboard = [];
-  const presetChoices = getAvailableTtsPresetNames();
-  for (let i = 0; i < presetChoices.length; i += 2) {
-    const row = [];
-    for (const preset of presetChoices.slice(i, i + 2)) {
-      const id = registerPrefButton(chatId, "tts-preset", preset);
-      row.push({ text: preset === effective ? `* ${preset}` : preset, callback_data: `pref:${id}` });
-    }
-    keyboard.push(row);
-  }
-
-  const resetId = registerPrefButton(chatId, "tts-preset-reset", "default");
-  keyboard.push([{ text: "Use bot default", callback_data: `pref:${resetId}` }]);
-
-  return {
-    text: lines.join("\n"),
-    replyMarkup: { inline_keyboard: keyboard },
-  };
-}
-
-async function sendVoicePresetPicker(chatId) {
-  const payload = buildVoicePresetPickerPayload(chatId);
-  await sendMessage(chatId, payload.text, {
-    replyMarkup: payload.replyMarkup,
-  });
-}
-
-async function refreshVoicePresetPickerMessage(chatId, messageId) {
-  const msgId = Number(messageId || 0);
-  if (!Number.isFinite(msgId) || msgId <= 0) {
-    await sendVoicePresetPicker(chatId);
-    return;
-  }
-  const payload = buildVoicePresetPickerPayload(chatId);
-  const formatted = renderTelegramEntities(normalizeResponse(payload.text));
-  const body = {
-    chat_id: chatId,
-    message_id: msgId,
-    text: formatted.text,
-    disable_web_page_preview: true,
-    reply_markup: payload.replyMarkup,
-  };
-  if (formatted.entities) body.entities = formatted.entities;
-  try {
-    await telegramApi("editMessageText", { body });
-  } catch (err) {
-    const message = String(err?.message || err || "");
-    const status = parseTelegramStatusFromError(err);
-    if (status === 400 && /message is not modified/i.test(message)) return;
-    log(`edit voice preset picker failed: ${redactError(message)}`);
-    await sendMessage(chatId, payload.text, { replyMarkup: payload.replyMarkup });
-  }
-}
-
 async function sendQueue(chatId) {
   const items = listQueuedJobsForChat(chatId);
   if (items.length === 0) {
@@ -13267,19 +13145,17 @@ async function sendQueue(chatId) {
     const item = entry.job;
     const laneId = String(entry.laneId || "").trim();
     const kind = String(item?.kind || "codex");
-    const ttsPreset = normalizeTtsPresetName(item?.ttsPreset) || "";
-    const presetTag = ttsPreset ? `:${ttsPreset}` : "";
     let preview = "";
     if (kind === "tts-batch") {
       const texts = Array.isArray(item?.texts) ? item.texts : [];
       const count = texts.length;
       const first = String(texts[0] || "").trim();
       const head = first.length > 70 ? `${first.slice(0, 70)}...` : first;
-      preview = `[tts-batch${presetTag} x${count || "?"}] ${head || "(empty)"}`;
+      preview = `[tts-batch x${count || "?"}] ${head || "(empty)"}`;
     } else {
       const t = String(item?.text || "").trim();
       preview = t.length > 90 ? `${t.slice(0, 90)}...` : t || "(empty)";
-      if (kind === "tts") preview = `[tts${presetTag}] ${preview}`;
+      if (kind === "tts") preview = `[tts] ${preview}`;
       if (kind === "raw") preview = `[raw] ${preview}`;
     }
     const workerId = String(item?.workerId || "").trim();
@@ -13566,36 +13442,6 @@ async function wipeRuntime(chatId) {
     `- Pending /cmd cleared (this chat): ${chat.pendingCommandCleared ? "yes" : "no"}`,
     `- Learned lessons cleared (this chat): ${chat.lessonsRemoved}`,
     `- Chat context reset in state (this chat): ${chat.stateChanged ? "yes" : "no"}`,
-  ];
-  if (runtime.errors.length > 0) {
-    lines.push(`- Warnings: ${runtime.errors.length}`);
-    lines.push(...runtime.errors.slice(0, 3).map((e) => `  - ${e}`));
-  }
-  await sendMessage(key, lines.join("\n"));
-}
-
-async function pruneRuntime(chatId) {
-  const key = String(chatId || "").trim();
-  if (!key) return;
-
-  const { active, queued } = laneWorkloadCounts();
-  if (active > 0 || queued > 0) {
-    await sendMessage(
-      key,
-      `Cannot run /prune while workers are busy (active=${active}, queued=${queued}). Use /cancel and /clear, wait for idle, then retry.`,
-    );
-    return;
-  }
-
-  const runtime = wipeRuntimeArtifacts();
-  await maybeTriggerPendingRestart("prune");
-
-  const lines = [
-    "Prune complete.",
-    `- Runtime files deleted: ${runtime.deletedFiles}`,
-    `- Runtime directories removed: ${runtime.deletedDirs}`,
-    `- Runtime bytes freed: ${runtime.deletedBytes}`,
-    "- Chat context kept: yes",
   ];
   if (runtime.errors.length > 0) {
     lines.push(`- Warnings: ${runtime.errors.length}`);
@@ -13921,9 +13767,6 @@ async function handleParsedCommand(chatId, parsed) {
     case "/clear":
       await clearQueue(chatId);
       return true;
-    case "/prune":
-      await pruneRuntime(chatId);
-      return true;
     case "/wipe":
       await wipeRuntime(chatId);
       return true;
@@ -14036,7 +13879,7 @@ async function handleParsedCommand(chatId, parsed) {
     case "/model": {
       const arg = String(parsed.arg || "").trim().toLowerCase();
       if (["clear", "reset", "defaults", "default", "off", "none"].includes(arg)) {
-        setChatPrefs(chatId, { model: "", reasoning: "" });
+        clearChatPrefs(chatId);
         await sendMessage(chatId, "Model preferences cleared for this chat (back to defaults).");
         return true;
       }
@@ -14105,30 +13948,24 @@ async function handleParsedCommand(chatId, parsed) {
       await sendMessage(chatId, "Cleared last image context.");
       return true;
     }
-    case "/voice":
-      return await handleVoicePresetCommand(chatId, parsed.arg);
-    case "/abtest":
-      return await handleTtsAbTestCommand(chatId, parsed.arg || "");
     case "/tts": {
       if (!TTS_ENABLED) {
         await sendMessage(chatId, "TTS is disabled on this bot (TTS_ENABLED=0).");
         return true;
       }
-      const ttsInput = parseTtsCommandInput(parsed.arg || "");
-      if (!ttsInput.ok) {
-        await sendMessage(chatId, ttsInput.error || "Usage: /tts <text>");
+      const q = String(parsed.arg || "").trim();
+      if (!q) {
+        await sendMessage(chatId, "Usage: /tts <text>");
         return true;
       }
-      const q = String(ttsInput.text || "").trim();
-      const presetOverride = String(ttsInput.preset || "").trim();
       // Never truncate user input for TTS; split into as many voice notes as needed.
       const { chunks, overflowText } = splitSpeakableTextIntoVoiceChunks(q);
       const all = chunks.length > 0 ? chunks : [q];
       if (overflowText) all.push(overflowText);
       if (all.length > 1) {
-        await enqueueTtsBatch(chatId, all, "tts-command", { ttsPreset: presetOverride });
+        await enqueueTtsBatch(chatId, all, "tts-command");
       } else {
-        await enqueueTts(chatId, all[0], "tts-command", { ttsPreset: presetOverride });
+        await enqueueTts(chatId, all[0], "tts-command");
       }
       return true;
     }
@@ -14270,307 +14107,6 @@ function normalizeTtsText(text) {
   const fixed = applyCommonTtsPronunciationFixes(trimmed);
   const squashed = fixed.replace(/\s+/g, " ").trim();
   return squashed;
-}
-
-const TTS_PRESET_ORDER = Object.freeze([
-  "off",
-  "hologram-ai",
-  "starship-comms",
-  "cyber-oracle",
-  "alien-terminal",
-  "anonymous",
-  "custom",
-]);
-
-const TTS_PRESET_ALIAS_MAP = Object.freeze({
-  off: "off",
-  none: "off",
-  disable: "off",
-  disabled: "off",
-  bypass: "off",
-  clean: "off",
-  hologram: "hologram-ai",
-  "hologram-ai": "hologram-ai",
-  hologramai: "hologram-ai",
-  starship: "starship-comms",
-  comms: "starship-comms",
-  radio: "starship-comms",
-  "starship-comms": "starship-comms",
-  cyber: "cyber-oracle",
-  oracle: "cyber-oracle",
-  "cyber-oracle": "cyber-oracle",
-  alien: "alien-terminal",
-  terminal: "alien-terminal",
-  "alien-terminal": "alien-terminal",
-  anonymous: "anonymous",
-  current: "anonymous",
-  baseline: "anonymous",
-  legacy: "anonymous",
-  audacity: "anonymous",
-  "audacity-stack": "anonymous",
-  custom: "custom",
-  raw: "custom",
-});
-
-const TTS_PRESET_DESCRIPTIONS = Object.freeze({
-  off: "No post-processing.",
-  "hologram-ai": "Brighter, louder hologram sheen with layered modulation.",
-  "starship-comms": "Bridge comms with start/end beeps, radio grit, and short interference bursts.",
-  "cyber-oracle": "Low-pitched oracle tone with slow steady pitch drift and synthetic space.",
-  "alien-terminal": "Layered alien machine timbre with moderate modulation.",
-  anonymous: "Legacy chain (kept for A/B comparisons; strong down-pitch).",
-  custom: "Use raw ffmpeg filtergraph from env.",
-});
-
-// Per-preset output gain calibration from /abtest loudness feedback (100 = target).
-const TTS_PRESET_OUTPUT_GAINS = Object.freeze({
-  "hologram-ai": 2.6,
-  "starship-comms": 0.95,
-  "cyber-oracle": 3.8,
-  "alien-terminal": 3.1,
-  anonymous: 6.5,
-});
-
-function normalizeTtsPresetName(name, { allowDefault = false } = {}) {
-  const raw = String(name || "").trim().toLowerCase();
-  if (!raw) return "";
-  const key = raw.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "").replace(/[_\s]+/g, "-");
-  if (allowDefault && ["default", "auto", "bot", "env"].includes(key)) return "default";
-  return TTS_PRESET_ALIAS_MAP[key] || "";
-}
-
-function getTtsPresetOutputGain(name) {
-  const key = normalizeTtsPresetName(name);
-  const gain = Number(TTS_PRESET_OUTPUT_GAINS[key]);
-  if (!Number.isFinite(gain) || gain <= 0) return 1;
-  return gain;
-}
-
-function getAvailableTtsPresetNames() {
-  return TTS_PRESET_ORDER.filter((name) => name !== "custom" || Boolean(TTS_POSTPROCESS_FFMPEG_AF));
-}
-
-function getTtsPresetDescription(name) {
-  const key = normalizeTtsPresetName(name) || String(name || "").trim().toLowerCase();
-  return String(TTS_PRESET_DESCRIPTIONS[key] || "").trim();
-}
-
-function formatTtsPresetChoicesInline() {
-  return getAvailableTtsPresetNames().join(", ");
-}
-
-const TTS_ABTEST_DEFAULT_SAMPLE = "This is AIDOLON. Same line, different preset, for an A B voice comparison.";
-
-function getDefaultTtsPresetName() {
-  if (!TTS_POSTPROCESS_ENABLED) return "off";
-  if (TTS_POSTPROCESS_FFMPEG_AF) return "custom";
-  const normalized = normalizeTtsPresetName(TTS_POSTPROCESS_PRESET);
-  return normalized || "anonymous";
-}
-
-function resolveTtsPresetForChat(chatId, overridePreset = "") {
-  const override = normalizeTtsPresetName(overridePreset, { allowDefault: true });
-  if (override && override !== "default") return override;
-  const prefs = getChatPrefs(chatId);
-  const chatPreset = normalizeTtsPresetName(prefs.ttsPreset, { allowDefault: true });
-  if (chatPreset && chatPreset !== "default") return chatPreset;
-  return getDefaultTtsPresetName();
-}
-
-function parseTtsCommandInput(argText) {
-  const raw = String(argText || "").trim();
-  if (!raw) {
-    return {
-      ok: false,
-      error: `Usage: /tts <text>\nOptional: /tts [preset:<name>] <text>\nPresets: ${formatTtsPresetChoicesInline()}`,
-    };
-  }
-
-  let text = raw;
-  let presetRaw = "";
-
-  const tagged = raw.match(/^\[(?:preset|voice)\s*[:=]\s*([^\]]+)\]\s*([\s\S]*)$/i);
-  if (tagged) {
-    presetRaw = String(tagged[1] || "").trim();
-    text = String(tagged[2] || "").trim();
-  } else {
-    const piped = raw.match(/^(?:preset|voice)\s*[:=]\s*([a-z0-9 _-]+)\s*\|\s*([\s\S]+)$/i);
-    if (piped) {
-      presetRaw = String(piped[1] || "").trim();
-      text = String(piped[2] || "").trim();
-    }
-  }
-
-  if (!text) {
-    return {
-      ok: false,
-      error: `Usage: /tts <text>\nOptional: /tts [preset:<name>] <text>\nPresets: ${formatTtsPresetChoicesInline()}`,
-    };
-  }
-
-  let preset = "";
-  if (presetRaw) {
-    const normalized = normalizeTtsPresetName(presetRaw, { allowDefault: true });
-    if (!normalized) {
-      return {
-        ok: false,
-        error: `Unknown preset: ${presetRaw}\nAvailable: ${formatTtsPresetChoicesInline()}`,
-      };
-    }
-    if (normalized === "custom" && !TTS_POSTPROCESS_FFMPEG_AF) {
-      return {
-        ok: false,
-        error: "Preset 'custom' is unavailable because TTS_POSTPROCESS_FFMPEG_AF is not set.",
-      };
-    }
-    preset = normalized === "default" ? "" : normalized;
-  }
-
-  return { ok: true, text, preset };
-}
-
-function parseTtsAbTestCommandInput(argText) {
-  const raw = String(argText || "").trim();
-  const lower = raw.toLowerCase();
-  if (["help", "-h", "--help", "?"].includes(lower)) {
-    return {
-      ok: false,
-      error: "Usage: /abtest [text]\nRuns the same one-line sample across all available voice presets.",
-    };
-  }
-
-  const sample = normalizeTtsText(raw || TTS_ABTEST_DEFAULT_SAMPLE);
-  if (!sample) {
-    return {
-      ok: false,
-      error: "Usage: /abtest [text]\nRuns the same one-line sample across all available voice presets.",
-    };
-  }
-
-  const split = splitSpeakableTextIntoVoiceChunks(sample);
-  const chunks = Array.isArray(split?.chunks) ? split.chunks.filter(Boolean) : [];
-  const overflowText = String(split?.overflowText || "").trim();
-  if (chunks.length + (overflowText ? 1 : 0) > 1) {
-    return {
-      ok: false,
-      error: "Please keep /abtest text short enough for one voice note so every preset reads the exact same line.",
-    };
-  }
-
-  const text = String(chunks[0] || sample).trim();
-  if (!text) {
-    return {
-      ok: false,
-      error: "Usage: /abtest [text]\nRuns the same one-line sample across all available voice presets.",
-    };
-  }
-  return { ok: true, text };
-}
-
-function resolveVoicePresetCommandAction(rawArg) {
-  const raw = String(rawArg || "").trim();
-  const arg = raw.toLowerCase();
-
-  if (!raw || ["list", "ls", "show", "status"].includes(arg)) {
-    return { action: "status" };
-  }
-  if (["default", "reset", "clear", "auto", "bot"].includes(arg)) {
-    return { action: "reset" };
-  }
-
-  const normalized = normalizeTtsPresetName(raw, { allowDefault: true });
-  if (!normalized) {
-    return {
-      action: "error",
-      text: `Unknown preset: ${raw}\nAvailable: ${formatTtsPresetChoicesInline()}`,
-    };
-  }
-  if (normalized === "custom" && !TTS_POSTPROCESS_FFMPEG_AF) {
-    return {
-      action: "error",
-      text: "Preset 'custom' is unavailable because TTS_POSTPROCESS_FFMPEG_AF is not set.",
-    };
-  }
-  if (normalized === "default") {
-    return { action: "reset" };
-  }
-  return { action: "set", preset: normalized };
-}
-
-async function handleVoicePresetCommand(chatId, rawArg) {
-  const decision = resolveVoicePresetCommandAction(rawArg);
-  if (decision.action === "status") {
-    await sendVoicePresetPicker(chatId);
-    return true;
-  }
-  if (decision.action === "error") {
-    await sendMessage(chatId, decision.text || "Invalid voice preset.");
-    return true;
-  }
-  if (decision.action === "reset") {
-    setChatPrefs(chatId, { ttsPreset: "" });
-    await sendMessage(chatId, `Voice preset reset to bot default: ${resolveTtsPresetForChat(chatId)}.`);
-    return true;
-  }
-  setChatPrefs(chatId, { ttsPreset: decision.preset });
-  const effective = resolveTtsPresetForChat(chatId);
-  await sendMessage(chatId, `Voice preset set to ${effective}. Use /tts [preset:<name>] <text> for one-off comparisons.`);
-  return true;
-}
-
-async function handleTtsAbTestCommand(chatId, rawArg) {
-  if (!TTS_ENABLED) {
-    await sendMessage(chatId, "TTS is disabled on this bot (TTS_ENABLED=0).");
-    return true;
-  }
-
-  const parsed = parseTtsAbTestCommandInput(rawArg);
-  if (!parsed.ok) {
-    await sendMessage(chatId, parsed.error || "Usage: /abtest [text]");
-    return true;
-  }
-
-  const sample = String(parsed.text || "").trim();
-  const presets = getAvailableTtsPresetNames();
-  if (presets.length === 0) {
-    await sendMessage(chatId, "No TTS presets are currently available.");
-    return true;
-  }
-
-  if (MAX_QUEUE_SIZE > 0 && totalQueuedJobs() + presets.length > MAX_QUEUE_SIZE) {
-    await sendMessage(
-      chatId,
-      `Queue is too full for /abtest (${presets.length} jobs needed, max queued=${MAX_QUEUE_SIZE}). Use /queue or /clear, then retry.`,
-    );
-    return true;
-  }
-
-  await sendMessage(
-    chatId,
-    `A/B test queued: ${presets.length} presets.\nOrder: ${presets.join(", ")}\nSample: "${sample}"`,
-  );
-
-  let queued = 0;
-  for (let i = 0; i < presets.length; i += 1) {
-    const preset = presets[i];
-    const ok = await enqueueTts(chatId, sample, "tts-abtest", {
-      ttsPreset: preset,
-      skipResultText: true,
-      voiceCaption: `A/B ${i + 1}/${presets.length}: ${preset}`,
-    });
-    if (!ok) break;
-    queued += 1;
-  }
-
-  if (queued > 0 && queued < presets.length) {
-    await sendMessage(chatId, `Queued ${queued}/${presets.length} samples before the queue filled.`);
-  }
-
-  if (queued === 0) {
-    await sendMessage(chatId, "Could not queue A/B samples.");
-  }
-
-  return true;
 }
 
 function formatClockTimeForTts(hoursRaw, minutesRaw) {
@@ -15381,18 +14917,15 @@ async function enqueueTts(chatId, inputText, source, options = {}) {
   }
 
   const workerId = String(options?.workerId || "").trim() || getActiveWorkerForChat(chatId);
-  const ttsPreset = resolveTtsPresetForChat(chatId, options?.ttsPreset || "");
   const job = {
     id: nextJobId++,
     chatId,
     text,
     source,
     kind: "tts",
-    ttsPreset,
     workerId,
     afterText: String(options.afterText || "").trim(),
     skipResultText: options.skipResultText === true,
-    voiceCaption: String(options.voiceCaption || "").trim(),
     attachments: Array.isArray(options.attachments) ? options.attachments : [],
     replyToMessageId: Number(options?.replyToMessageId || 0),
     taskId: Number(options?.routeTaskId || 0),
@@ -15425,14 +14958,12 @@ async function enqueueTtsBatch(chatId, inputTexts, source, options = {}) {
   }
 
   const workerId = String(options?.workerId || "").trim() || getActiveWorkerForChat(chatId);
-  const ttsPreset = resolveTtsPresetForChat(chatId, options?.ttsPreset || "");
   const job = {
     id: nextJobId++,
     chatId,
     texts,
     source,
     kind: "tts-batch",
-    ttsPreset,
     workerId,
     afterText: String(options.afterText || "").trim(),
     skipResultText: options.skipResultText === true,
@@ -15545,11 +15076,6 @@ function resolveTtsRuntime() {
 }
 
 const _ffmpegAudioFilterCache = new Map(); // key: ffmpeg bin path -> Set<string> | null
-// Some filters are audio-usable but reported as generic/dynamic I/O (for example N->N or |->N).
-const FFMPEG_AUDIO_COMPAT_FILTER_NAMES = new Set([
-  "amovie",
-  "concat",
-]);
 
 function getFfmpegAudioFilterSet(ffmpegBin) {
   const key = String(ffmpegBin || "").trim();
@@ -15583,10 +15109,9 @@ function getFfmpegAudioFilterSet(ffmpegBin) {
     const io = parts[2] || "";
     if (!name) continue;
     // The input/output types are expressed in the third column (e.g. "A->A", "N->A", "A->V").
-    // We mainly need audio-capable filters for -af post-processing, plus a short allow-list
-    // of generic filters used in starship-comms -filter_complex graphing.
+    // We only need to know whether a filter is audio-capable for our -af post-processing.
     if (!io.includes("->")) continue; // skip header legend lines like "T.. = Timeline support"
-    if (io.includes("A") || FFMPEG_AUDIO_COMPAT_FILTER_NAMES.has(name)) set.add(name);
+    if (io.includes("A")) set.add(name);
   }
 
   _ffmpegAudioFilterCache.set(key, set);
@@ -15607,245 +15132,85 @@ function fmtFloat(x, digits = 6) {
   return n.toFixed(digits).replace(/0+$/, "").replace(/\.$/, "");
 }
 
-function escapeFfmpegFilterPath(value) {
-  return String(value || "")
-    .trim()
-    .replace(/\\/g, "/")
-    .replace(/:/g, "\\:")
-    .replace(/'/g, "\\'");
-}
+function buildTtsPostprocessFiltergraph(ffmpegBin) {
+  if (!TTS_POSTPROCESS_ENABLED) return "";
+  if (TTS_POSTPROCESS_FFMPEG_AF) return TTS_POSTPROCESS_FFMPEG_AF;
 
-function buildStarshipCommsComplexSpec(audioFilters) {
-  const requiredFilters = [
-    "amovie",
-    "anoisesrc",
-    "concat",
-    "amix",
-    "afade",
-    "atrim",
-    "adelay",
-    "aresample",
-    "highpass",
-    "lowpass",
-    "acompressor",
-    "volume",
-  ];
-  if (!requiredFilters.every((name) => audioFilters.has(name))) return null;
+  const preset = TTS_POSTPROCESS_PRESET || "audacity-stack";
+  const audioFilters = getFfmpegAudioFilterSet(ffmpegBin) || new Set();
 
-  if (!TTS_STARSHIP_BEEP_START || !fs.existsSync(TTS_STARSHIP_BEEP_START)) {
-    if (TTS_POSTPROCESS_DEBUG) {
-      log(`TTS postprocess (starship-comms): missing start beep WAV at ${TTS_STARSHIP_BEEP_START || "(unset)"}.`);
-    }
-    return null;
-  }
-  if (!TTS_STARSHIP_BEEP_END || !fs.existsSync(TTS_STARSHIP_BEEP_END)) {
-    if (TTS_POSTPROCESS_DEBUG) {
-      log(`TTS postprocess (starship-comms): missing end beep WAV at ${TTS_STARSHIP_BEEP_END || "(unset)"}.`);
-    }
-    return null;
-  }
+  if (preset !== "audacity-stack") return "";
 
-  const startBeepPath = escapeFfmpegFilterPath(TTS_STARSHIP_BEEP_START);
-  const endBeepPath = escapeFfmpegFilterPath(TTS_STARSHIP_BEEP_END);
-
-  const radioChain = [
-    "highpass=f=260",
-    "lowpass=f=3300",
-    "acompressor=threshold=-30dB:ratio=5.4:attack=1.5:release=92:makeup=7.4",
-  ];
-  if (audioFilters.has("acrusher")) radioChain.push("acrusher=bits=8:mode=log:mix=0.28");
-
-  const graphParts = [
-    "[0:a]aresample=48000[voice_src]",
-    `[voice_src]${radioChain.join(",")}[radio]`,
-    `amovie='${startBeepPath}':loop=0,aresample=48000,atrim=0:0.18,afade=t=in:st=0:d=0.008,afade=t=out:st=0.13:d=0.05,volume=0.26[beep_start]`,
-    `amovie='${endBeepPath}':loop=0,aresample=48000,atrim=0:0.2,afade=t=in:st=0:d=0.008,afade=t=out:st=0.145:d=0.055,volume=0.26[beep_end]`,
-    "anoisesrc=color=white:amplitude=0.055:r=48000:d=1.2,highpass=f=1400,lowpass=f=5200,atrim=0:0.055,afade=t=in:st=0:d=0.005,afade=t=out:st=0.042:d=0.013,adelay=340|340[burst1]",
-    "anoisesrc=color=white:amplitude=0.052:r=48000:d=1.8,highpass=f=1500,lowpass=f=5300,atrim=0:0.06,afade=t=in:st=0:d=0.006,afade=t=out:st=0.045:d=0.015,adelay=1040|1040[burst2]",
-    "anoisesrc=color=white:amplitude=0.058:r=48000:d=2.8,highpass=f=1350,lowpass=f=5000,atrim=0:0.07,afade=t=in:st=0:d=0.008,afade=t=out:st=0.053:d=0.017,adelay=1920|1920[burst3]",
-    "[radio][burst1][burst2][burst3]amix=inputs=4:normalize=0[radio_dirty]",
-    "[beep_start][radio_dirty][beep_end]concat=n=3:v=0:a=1[comms]",
-  ];
-
-  let outputLabel = "comms";
-  if (audioFilters.has("asoftclip")) {
-    graphParts.push(`[${outputLabel}]asoftclip=type=tanh:threshold=0.76[comms_clip]`);
-    outputLabel = "comms_clip";
-  }
-  if (audioFilters.has("alimiter")) {
-    graphParts.push(`[${outputLabel}]alimiter=limit=0.86[comms_limited]`);
-    outputLabel = "comms_limited";
-  }
-
-  const outputGain = getTtsPresetOutputGain("starship-comms");
-  if (audioFilters.has("volume") && Math.abs(outputGain - 1) > 1e-4) {
-    graphParts.push(`[${outputLabel}]volume=${fmtFloat(outputGain, 4)}[comms_gain]`);
-    outputLabel = "comms_gain";
-  }
-
-  return { graph: graphParts.join(";"), outputLabel };
-}
-
-function buildTtsPresetFiltergraph(preset, audioFilters) {
-  const key = normalizeTtsPresetName(preset);
-  if (!key || key === "off") return "";
-  if (key === "custom") return TTS_POSTPROCESS_FFMPEG_AF || "";
+  // Requested (Audacity-like) stack:
+  // - Medium "overdrive" distortion (amount=60, output=30)
+  // - Phaser (dry/wet=45/255, LFO=2.4Hz, feedback=20%, etc) -> approximated with ffmpeg aphaser
+  // - Paulstretch (factor=1.1, time resolution=0.075) -> approximated with atempo=0.909...
+  // - Pitch shift (semitones=-5.69) without tempo change -> rubberband if available
+  // - Tempo +10% without pitch change -> atempo=1.1
+  //
+  // Notes:
+  // - ffmpeg doesn't expose Audacity's Paulstretch parameters; this is a best-effort approximation.
+  // - ffmpeg aphaser doesn't match Audacity phaser 1:1 (stages/depth/start phase), so those are ignored.
 
   const parts = [];
-  const add = (filterName, expr) => {
-    if (audioFilters.has(filterName)) parts.push(expr);
-  };
-  const addPitchShift = (semitones, presetName) => {
-    const semitonesNum = Number(semitones);
-    if (!Number.isFinite(semitonesNum) || semitonesNum === 0) return;
-    if (audioFilters.has("rubberband")) {
-      const pitchRatio = Math.pow(2, semitonesNum / 12);
-      parts.push(`rubberband=pitch=${fmtFloat(pitchRatio, 8)}`);
-      return;
-    }
-    if (TTS_POSTPROCESS_DEBUG) {
-      log(`TTS postprocess (${presetName || "preset"}): ffmpeg filter 'rubberband' not available; skipping pitch shift.`);
-    }
-  };
-  const addPresetOutputGain = (presetName = key) => {
-    const gain = getTtsPresetOutputGain(presetName);
-    if (Math.abs(gain - 1) <= 1e-4) return;
-    add("volume", `volume=${fmtFloat(gain, 4)}`);
-  };
 
-  if (key === "hologram-ai") {
-    add("aresample", "aresample=48000");
-    add("highpass", "highpass=f=140");
-    add("lowpass", "lowpass=f=7800");
-    addPitchShift(2.1, "hologram-ai");
-    add("aphaser", "aphaser=speed=1.9:decay=0.42:delay=2.2");
-    add("chorus", "chorus=0.35:0.75:28|42:0.2|0.16:0.35|0.27:1.4|2.1");
-    add("aecho", "aecho=0.72:0.4:26|52:0.24|0.12");
-    add("acompressor", "acompressor=threshold=-27dB:ratio=3.3:attack=4:release=150:makeup=7.4");
-    add("volume", "volume=1.72");
-    addPresetOutputGain("hologram-ai");
-    add("alimiter", "alimiter=limit=0.94");
-    return parts.join(",");
+  // Keep sample rate stable for later filters (especially pitch/tempo).
+  if (audioFilters.has("aresample")) parts.push("aresample=48000");
+
+  // Distortion approximation (soft clip) with pregain and a final output trim.
+  // amount 60/100: pregain ~2.8, threshold ~0.7, then output level ~0.3.
+  const distortionAmount = 60;
+  const outputLevel = 30;
+  const pregain = 1 + (distortionAmount / 100) * 3.0;
+  const threshold = 1 - (distortionAmount / 100) * 0.5;
+  const outVol = outputLevel / 100;
+  if (audioFilters.has("volume")) parts.push(`volume=${fmtFloat(pregain, 4)}`);
+  if (audioFilters.has("asoftclip")) {
+    parts.push(`asoftclip=type=tanh:threshold=${fmtFloat(clamp01(threshold), 4)}`);
+  }
+  if (audioFilters.has("volume")) parts.push(`volume=${fmtFloat(clamp01(outVol), 4)}`);
+
+  // Phaser approximation with dry/wet mix.
+  const dryWet = 45 / 255; // requested wet fraction
+  const wet = clamp01(dryWet);
+  const dry = clamp01(1 - wet);
+  const hasSplit = audioFilters.has("asplit");
+  const hasMix = audioFilters.has("amix");
+  const hasAphaser = audioFilters.has("aphaser");
+  if (hasAphaser && hasSplit && hasMix && wet > 0) {
+    // ffmpeg's aphaser speed is capped at 2 in common builds; clamp the requested 2.4Hz.
+    const speedHz = 2.0;
+    const feedbackPct = 20;
+    const decay = clamp01(feedbackPct / 100);
+    const delayMs = 3.0; // no direct mapping from Audacity depth/stages; keep a mild delay
+    // This introduces a graph break (labels), so we emit a single filtergraph string later.
+    // We'll splice this after the simple chain.
+    const phaserGraph = `asplit=2[dry][wet];[wet]aphaser=speed=${fmtFloat(speedHz, 3)}:decay=${fmtFloat(decay, 3)}:delay=${fmtFloat(delayMs, 3)} [ph];[dry][ph]amix=inputs=2:weights='${fmtFloat(dry, 6)} ${fmtFloat(wet, 6)}'`;
+    parts.push(phaserGraph);
+  } else if (hasAphaser) {
+    // Fall back to 100% wet if we can't do a proper dry/wet mix.
+    parts.push(`aphaser=speed=${fmtFloat(2.0, 3)}:decay=${fmtFloat(0.2, 3)}:delay=${fmtFloat(3.0, 3)}`);
   }
 
-  if (key === "starship-comms") {
-    if (TTS_POSTPROCESS_DEBUG) {
-      log("TTS postprocess (starship-comms): complex beep pipeline unavailable; using fallback chain.");
-    }
-    add("aresample", "aresample=48000");
-    add("highpass", "highpass=f=260");
-    add("lowpass", "lowpass=f=3300");
-    add("acompressor", "acompressor=threshold=-30dB:ratio=5.2:attack=1.5:release=90:makeup=6.8");
-    add("acrusher", "acrusher=bits=8:mode=log:mix=0.25");
-    add("tremolo", "tremolo=f=8.5:d=0.045");
-    add("asoftclip", "asoftclip=type=tanh:threshold=0.78");
-    addPresetOutputGain("starship-comms");
-    add("alimiter", "alimiter=limit=0.85");
-    return parts.join(",");
+  // Paulstretch approximation: slow down by factor 1.1 (i.e., tempo 1/1.1).
+  // ffmpeg atempo preserves pitch.
+  if (audioFilters.has("atempo")) parts.push(`atempo=${fmtFloat(1 / 1.1, 6)}`);
+
+  // Pitch shift without tempo change (semitones=-5.69). Prefer rubberband if available.
+  const semitones = -5.69;
+  const pitchRatio = Math.pow(2, semitones / 12);
+  if (audioFilters.has("rubberband")) {
+    parts.push(`rubberband=pitch=${fmtFloat(pitchRatio, 8)}`);
+  } else if (TTS_POSTPROCESS_DEBUG) {
+    log("TTS postprocess: ffmpeg filter 'rubberband' not available; skipping pitch shift.");
   }
 
-  if (key === "cyber-oracle") {
-    add("aresample", "aresample=48000");
-    add("highpass", "highpass=f=100");
-    add("lowpass", "lowpass=f=7000");
-    addPitchShift(-3.2, "cyber-oracle");
-    // ffmpeg lacks stable random pitch drift in this chain; use slow LFO wobble instead.
-    add("vibrato", "vibrato=f=1.05:d=0.09");
-    add("aphaser", "aphaser=speed=0.34:decay=0.6:delay=3.1");
-    add("chorus", "chorus=0.36:0.7:34|50|66:0.22|0.17|0.1:0.24|0.36|0.5:1.7|2.4|3.1");
-    add("aecho", "aecho=0.6:0.38:78|166:0.22|0.13");
-    add("acompressor", "acompressor=threshold=-27dB:ratio=3.1:attack=7:release=220:makeup=5.9");
-    add("volume", "volume=1.38");
-    addPresetOutputGain("cyber-oracle");
-    add("alimiter", "alimiter=limit=0.93");
-    return parts.join(",");
-  }
+  // Tempo +10% without pitch change.
+  if (audioFilters.has("atempo")) parts.push(`atempo=${fmtFloat(1.1, 6)}`);
 
-  if (key === "alien-terminal") {
-    add("aresample", "aresample=48000");
-    add("highpass", "highpass=f=170");
-    add("lowpass", "lowpass=f=5100");
-    addPitchShift(-2.1, "alien-terminal");
-    add("acrusher", "acrusher=bits=7:mode=log:mix=0.34");
-    add("vibrato", "vibrato=f=5.4:d=0.055");
-    add("aphaser", "aphaser=speed=0.62:decay=0.54:delay=2.4");
-    add("chorus", "chorus=0.33:0.72:22|38:0.18|0.13:0.22|0.33:1.15|1.75");
-    add("acompressor", "acompressor=threshold=-28dB:ratio=3.9:attack=3:release=155:makeup=4.2");
-    add("asoftclip", "asoftclip=type=tanh:threshold=0.72");
-    add("volume", "volume=0.98");
-    addPresetOutputGain("alien-terminal");
-    add("alimiter", "alimiter=limit=0.88");
-    return parts.join(",");
-  }
-
-  if (key === "anonymous") {
-    // Legacy Audacity-like stack kept as an explicit preset for A/B tests.
-    add("aresample", "aresample=48000");
-    const distortionAmount = 60;
-    const outputLevel = 30;
-    const pregain = 1 + (distortionAmount / 100) * 3.0;
-    const threshold = 1 - (distortionAmount / 100) * 0.5;
-    const outVol = outputLevel / 100;
-    add("volume", `volume=${fmtFloat(pregain, 4)}`);
-    add("asoftclip", `asoftclip=type=tanh:threshold=${fmtFloat(clamp01(threshold), 4)}`);
-    add("volume", `volume=${fmtFloat(clamp01(outVol), 4)}`);
-    add("aphaser", `aphaser=speed=${fmtFloat(2.0, 3)}:decay=${fmtFloat(0.2, 3)}:delay=${fmtFloat(3.0, 3)}`);
-    add("atempo", `atempo=${fmtFloat(1 / 1.1, 6)}`);
-    const pitchRatio = Math.pow(2, -5.69 / 12);
-    if (audioFilters.has("rubberband")) {
-      parts.push(`rubberband=pitch=${fmtFloat(pitchRatio, 8)}`);
-    } else if (TTS_POSTPROCESS_DEBUG) {
-      log("TTS postprocess: ffmpeg filter 'rubberband' not available; skipping pitch shift.");
-    }
-    add("atempo", `atempo=${fmtFloat(1.1, 6)}`);
-    addPresetOutputGain("anonymous");
-    add("alimiter", "alimiter=limit=0.92");
-    return parts.join(",");
-  }
-
-  return "";
-}
-
-function buildTtsPostprocessConfig(ffmpegBin, presetName = "") {
-  let preset = normalizeTtsPresetName(presetName, { allowDefault: true });
-  if (!preset || preset === "default") preset = getDefaultTtsPresetName();
-  if (!preset || preset === "off") {
-    if (TTS_POSTPROCESS_DEBUG) log("TTS postprocess disabled (preset=off).");
-    return { mode: "none", graph: "", mapLabel: "" };
-  }
-  if (preset === "custom" && !TTS_POSTPROCESS_FFMPEG_AF) {
-    if (TTS_POSTPROCESS_DEBUG) log("TTS postprocess preset 'custom' requested but no raw filtergraph is configured.");
-    return { mode: "none", graph: "", mapLabel: "" };
-  }
-
-  const audioFilters = getFfmpegAudioFilterSet(ffmpegBin) || new Set();
-  if (preset === "starship-comms") {
-    const complexSpec = buildStarshipCommsComplexSpec(audioFilters);
-    if (complexSpec && complexSpec.graph) {
-      if (TTS_POSTPROCESS_DEBUG) log(`TTS postprocess preset=${preset} -filter_complex: ${complexSpec.graph}`);
-      return { mode: "complex", graph: complexSpec.graph, mapLabel: complexSpec.outputLabel || "" };
-    }
-  }
-
-  const graph = buildTtsPresetFiltergraph(preset, audioFilters);
-  if (TTS_POSTPROCESS_DEBUG) log(`TTS postprocess preset=${preset} -af: ${graph || "(none)"}`);
-  if (!graph) return { mode: "none", graph: "", mapLabel: "" };
-  return { mode: "af", graph, mapLabel: "" };
-}
-
-function buildTtsPostprocessFfmpegArgs(config) {
-  const mode = String(config?.mode || "none");
-  const graph = String(config?.graph || "").trim();
-  if (!graph) return [];
-  if (mode === "complex") {
-    const mapLabel = String(config?.mapLabel || "").trim();
-    const mapTarget = mapLabel ? `[${mapLabel}]` : "0:a";
-    return ["-filter_complex", graph, "-map", mapTarget];
-  }
-  if (mode === "af") {
-    return ["-af", graph];
-  }
-  return [];
+  const graph = parts.filter(Boolean).join(",");
+  if (TTS_POSTPROCESS_DEBUG) log(`TTS postprocess -af: ${graph || "(none)"}`);
+  return graph;
 }
 
 function rejectTtsKeepalivePending(err) {
@@ -16483,7 +15848,7 @@ async function runTtsJob(job, lane) {
     job.onProgressChunk("TTS: encoding voice message...\n", "stderr");
   }
 
-  const ttsFxConfig = buildTtsPostprocessConfig(ffmpegBin, job?.ttsPreset);
+  const ttsFxGraph = buildTtsPostprocessFiltergraph(ffmpegBin);
   const runEncodeOnce = async (inWavPath, outOggPath) => {
     const ffArgs = [
       "-y",
@@ -16492,7 +15857,7 @@ async function runTtsJob(job, lane) {
       "error",
       "-i",
       inWavPath,
-      ...buildTtsPostprocessFfmpegArgs(ttsFxConfig),
+      ...(ttsFxGraph ? ["-af", ttsFxGraph] : []),
       "-ac",
       "1",
       "-ar",
@@ -16672,7 +16037,6 @@ async function runTtsJob(job, lane) {
       await sendVoice(job.chatId, oggPath, {
         timeoutMs: uploadTimeoutMs,
         signal: abortSignal,
-        caption: String(job?.voiceCaption || "").trim(),
         replyToMessageId: job.replyToMessageId,
         routeWorkerId: job.workerId,
         routeTaskId: Number(job?.taskId || 0),
@@ -16786,7 +16150,6 @@ async function runTtsBatchJobPipelined(job, lane) {
     kind: job.kind,
     text: job.text,
     source: job.source,
-    ttsPreset: job.ttsPreset,
     afterText: job.afterText,
     attachments: job.attachments,
     skipResultText: job.skipResultText,
@@ -16877,7 +16240,6 @@ async function runTtsBatchJobPipelined(job, lane) {
     job.kind = original.kind;
     job.text = original.text;
     job.source = original.source;
-    job.ttsPreset = original.ttsPreset;
     job.afterText = original.afterText;
     job.attachments = original.attachments;
     job.skipResultText = original.skipResultText;
@@ -17186,7 +16548,7 @@ async function runTtsBatchJob(job, lane) {
     job.onProgressChunk("TTS: encoding voice messages...\n", "stderr");
   }
 
-  const ttsFxConfig = buildTtsPostprocessConfig(ffmpegBin, job?.ttsPreset);
+  const ttsFxGraph = buildTtsPostprocessFiltergraph(ffmpegBin);
   const runEncodeOnce = async (inWavPath, outOggPath) => {
     const ffArgs = [
       "-y",
@@ -17195,7 +16557,7 @@ async function runTtsBatchJob(job, lane) {
       "error",
       "-i",
       inWavPath,
-      ...buildTtsPostprocessFfmpegArgs(ttsFxConfig),
+      ...(ttsFxGraph ? ["-af", ttsFxGraph] : []),
       "-ac",
       "1",
       "-ar",
@@ -18962,31 +18324,8 @@ async function handleCallbackQuery(cb) {
       await refreshModelPickerMessage(chatId, pickerMessageId);
       return;
     }
-    if (entry.kind === "tts-preset") {
-      const selected = normalizeTtsPresetName(entry.value, { allowDefault: true });
-      if (!selected) {
-        await answerCallbackQuery(id, "Invalid preset");
-        await refreshVoicePresetPickerMessage(chatId, pickerMessageId);
-        return;
-      }
-      if (selected === "custom" && !TTS_POSTPROCESS_FFMPEG_AF) {
-        await answerCallbackQuery(id, "Custom preset unavailable");
-        await refreshVoicePresetPickerMessage(chatId, pickerMessageId);
-        return;
-      }
-      setChatPrefs(chatId, { ttsPreset: selected === "default" ? "" : selected });
-      await answerCallbackQuery(id, `Voice preset: ${resolveTtsPresetForChat(chatId)}`);
-      await refreshVoicePresetPickerMessage(chatId, pickerMessageId);
-      return;
-    }
-    if (entry.kind === "tts-preset-reset") {
-      setChatPrefs(chatId, { ttsPreset: "" });
-      await answerCallbackQuery(id, `Voice preset: ${resolveTtsPresetForChat(chatId)}`);
-      await refreshVoicePresetPickerMessage(chatId, pickerMessageId);
-      return;
-    }
     if (entry.kind === "reset") {
-      setChatPrefs(chatId, { model: "", reasoning: "" });
+      clearChatPrefs(chatId);
       await answerCallbackQuery(id, "Reset");
       await refreshModelPickerMessage(chatId, pickerMessageId);
       return;
