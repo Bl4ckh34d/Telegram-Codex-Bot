@@ -1,0 +1,652 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AIDOLON UI Demo</title>
+    <style>
+      :root {
+        --bg: #f4f6fa;
+        --panel: #ffffff;
+        --ink: #111827;
+        --muted: #6b7280;
+        --primary: #0f766e;
+        --primary-strong: #115e59;
+        --accent: #b45309;
+        --success: #047857;
+        --warn: #b91c1c;
+        --line: #d1d5db;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        color: var(--ink);
+        background: radial-gradient(circle at 15% 0%, #e0f2f1, var(--bg) 38%);
+      }
+
+      .page {
+        min-height: 100vh;
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+      }
+
+      .topbar {
+        position: sticky;
+        top: 0;
+        z-index: 3;
+        background: rgba(255, 255, 255, 0.92);
+        backdrop-filter: blur(6px);
+        border-bottom: 1px solid var(--line);
+        padding: 12px 18px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .title-wrap h1 {
+        margin: 0;
+        font-size: 20px;
+        font-weight: 700;
+      }
+
+      .title-wrap p {
+        margin: 2px 0 0;
+        font-size: 13px;
+        color: var(--muted);
+      }
+
+      .status-pill {
+        border: 1px solid var(--line);
+        background: var(--panel);
+        border-radius: 999px;
+        padding: 6px 10px;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .layout {
+        max-width: 1240px;
+        width: 100%;
+        margin: 0 auto;
+        display: grid;
+        grid-template-columns: 1.6fr 1fr;
+        gap: 18px;
+        padding: 18px;
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 16px;
+        box-shadow: 0 3px 18px rgba(17, 24, 39, 0.06);
+      }
+
+      .panel h2 {
+        margin: 0 0 8px;
+        font-size: 17px;
+      }
+
+      .panel p {
+        margin: 0 0 12px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .form-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+
+      label {
+        display: grid;
+        gap: 6px;
+        font-size: 13px;
+      }
+
+      input,
+      select,
+      textarea,
+      button {
+        font: inherit;
+      }
+
+      input[type="text"],
+      input[type="email"],
+      select,
+      textarea {
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 8px 10px;
+        background: #fff;
+      }
+
+      textarea {
+        min-height: 90px;
+        resize: vertical;
+      }
+
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-top: 10px;
+        flex-wrap: wrap;
+      }
+
+      .btn {
+        border: 1px solid transparent;
+        border-radius: 9px;
+        padding: 9px 12px;
+        cursor: pointer;
+        transition: transform 80ms ease, background 120ms ease;
+      }
+
+      .btn:active {
+        transform: translateY(1px);
+      }
+
+      .btn-primary {
+        background: var(--primary);
+        color: #fff;
+      }
+
+      .btn-primary:hover {
+        background: var(--primary-strong);
+      }
+
+      .btn-accent {
+        background: var(--accent);
+        color: #fff;
+      }
+
+      .btn-subtle {
+        background: #f9fafb;
+        border-color: var(--line);
+      }
+
+      .slider-wrap {
+        margin-top: 12px;
+      }
+
+      .meter {
+        margin-top: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: #e5e7eb;
+        overflow: hidden;
+      }
+
+      .meter > div {
+        height: 100%;
+        width: 20%;
+        background: linear-gradient(90deg, #0f766e, #14b8a6);
+        transition: width 160ms ease;
+      }
+
+      .score {
+        margin-top: 6px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .checklist {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+        display: grid;
+        gap: 8px;
+      }
+
+      .checklist li {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 8px 10px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .check-badge {
+        font-size: 12px;
+        border-radius: 999px;
+        padding: 4px 8px;
+        border: 1px solid var(--line);
+        background: #f8fafc;
+      }
+
+      .check-badge.ok {
+        background: #ecfdf5;
+        color: var(--success);
+        border-color: #a7f3d0;
+      }
+
+      .check-badge.fail {
+        background: #fef2f2;
+        color: var(--warn);
+        border-color: #fecaca;
+      }
+
+      .log-area {
+        display: grid;
+        gap: 10px;
+      }
+
+      .log-box {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #0b1220;
+        color: #d1e4ff;
+        min-height: 200px;
+        max-height: 300px;
+        overflow: auto;
+        padding: 10px;
+        font-family: Consolas, "Courier New", monospace;
+        font-size: 12px;
+        line-height: 1.35;
+      }
+
+      .log-box div + div {
+        margin-top: 6px;
+      }
+
+      .footer-controls {
+        position: sticky;
+        bottom: 0;
+        z-index: 3;
+        padding: 12px 18px 18px;
+        border-top: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.94);
+        backdrop-filter: blur(6px);
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-end;
+        gap: 14px;
+      }
+
+      .left-stack {
+        display: grid;
+        gap: 8px;
+      }
+
+      .hint {
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      @media (max-width: 930px) {
+        .layout {
+          grid-template-columns: 1fr;
+          padding: 12px;
+        }
+
+        .form-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .footer-controls {
+          flex-direction: column;
+          align-items: stretch;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <header class="topbar">
+        <div class="title-wrap">
+          <h1>Automation Demo Playground</h1>
+          <p>Safe page for click, type, key, scroll, and validation tests</p>
+        </div>
+        <div class="status-pill" id="health-pill">Server: checking...</div>
+      </header>
+
+      <main class="layout">
+        <section class="panel">
+          <h2>Form Actions</h2>
+          <p>Every interaction sends an event to the local logger and appears below.</p>
+          <div class="form-grid">
+            <label>
+              Display Name
+              <input id="field-name" type="text" placeholder="Type a test name" />
+            </label>
+            <label>
+              Email
+              <input id="field-email" type="email" placeholder="test@example.com" />
+            </label>
+            <label>
+              Role
+              <select id="field-role">
+                <option value="">Choose...</option>
+                <option value="viewer">Viewer</option>
+                <option value="editor">Editor</option>
+                <option value="owner">Owner</option>
+              </select>
+            </label>
+            <label>
+              Priority
+              <select id="field-priority">
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+              </select>
+            </label>
+          </div>
+          <label class="row" for="field-notes">
+            Notes
+            <textarea id="field-notes" placeholder="Type a longer note here"></textarea>
+          </label>
+          <div class="row">
+            <label><input id="check-agree" type="checkbox" /> Confirm data review</label>
+            <label><input name="mode" type="radio" value="alpha" /> Alpha mode</label>
+            <label><input name="mode" type="radio" value="beta" /> Beta mode</label>
+          </div>
+          <div class="slider-wrap">
+            <label for="field-slider">Confidence slider</label>
+            <input id="field-slider" type="range" min="0" max="100" value="20" />
+            <div class="meter"><div id="slider-meter"></div></div>
+            <div class="score" id="slider-value">Current: 20</div>
+          </div>
+          <div class="row">
+            <button class="btn btn-primary" id="save-btn">Save Draft</button>
+            <button class="btn btn-subtle" id="reset-btn">Reset Form</button>
+            <button class="btn btn-accent" id="marker-btn">Set Success Marker</button>
+          </div>
+        </section>
+
+        <section class="panel log-area">
+          <h2>Validation + Logs</h2>
+          <p>Checklist flips to OK when expected actions are completed.</p>
+          <ul class="checklist">
+            <li>
+              Click "Weiter"
+              <span class="check-badge fail" id="check-weiter">Pending</span>
+            </li>
+            <li>
+              Click "Start Next Stage"
+              <span class="check-badge fail" id="check-next-stage">Pending</span>
+            </li>
+            <li>
+              Enter a name
+              <span class="check-badge fail" id="check-name">Pending</span>
+            </li>
+            <li>
+              Set marker
+              <span class="check-badge fail" id="check-marker">Pending</span>
+            </li>
+          </ul>
+          <div class="hint">Local event stream (last 20 entries)</div>
+          <div class="log-box" id="server-log"></div>
+          <div class="hint">Immediate action stream (this tab)</div>
+          <div class="log-box" id="local-log"></div>
+        </section>
+      </main>
+
+      <footer class="footer-controls">
+        <div class="left-stack">
+          <button class="btn btn-primary" id="next-stage-btn">Start Next Stage</button>
+          <button class="btn btn-subtle" id="back-btn">Zurueck</button>
+        </div>
+        <button class="btn btn-primary" id="weiter-btn">Weiter</button>
+      </footer>
+    </div>
+
+    <script>
+      const appState = {
+        step: 1,
+        stageStarted: false,
+        markerSet: false,
+      };
+
+      const localEvents = [];
+
+      const healthPill = document.getElementById("health-pill");
+      const localLog = document.getElementById("local-log");
+      const serverLog = document.getElementById("server-log");
+      const slider = document.getElementById("field-slider");
+      const sliderMeter = document.getElementById("slider-meter");
+      const sliderValue = document.getElementById("slider-value");
+
+      const checks = {
+        weiter: document.getElementById("check-weiter"),
+        nextStage: document.getElementById("check-next-stage"),
+        name: document.getElementById("check-name"),
+        marker: document.getElementById("check-marker"),
+      };
+      let lastWheelLogAt = 0;
+
+      function setCheckState(node, ok) {
+        node.classList.remove("ok", "fail");
+        node.classList.add(ok ? "ok" : "fail");
+        node.textContent = ok ? "OK" : "Pending";
+      }
+
+      function updateChecklist() {
+        setCheckState(checks.weiter, appState.step > 1);
+        setCheckState(checks.nextStage, appState.stageStarted);
+        const nameValue = (document.getElementById("field-name").value || "").trim();
+        setCheckState(checks.name, nameValue.length > 0);
+        setCheckState(checks.marker, appState.markerSet);
+      }
+
+      function renderLog(target, rows) {
+        target.innerHTML = "";
+        if (!rows.length) {
+          const empty = document.createElement("div");
+          empty.textContent = "No events yet.";
+          target.appendChild(empty);
+          return;
+        }
+        for (const row of rows.slice(-20)) {
+          const line = document.createElement("div");
+          line.textContent = `[${row.ts}] ${row.action}${row.detail ? " - " + row.detail : ""}`;
+          target.appendChild(line);
+        }
+        target.scrollTop = target.scrollHeight;
+      }
+
+      async function postEvent(action, detail) {
+        const payload = {
+          action,
+          detail,
+          source: "demo-page",
+          state: {
+            step: appState.step,
+            stageStarted: appState.stageStarted,
+            markerSet: appState.markerSet,
+          },
+        };
+
+        const now = new Date().toISOString();
+        localEvents.push({ ts: now, action, detail });
+        renderLog(localLog, localEvents);
+
+        try {
+          const response = await fetch("/api/event", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          if (!response.ok) {
+            throw new Error("server rejected event");
+          }
+        } catch (err) {
+          localEvents.push({
+            ts: new Date().toISOString(),
+            action: "error",
+            detail: `post failed: ${err.message}`,
+          });
+          renderLog(localLog, localEvents);
+        }
+      }
+
+      async function refreshServerHealth() {
+        try {
+          const res = await fetch("/api/health");
+          const data = await res.json();
+          if (!res.ok || !data.ok) {
+            throw new Error("health endpoint failed");
+          }
+          healthPill.textContent = `Server: online (${data.host}:${data.port})`;
+        } catch {
+          healthPill.textContent = "Server: offline";
+        }
+      }
+
+      async function refreshServerLog() {
+        try {
+          const res = await fetch("/api/events?limit=20");
+          const data = await res.json();
+          if (!res.ok || !Array.isArray(data.events)) {
+            throw new Error("invalid event payload");
+          }
+          renderLog(serverLog, data.events);
+        } catch {
+          renderLog(serverLog, [
+            {
+              ts: new Date().toISOString(),
+              action: "error",
+              detail: "failed to fetch server log",
+            },
+          ]);
+        }
+      }
+
+      function bindAction(id, eventName, action, detailBuilder) {
+        const node = document.getElementById(id);
+        node.addEventListener(eventName, async (event) => {
+          const detail = typeof detailBuilder === "function" ? detailBuilder(event) : detailBuilder || "";
+          await postEvent(action, detail);
+          updateChecklist();
+          await refreshServerLog();
+        });
+      }
+
+      function updateSlider() {
+        const value = Number(slider.value);
+        sliderMeter.style.width = `${value}%`;
+        sliderValue.textContent = `Current: ${value}`;
+      }
+
+      bindAction("field-name", "input", "input_name", (event) => `value=${event.target.value}`);
+      bindAction("field-email", "input", "input_email", (event) => `value=${event.target.value}`);
+      bindAction("field-role", "change", "change_role", (event) => `value=${event.target.value}`);
+      bindAction("field-priority", "change", "change_priority", (event) => `value=${event.target.value}`);
+      bindAction("field-notes", "input", "input_notes", (event) => `len=${event.target.value.length}`);
+      bindAction("check-agree", "change", "toggle_agree", (event) => `checked=${event.target.checked}`);
+      bindAction("save-btn", "click", "click_save", "");
+
+      document.getElementById("reset-btn").addEventListener("click", async () => {
+        document.getElementById("field-name").value = "";
+        document.getElementById("field-email").value = "";
+        document.getElementById("field-role").value = "";
+        document.getElementById("field-priority").value = "low";
+        document.getElementById("field-notes").value = "";
+        document.getElementById("check-agree").checked = false;
+        const mode = document.querySelector("input[name='mode']:checked");
+        if (mode) {
+          mode.checked = false;
+        }
+        slider.value = "20";
+        updateSlider();
+        await postEvent("click_reset", "form reset");
+        updateChecklist();
+        await refreshServerLog();
+      });
+
+      document.getElementById("marker-btn").addEventListener("click", async () => {
+        appState.markerSet = true;
+        await postEvent("set_marker", "success marker set");
+        updateChecklist();
+        await refreshServerLog();
+      });
+
+      slider.addEventListener("input", async (event) => {
+        updateSlider();
+        await postEvent("change_slider", `value=${event.target.value}`);
+        updateChecklist();
+        await refreshServerLog();
+      });
+
+      for (const node of document.querySelectorAll("input[name='mode']")) {
+        node.addEventListener("change", async (event) => {
+          await postEvent("select_mode", `value=${event.target.value}`);
+          updateChecklist();
+          await refreshServerLog();
+        });
+      }
+
+      document.getElementById("weiter-btn").addEventListener("click", async () => {
+        appState.step = Math.min(5, appState.step + 1);
+        await postEvent("click_weiter", `step=${appState.step}`);
+        updateChecklist();
+        await refreshServerLog();
+      });
+
+      document.getElementById("back-btn").addEventListener("click", async () => {
+        appState.step = Math.max(1, appState.step - 1);
+        await postEvent("click_zurueck", `step=${appState.step}`);
+        updateChecklist();
+        await refreshServerLog();
+      });
+
+      document.getElementById("next-stage-btn").addEventListener("click", async () => {
+        appState.stageStarted = true;
+        await postEvent("click_start_next_stage", "requested next stage");
+        updateChecklist();
+        await refreshServerLog();
+      });
+
+      document.addEventListener("keydown", async (event) => {
+        await postEvent("key_down", `key=${event.key}`);
+        updateChecklist();
+      });
+
+      document.addEventListener("pointerdown", async (event) => {
+        const targetId = event.target && event.target.id ? event.target.id : event.target.tagName.toLowerCase();
+        await postEvent(
+          "pointer_down",
+          `x=${Math.round(event.clientX)} y=${Math.round(event.clientY)} target=${targetId}`
+        );
+      });
+
+      document.addEventListener(
+        "wheel",
+        async (event) => {
+          const now = Date.now();
+          if (now - lastWheelLogAt < 300) {
+            return;
+          }
+          lastWheelLogAt = now;
+          await postEvent("wheel_scroll", `deltaY=${Math.round(event.deltaY)}`);
+        },
+        { passive: true }
+      );
+
+      async function boot() {
+        updateSlider();
+        updateChecklist();
+        renderLog(localLog, localEvents);
+        await refreshServerHealth();
+        await refreshServerLog();
+        setInterval(refreshServerHealth, 5000);
+        setInterval(refreshServerLog, 1500);
+        await postEvent("page_loaded", "demo page initialized");
+        await refreshServerLog();
+      }
+
+      boot();
+    </script>
+  </body>
+</html>

@@ -10,6 +10,7 @@ This bot is built for local personal use. It long-polls Telegram and runs Codex 
 - Voice note transcription (Whisper)
 - Optional voice replies (TTS)
 - Image and screenshot analysis
+- Windows desktop UI automation for browser UX testing (minimal toolset)
 - Multi-worker orchestration across repos
 - Session resume and compression
 - File attachment upload from assistant output
@@ -116,6 +117,14 @@ Each worker is a separate Codex lane with its own working directory.
 
 Worker count is capped by `ORCH_MAX_CODEX_WORKERS` (default: 5).
 
+## Failure learning memory
+
+The orchestrator keeps a small persistent memory of repeated failure patterns and injects the most relevant lessons into future prompts.
+
+- Lessons are deduplicated per worker/workdir and pruned by TTL/cap.
+- The top lessons are included automatically in new prompts to reduce repeat mistakes.
+- `/status` shows whether lesson memory is enabled and how many lessons are stored.
+
 ## Voice flow
 
 Voice notes:
@@ -144,6 +153,48 @@ Voice replies:
 - Send an image with a caption to ask directly about that image.
 - Send an image first, then ask using `/ask`.
 - `/see` captures screenshots and includes them in the vision request.
+
+## Desktop UI automation (Windows)
+
+Minimal browser-control toolset for real UI testing:
+
+- `tools/ui_automation.ps1` (PowerShell entrypoint)
+- `tools/ui.cmd` (wrapper)
+
+Supported actions:
+
+- `windows` - list visible top-level windows
+- `focus` - focus a window by title or regex
+- `click`, `double_click`, `right_click`, `move` - pointer control
+- `mouse_down`, `mouse_up` - split press/release control
+- `drag` - dedicated start/end drag with custom duration
+- `highlight` - temporary visual target box
+- `click_text` - OCR-based click on visible text
+- `type`, `key` - text and key input (`type` defaults to human-like character-by-character entry for shorter text)
+- `clipboard_copy`, `clipboard_paste`, `clipboard_read` - clipboard workflows
+- `scroll` - wheel scroll at current or provided cursor point
+- `wait` - explicit timing/waits
+- `screenshot` - capture active desktop view (single or all screens)
+
+Move behavior notes:
+- Pointer actions glide from the current cursor position to the target (no teleport jumps).
+- `move` supports left-button drag mode (`-DragLeft`) to drag sliders.
+- `drag` supports explicit start/end points and drag duration.
+- `click`, `double_click`, `right_click`, and `click_text` support `-HighlightBeforeClick`.
+- `key` now normalizes common Enter aliases (for example `Enter` and `Return`).
+- `type` uses randomized per-character delays by default for short strings, and auto-switches to direct send for longer content.
+
+Optional helper for the local demo page:
+
+- `tools/ui_demo_control.ps1` (or `tools/ui_demo.cmd`) to `start|status|open|stop|restart` the demo server in the background.
+
+Recommended loop for frontend UX checks:
+
+1. Focus the target app window.
+2. Capture screenshot.
+3. Perform exactly one action.
+4. Capture screenshot again and verify state.
+5. Repeat.
 
 ## Attachments
 
@@ -192,6 +243,12 @@ Orchestration:
 - `ORCH_ROUTER_MAX_CONCURRENCY`
 - `ORCH_ROUTER_MODEL`, `ORCH_ROUTER_REASONING_EFFORT`
 - `ORCH_ROUTER_PROMPT_FILE`
+- `ORCH_LESSONS_ENABLED`
+- `ORCH_LESSONS_MAX_ITEMS`
+- `ORCH_LESSONS_PER_PROMPT`
+- `ORCH_LESSONS_PROMPT_MAX_CHARS`
+- `ORCH_LESSON_MAX_TEXT_CHARS`
+- `ORCH_LESSON_TTL_DAYS`
 
 Media and voice:
 - `WHISPER_ENABLED`, `WHISPER_MODEL`, `WHISPER_LANGUAGE`

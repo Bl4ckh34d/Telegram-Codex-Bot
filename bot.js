@@ -539,6 +539,103 @@ function readJson(filePath, fallback) {
   }
 }
 
+function normalizeLessonText(value, maxChars = ORCH_LESSON_MAX_TEXT_CHARS) {
+  const text = oneLine(String(value || ""));
+  if (!text) return "";
+  const lim = Number(maxChars || 0);
+  if (!Number.isFinite(lim) || lim <= 0 || text.length <= lim) return text;
+  return `${text.slice(0, Math.max(1, lim - 3)).trimEnd()}...`;
+}
+
+function normalizeOrchLessonSignature(value) {
+  const cleaned = normalizeLessonText(value, 160)
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return cleaned.slice(0, 120);
+}
+
+function normalizeOrchLessonEntry(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const signature = normalizeOrchLessonSignature(raw.signature || raw.key || "");
+  const lesson = normalizeLessonText(raw.lesson || raw.prevention || "", ORCH_LESSON_MAX_TEXT_CHARS);
+  if (!signature || !lesson) return null;
+
+  const firstSeenRaw = Number(raw.firstSeenAt || raw.createdAt || 0);
+  const lastSeenRaw = Number(raw.lastSeenAt || raw.updatedAt || firstSeenRaw || 0);
+  const now = Date.now();
+  const firstSeenAt = Number.isFinite(firstSeenRaw) && firstSeenRaw > 0 ? Math.trunc(firstSeenRaw) : now;
+  const lastSeenAt = Number.isFinite(lastSeenRaw) && lastSeenRaw > 0 ? Math.trunc(lastSeenRaw) : firstSeenAt;
+  const failCountRaw = Number(raw.failCount || 1);
+  const failCount = Number.isFinite(failCountRaw) && failCountRaw > 0 ? Math.min(9999, Math.trunc(failCountRaw)) : 1;
+
+  return {
+    signature,
+    lesson,
+    trigger: normalizeLessonText(raw.trigger || "", 160),
+    category: normalizeLessonText(raw.category || "runtime", 32).toLowerCase() || "runtime",
+    source: normalizeLessonText(raw.source || "", 40).toLowerCase(),
+    chatId: normalizeLessonText(raw.chatId || "", 80),
+    workerId: normalizeLessonText(raw.workerId || "", 80),
+    workdirKey: normalizeLessonText(raw.workdirKey || "", 260).toLowerCase(),
+    failCount,
+    firstSeenAt,
+    lastSeenAt,
+    lastError: normalizeLessonText(raw.lastError || "", ORCH_LESSON_MAX_TEXT_CHARS),
+  };
+}
+
+function makeOrchLessonDedupeKey(entry) {
+  const worker = String(entry?.workerId || "").trim();
+  const workdir = String(entry?.workdirKey || "").trim().toLowerCase();
+  const sig = String(entry?.signature || "").trim();
+  return `${workdir}\u0000${worker}\u0000${sig}`;
+}
+
+function normalizeOrchLessons(rawValue) {
+  const rows = Array.isArray(rawValue) ? rawValue : [];
+  const merged = new Map();
+
+  for (const raw of rows) {
+    const lesson = normalizeOrchLessonEntry(raw);
+    if (!lesson) continue;
+    const key = makeOrchLessonDedupeKey(lesson);
+    const prev = merged.get(key);
+    if (!prev) {
+      merged.set(key, lesson);
+      continue;
+    }
+
+    prev.failCount = Math.min(9999, Number(prev.failCount || 0) + Number(lesson.failCount || 0));
+    if (Number(lesson.firstSeenAt || 0) > 0 && Number(lesson.firstSeenAt || 0) < Number(prev.firstSeenAt || 0)) {
+      prev.firstSeenAt = lesson.firstSeenAt;
+    }
+    if (Number(lesson.lastSeenAt || 0) >= Number(prev.lastSeenAt || 0)) {
+      prev.lastSeenAt = lesson.lastSeenAt;
+      if (lesson.lesson) prev.lesson = lesson.lesson;
+      if (lesson.trigger) prev.trigger = lesson.trigger;
+      if (lesson.category) prev.category = lesson.category;
+      if (lesson.source) prev.source = lesson.source;
+      if (lesson.lastError) prev.lastError = lesson.lastError;
+      if (lesson.chatId) prev.chatId = lesson.chatId;
+      if (lesson.workerId) prev.workerId = lesson.workerId;
+      if (lesson.workdirKey) prev.workdirKey = lesson.workdirKey;
+    }
+  }
+
+  const ttlMs = Math.max(1, ORCH_LESSON_TTL_DAYS) * 24 * 60 * 60 * 1000;
+  const cutoff = Date.now() - ttlMs;
+  const out = [...merged.values()]
+    .filter((entry) => Number(entry.lastSeenAt || 0) >= cutoff)
+    .sort((a, b) => Number(b.lastSeenAt || 0) - Number(a.lastSeenAt || 0));
+
+  if (ORCH_LESSONS_MAX_ITEMS > 0 && out.length > ORCH_LESSONS_MAX_ITEMS) {
+    return out.slice(0, ORCH_LESSONS_MAX_ITEMS);
+  }
+  return out;
+}
+
 function canSignalProcess(pid) {
   if (!Number.isFinite(pid) || pid <= 0) return false;
   try {
@@ -1005,6 +1102,12 @@ const ORCH_SPLIT_ENABLED = toBool(process.env.ORCH_SPLIT_ENABLED, true);
 const ORCH_SPLIT_MAX_TASKS = toInt(process.env.ORCH_SPLIT_MAX_TASKS, 3, 2, 8);
 const ORCH_DELEGATION_ACK_ENABLED = toBool(process.env.ORCH_DELEGATION_ACK_ENABLED, true);
 const ORCH_DELEGATION_ACK_SILENT = toBool(process.env.ORCH_DELEGATION_ACK_SILENT, true);
+const ORCH_LESSONS_ENABLED = toBool(process.env.ORCH_LESSONS_ENABLED, true);
+const ORCH_LESSONS_MAX_ITEMS = toInt(process.env.ORCH_LESSONS_MAX_ITEMS, 240, 20, 2000);
+const ORCH_LESSONS_PER_PROMPT = toInt(process.env.ORCH_LESSONS_PER_PROMPT, 4, 0, 12);
+const ORCH_LESSONS_PROMPT_MAX_CHARS = toInt(process.env.ORCH_LESSONS_PROMPT_MAX_CHARS, 1200, 180, 6000);
+const ORCH_LESSON_MAX_TEXT_CHARS = toInt(process.env.ORCH_LESSON_MAX_TEXT_CHARS, 220, 80, 1000);
+const ORCH_LESSON_TTL_DAYS = toInt(process.env.ORCH_LESSON_TTL_DAYS, 45, 1, 365);
 const ORCH_ROUTER_PROMPT_FILE = resolveMaybeRelativePath(
   process.env.ORCH_ROUTER_PROMPT_FILE || path.join(ROOT, "codex_prompt_router.txt"),
 );
@@ -1040,7 +1143,7 @@ const WORLDMONITOR_NATIVE_STORE_MAX_AGE_DAYS = toInt(process.env.WORLDMONITOR_NA
 const WORLDMONITOR_NATIVE_REFRESH_MIN_INTERVAL_SEC = toInt(process.env.WORLDMONITOR_NATIVE_REFRESH_MIN_INTERVAL_SEC, 240, 30, 3600);
 const WORLDMONITOR_NATIVE_REFRESH_HARD_TIMEOUT_MS = toTimeoutMs(
   process.env.WORLDMONITOR_NATIVE_REFRESH_HARD_TIMEOUT_MS,
-  90_000,
+  180_000,
   0,
   MAX_TIMEOUT_MS,
 );
@@ -1181,7 +1284,7 @@ const WORLDMONITOR_CHECK_LOOKBACK_HOURS = toInt(process.env.WORLDMONITOR_CHECK_L
 const WORLDMONITOR_CHECK_MAX_HEADLINES = toInt(process.env.WORLDMONITOR_CHECK_MAX_HEADLINES, 16, 4, 60);
 const WORLDMONITOR_CHECK_FETCH_TIMEOUT_MS = toTimeoutMs(
   process.env.WORLDMONITOR_CHECK_FETCH_TIMEOUT_MS,
-  120_000,
+  180_000,
   0,
   MAX_TIMEOUT_MS,
 );
@@ -1329,6 +1432,7 @@ const state = readJson(STATE_PATH, {
   chatSessions: {},
   lastImages: {},
   chatPrefs: {},
+  orchLessons: [],
   redditDigest: {},
   worldMonitorMonitor: {},
   weatherDaily: {},
@@ -1345,6 +1449,7 @@ const chatPrefs = state && typeof state.chatPrefs === "object" && state.chatPref
 const redditDigest = state && typeof state.redditDigest === "object" && state.redditDigest
   ? { ...state.redditDigest }
   : {};
+const orchLessons = normalizeOrchLessons(state?.orchLessons);
 const worldMonitorMonitorRaw = state && typeof state.worldMonitorMonitor === "object" && state.worldMonitorMonitor
   ? state.worldMonitorMonitor
   : {};
@@ -1928,6 +2033,7 @@ function persistState() {
       lastUpdateId,
       lastImages,
       chatPrefs,
+      orchLessons,
       redditDigest,
       worldMonitorMonitor,
       weatherDaily: weatherDailyState,
@@ -1977,6 +2083,252 @@ function clearChatPrefs(chatId) {
   if (!(key in chatPrefs)) return;
   delete chatPrefs[key];
   persistState();
+}
+
+function pruneOrchLessons({ persist = false } = {}) {
+  const normalized = normalizeOrchLessons(orchLessons);
+  const fingerprint = (rows) => rows
+    .map((row) => [
+      makeOrchLessonDedupeKey(row),
+      String(row.lesson || ""),
+      String(row.trigger || ""),
+      String(row.category || ""),
+      String(row.source || ""),
+      String(row.chatId || ""),
+      Number(row.failCount || 0),
+      Number(row.firstSeenAt || 0),
+      Number(row.lastSeenAt || 0),
+      String(row.lastError || ""),
+    ].join("|"))
+    .join("\n");
+  const changed = fingerprint(normalized) !== fingerprint(orchLessons);
+  if (!changed) return false;
+  orchLessons.splice(0, orchLessons.length, ...normalized);
+  if (persist) persistState();
+  return true;
+}
+
+function inferOrchFailureLesson(job, result) {
+  if (!ORCH_LESSONS_ENABLED) return null;
+  const raw = String(result?.text || "").trim();
+  if (!raw) return null;
+
+  const source = String(job?.source || "").trim().toLowerCase();
+  if (source === "router" || source.startsWith("worldmonitor") || source.startsWith("weather")) return null;
+
+  const kind = String(job?.kind || "codex").trim().toLowerCase();
+  const text = oneLine(raw);
+  const lower = text.toLowerCase();
+  const timedOut = Boolean(job?.timedOut) || /\btimed out\b/.test(lower);
+  const voiceRelated = kind === "tts" || source.includes("voice") || source.includes("tts");
+  const uiRelated = source.includes("screenshot")
+    || source.includes("vision")
+    || source.includes("ui")
+    || /\bwindow\b.*\bnot found\b/.test(lower);
+
+  const make = (signature, trigger, lesson, category = "runtime") => ({
+    signature,
+    trigger,
+    lesson,
+    category,
+  });
+
+  if (/unexpected argument ['"]?-a['"]? found/i.test(lower) || /older bot process is still running/i.test(lower)) {
+    return make(
+      "stale-codex-process-arg-a",
+      "the runner reports unexpected argument -a",
+      "stop old bot terminals and restart one bot instance before retrying the same action",
+      "process",
+    );
+  }
+
+  if (/failed to send telegram voice message|voice reply failed|tts synthesis failed|tts encoding failed|tts upload timed out|tts is unavailable/i.test(lower)) {
+    return make(
+      "voice-delivery-failure",
+      "voice delivery fails",
+      "send a text fallback immediately and restart the voice pipeline before the next voice reply",
+      "voice",
+    );
+  }
+
+  if (timedOut && uiRelated) {
+    return make(
+      "ui-timeout-loop-too-large",
+      "a UI automation run times out",
+      "use short loops only: focus window, screenshot, one action, screenshot, then continue",
+      "ui",
+    );
+  }
+
+  if (timedOut && voiceRelated) {
+    return make(
+      "voice-timeout",
+      "voice processing times out",
+      "split the spoken response into smaller chunks and confirm delivery after each chunk",
+      "voice",
+    );
+  }
+
+  if (timedOut) {
+    return make(
+      "job-timeout",
+      "a task times out",
+      "break the task into smaller steps and report progress after each step instead of repeating one long run",
+      "timeout",
+    );
+  }
+
+  if (/screenshot failed|image handling failed|\bwindow\b.*\bnot found\b|ui automation/i.test(lower)) {
+    return make(
+      "ui-capture-or-focus-failure",
+      "UI capture or focus fails",
+      "verify the target window is focused and visible before each action, and capture before/after screenshots",
+      "ui",
+    );
+  }
+
+  if (/failed to prepare aidolon execution|failed to start aidolon|aidolon process error/i.test(lower)) {
+    return make(
+      "aidolon-launch-failure",
+      "the runner fails before task execution starts",
+      "validate runtime prerequisites first, then retry once; if still failing, report the blocker instead of looping",
+      "runtime",
+    );
+  }
+
+  if (/failed unexpectedly|unknown error/i.test(lower)) {
+    return make(
+      "unexpected-job-failure",
+      "an unexpected failure appears",
+      "state the exact blocker and change strategy on the next attempt rather than retrying the same step",
+      "runtime",
+    );
+  }
+
+  return null;
+}
+
+function rememberOrchFailureLesson(job, result) {
+  if (!ORCH_LESSONS_ENABLED) return null;
+  const inferred = inferOrchFailureLesson(job, result);
+  if (!inferred) return null;
+
+  const now = Date.now();
+  const source = String(job?.source || "").trim().toLowerCase();
+  const candidate = normalizeOrchLessonEntry({
+    signature: inferred.signature,
+    trigger: inferred.trigger,
+    lesson: inferred.lesson,
+    category: inferred.category,
+    source,
+    chatId: String(job?.chatId || "").trim(),
+    workerId: String(job?.workerId || "").trim(),
+    workdirKey: normalizePathKey(String(job?.workdir || "").trim()),
+    failCount: 1,
+    firstSeenAt: now,
+    lastSeenAt: now,
+    lastError: String(result?.text || ""),
+  });
+  if (!candidate) return null;
+
+  const dedupeKey = makeOrchLessonDedupeKey(candidate);
+  let existing = null;
+  for (const item of orchLessons) {
+    if (makeOrchLessonDedupeKey(item) !== dedupeKey) continue;
+    existing = item;
+    break;
+  }
+
+  if (existing) {
+    existing.failCount = Math.min(9999, Number(existing.failCount || 0) + 1);
+    existing.lastSeenAt = now;
+    if (candidate.lesson) existing.lesson = candidate.lesson;
+    if (candidate.trigger) existing.trigger = candidate.trigger;
+    if (candidate.category) existing.category = candidate.category;
+    if (candidate.source) existing.source = candidate.source;
+    if (candidate.chatId) existing.chatId = candidate.chatId;
+    if (candidate.workerId) existing.workerId = candidate.workerId;
+    if (candidate.workdirKey) existing.workdirKey = candidate.workdirKey;
+    if (candidate.lastError) existing.lastError = candidate.lastError;
+  } else {
+    orchLessons.push(candidate);
+  }
+
+  pruneOrchLessons({ persist: false });
+  persistState();
+  return existing || candidate;
+}
+
+function buildOrchLessonPromptContext({ chatId = "", workerId = "", workdir = "", source = "", replyStyle = "" } = {}) {
+  if (!ORCH_LESSONS_ENABLED || ORCH_LESSONS_PER_PROMPT <= 0) return "";
+  if (!Array.isArray(orchLessons) || orchLessons.length === 0) return "";
+
+  pruneOrchLessons({ persist: false });
+  if (orchLessons.length === 0) return "";
+
+  const wantedChatId = String(chatId || "").trim();
+  const wantedWorkerId = String(workerId || "").trim();
+  const wantedWorkdirKey = normalizePathKey(workdir);
+  const sourceKey = String(source || "").trim().toLowerCase();
+  const styleKey = String(replyStyle || "").trim().toLowerCase();
+  const wantsVoice = styleKey === "voice" || styleKey === "tts" || styleKey === "spoken" || sourceKey.includes("voice");
+  const now = Date.now();
+
+  const ranked = [];
+  for (const lesson of orchLessons) {
+    if (!lesson || typeof lesson !== "object") continue;
+    let score = 0;
+    const hasScope = Boolean(
+      String(lesson.workdirKey || "").trim()
+      || String(lesson.workerId || "").trim()
+      || String(lesson.chatId || "").trim(),
+    );
+
+    if (wantedWorkdirKey && lesson.workdirKey && lesson.workdirKey === wantedWorkdirKey) score += 90;
+    else if (wantedWorkerId && lesson.workerId && lesson.workerId === wantedWorkerId) score += 50;
+    else if (wantedChatId && lesson.chatId && lesson.chatId === wantedChatId) score += 30;
+    else if (hasScope) continue;
+    else score += 5;
+
+    const category = String(lesson.category || "").trim().toLowerCase();
+    if (wantsVoice && category === "voice") score += 10;
+    if (!wantsVoice && category === "ui") score += 4;
+
+    const failCount = Math.max(1, Number(lesson.failCount || 1));
+    score += Math.min(15, failCount);
+
+    const ageMs = Math.max(0, now - Number(lesson.lastSeenAt || 0));
+    const ageHours = ageMs / (60 * 60 * 1000);
+    score += Math.max(0, 18 - ageHours / 4);
+
+    if (score <= 0) continue;
+    ranked.push({ lesson, score });
+  }
+
+  ranked.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return Number(b.lesson?.lastSeenAt || 0) - Number(a.lesson?.lastSeenAt || 0);
+  });
+
+  const lines = [];
+  const seenSignatures = new Set();
+  for (const row of ranked) {
+    const lesson = row.lesson;
+    const sig = String(lesson.signature || "").trim();
+    if (!sig || seenSignatures.has(sig)) continue;
+    seenSignatures.add(sig);
+    const trigger = normalizeLessonText(lesson.trigger || "", 120);
+    const advice = normalizeLessonText(lesson.lesson || "", ORCH_LESSON_MAX_TEXT_CHARS);
+    if (!advice) continue;
+    const count = Math.max(1, Number(lesson.failCount || 1));
+    const seenSuffix = count > 1 ? ` (seen ${count} times)` : "";
+    const prefix = trigger ? `If ${trigger}, ` : "";
+    lines.push(`- ${prefix}${advice}${seenSuffix}.`);
+    if (lines.length >= ORCH_LESSONS_PER_PROMPT) break;
+  }
+
+  if (lines.length === 0) return "";
+  return trimContextBlock(lines.join("\n"), ORCH_LESSONS_PROMPT_MAX_CHARS, "[...older lessons truncated]");
 }
 
 function getActiveWorkerForChat(chatId) {
@@ -4249,6 +4601,20 @@ function defaultPromptPreamble() {
     "You are AIDOLON CLI replying via Telegram.",
     "Keep it concise and practical.",
     "If ambiguous, ask one clear follow-up question.",
+    "",
+    "Front-end UI handling (Windows desktop automation):",
+    "- You can drive real browser UI with tools/ui_automation.ps1 (or tools/ui.cmd).",
+    "- Supported actions: windows, focus, click, double_click, right_click, move, mouse_down, mouse_up, drag, highlight, click_text, clipboard_copy, clipboard_paste, clipboard_read, type, key, scroll, wait, screenshot.",
+    "- Cursor movement should glide from current position to target (no teleport jumps); drag supports start/end points and duration; move still supports DragLeft.",
+    "- click_text uses OCR and can target visible text; click actions can preview with HighlightBeforeClick.",
+    "- Clipboard actions support copy, paste, and read. For key Enter, use key action with Enter (or Return). Scroll accepts positive and negative delta.",
+    "- For short UI text input, prefer typewriter-style character-by-character typing with slight random delays; for large text blocks, direct insert or clipboard paste is acceptable.",
+    "- For adjacent form fields, avoid a second coordinate guess: anchor the first field by visible label (click_text), type, then use key Tab to move to the next field.",
+    "- For paired fields like display name + email, never type both values into one field; if focus is wrong, refocus by label and retry that field only.",
+    "- For UX testing, use short loops: focus window, screenshot, one action, screenshot again.",
+    "- For sliders and other draggable controls, prefer drag over move-with-held-mouse and avoid blind coordinate guesses when label anchoring is available.",
+    "- After slider drags, verify that value/position/log changed; if not, retry once with a clearly different offset instead of repeating the same drag.",
+    "- Ask one short confirmation question before destructive actions.",
   ].join("\n");
 }
 
@@ -4259,6 +4625,20 @@ function defaultVoicePromptPreamble() {
     "Do not output code blocks, markdown, commands, stack traces, JSON, or file paths.",
     "Do not include URLs in SPOKEN. URLs are allowed in TEXT_ONLY when useful.",
     "Avoid weird symbols and formatting; use plain words and short sentences.",
+    "",
+    "Front-end UI handling (Windows desktop automation):",
+    "- Voice mode does not reduce capabilities. You can use tools/ui_automation.ps1 (or tools/ui.cmd).",
+    "- Supported actions: windows, focus, click, double_click, right_click, move, mouse_down, mouse_up, drag, highlight, click_text, clipboard_copy, clipboard_paste, clipboard_read, type, key, scroll, wait, screenshot.",
+    "- Cursor movement should glide from current position to target (no teleport jumps); drag supports start/end points and duration; move still supports DragLeft.",
+    "- click_text uses OCR and can target visible text; click actions can preview with HighlightBeforeClick.",
+    "- Clipboard actions support copy, paste, and read. For key Enter, use key action with Enter (or Return). Scroll accepts positive and negative delta.",
+    "- For short UI text input, prefer typewriter-style character-by-character typing with slight random delays; for large text blocks, direct insert or clipboard paste is acceptable.",
+    "- For adjacent form fields, avoid a second coordinate guess: anchor the first field by visible label (click_text), type, then use key Tab to move to the next field.",
+    "- For paired fields like display name + email, never type both values into one field; if focus is wrong, refocus by label and retry that field only.",
+    "- For UX testing, run short loops: focus window, screenshot, one action, screenshot again.",
+    "- For sliders and other draggable controls, prefer drag over move-with-held-mouse and avoid blind coordinate guesses when label anchoring is available.",
+    "- After slider drags, verify that value/position/log changed; if not, retry once with a clearly different offset instead of repeating the same drag.",
+    "- Ask one short confirmation question before destructive actions.",
     "",
     "Output format:",
     "SPOKEN:",
@@ -4307,6 +4687,8 @@ function formatCodexPrompt(userText, options = {}) {
   const replyStyle = String(options?.replyStyle || "").trim();
   const workdir = String(options?.workdir || "").trim();
   const workerId = String(options?.workerId || "").trim();
+  const chatId = String(options?.chatId || "").trim();
+  const source = String(options?.source || "").trim();
   const replyContext = options?.replyContext && typeof options.replyContext === "object"
     ? options.replyContext
     : null;
@@ -4390,6 +4772,20 @@ function formatCodexPrompt(userText, options = {}) {
   if (recentText) {
     lines.push("", "Recent chat context:");
     lines.push(recentText);
+  }
+
+  if (String(replyStyle || "").trim().toLowerCase() !== "router") {
+    const lessonContext = buildOrchLessonPromptContext({
+      chatId,
+      workerId,
+      workdir,
+      source,
+      replyStyle,
+    });
+    if (lessonContext) {
+      lines.push("", "Process memory (learned from previous mistakes):");
+      lines.push(lessonContext);
+    }
   }
 
   lines.push("", "User message:", userText);
@@ -4783,6 +5179,8 @@ function buildCodexExecSpec(job) {
     replyStyle: String(job?.replyStyle || ""),
     workdir,
     workerId: String(job?.workerId || "").trim(),
+    chatId: String(job?.chatId || "").trim(),
+    source: String(job?.source || "").trim(),
     replyContext,
     replyThreadContext,
     recentHistoryContext,
@@ -9338,6 +9736,7 @@ async function runWorldMonitorNativeFeedRefresh(options = {}) {
     const timeoutMs = Number(WORLDMONITOR_NATIVE_FEED_TIMEOUT_MS || 0);
     const concurrency = Math.max(1, Number(WORLDMONITOR_NATIVE_FEED_FETCH_CONCURRENCY || 1));
     const fetchedAt = Date.now();
+    const feedFetchStartedAt = Date.now();
     const existingByKey = new Map();
     for (const item of worldMonitorNativeNewsItems) {
       const key = String(item?.articleKey || "").trim();
@@ -9351,6 +9750,7 @@ async function runWorldMonitorNativeFeedRefresh(options = {}) {
     let newItems = 0;
     const newItemKeys = [];
     const errors = [];
+    const feedSamples = [];
 
     async function workerLoop() {
       for (;;) {
@@ -9358,6 +9758,10 @@ async function runWorldMonitorNativeFeedRefresh(options = {}) {
         cursor += 1;
         if (idx >= feeds.length) break;
         const feed = feeds[idx];
+        const feedStartedAt = Date.now();
+        let parsedCount = 0;
+        let sampleError = "";
+        let sampleOk = false;
         try {
           const controller = new AbortController();
           const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
@@ -9383,6 +9787,7 @@ async function runWorldMonitorNativeFeedRefresh(options = {}) {
             minPublishedAtMs,
             maxItemsPerSource,
           });
+          parsedCount = parsed.length;
           for (const next of parsed) {
             const key = String(next.articleKey || "").trim();
             if (!key) continue;
@@ -9406,11 +9811,21 @@ async function runWorldMonitorNativeFeedRefresh(options = {}) {
             newItems += 1;
           }
           feedsOk += 1;
+          sampleOk = true;
         } catch (err) {
           feedsFail += 1;
+          sampleError = String(err?.message || err || "").trim() || "fetch failed";
           if (errors.length < 12) {
-            errors.push(`${feed.name}: ${String(err?.message || err || "").trim() || "fetch failed"}`);
+            errors.push(`${feed.name}: ${sampleError}`);
           }
+        } finally {
+          feedSamples.push({
+            source: oneLine(String(feed?.name || feed?.url || `feed-${idx + 1}`)).slice(0, 90),
+            ok: sampleOk,
+            duration_ms: Date.now() - feedStartedAt,
+            parsed_items: parsedCount,
+            error: sampleOk ? "" : sampleError.slice(0, 140),
+          });
         }
       }
     }
@@ -9420,19 +9835,91 @@ async function runWorldMonitorNativeFeedRefresh(options = {}) {
       workers.push(workerLoop());
     }
     await Promise.all(workers);
+    const feedFetchDurationMs = Date.now() - feedFetchStartedAt;
 
     pruneWorldMonitorNativeStore(fetchedAt);
-    const deepIngestResult = await runWorldMonitorNativeDeepIngest({ force, seedKeys: newItemKeys });
     persistWorldMonitorNativeStore();
-    const signalsResult = await runWorldMonitorNativeSignalsRefresh({ force });
+    const hardTimeoutMs = Number(WORLDMONITOR_NATIVE_REFRESH_HARD_TIMEOUT_MS || 0);
+    const elapsedBeforePostMs = Date.now() - startedAt;
+    const deepIngestBudgetMs = hardTimeoutMs > 0
+      ? Math.max(1_000, hardTimeoutMs - elapsedBeforePostMs - 2_000)
+      : 0;
+    let deepIngestDurationMs = 0;
+    let signalsDurationMs = 0;
+    let deepIngestTimedOut = false;
+    let deepIngestError = "";
+    const deepIngestPromise = (async () => {
+      const phaseStartedAt = Date.now();
+      try {
+        const task = runWorldMonitorNativeDeepIngest({ force, seedKeys: newItemKeys });
+        if (deepIngestBudgetMs > 0) {
+          return await withPromiseTimeout(
+            task,
+            deepIngestBudgetMs,
+            `native deep ingest stage timed out after ${Math.round(deepIngestBudgetMs / 1000)}s`,
+          );
+        }
+        return await task;
+      } catch (err) {
+        deepIngestError = String(err?.message || err || "").trim() || "native deep ingest failed";
+        deepIngestTimedOut = /timed out/i.test(deepIngestError);
+        return {
+          ok: false,
+          error: deepIngestError,
+          skipped: deepIngestTimedOut ? "timed_out" : "error",
+          stats: {},
+        };
+      } finally {
+        deepIngestDurationMs = Date.now() - phaseStartedAt;
+      }
+    })();
+    const signalsPromise = (async () => {
+      const phaseStartedAt = Date.now();
+      try {
+        return await runWorldMonitorNativeSignalsRefresh({ force });
+      } finally {
+        signalsDurationMs = Date.now() - phaseStartedAt;
+      }
+    })();
+    const [deepIngestResult, signalsResult] = await Promise.all([deepIngestPromise, signalsPromise]);
 
     const durationMs = Date.now() - startedAt;
+    if (deepIngestTimedOut) {
+      log(
+        `worldmonitor native refresh: deep ingest exceeded stage budget `
+        + `(${Math.round(deepIngestBudgetMs / 1000)}s) and was detached.`,
+      );
+    } else if (deepIngestError) {
+      log(`worldmonitor native refresh: deep ingest stage error (${redactError(deepIngestError)})`);
+    }
+    if (hardTimeoutMs > 0 && durationMs >= Math.max(45_000, Math.floor(hardTimeoutMs * 0.7))) {
+      log(
+        `worldmonitor native refresh: slow run ${Math.round(durationMs / 1000)}s `
+        + `(feeds=${Math.round(feedFetchDurationMs / 1000)}s, `
+        + `deep_ingest=${Math.round(deepIngestDurationMs / 1000)}s, `
+        + `signals=${Math.round(signalsDurationMs / 1000)}s, `
+        + `watchdog=${Math.round(hardTimeoutMs / 1000)}s).`,
+      );
+    }
+    const slowFeeds = feedSamples
+      .slice()
+      .sort((a, b) => Number(b.duration_ms || 0) - Number(a.duration_ms || 0))
+      .slice(0, 10);
     const stats = {
+      duration_ms: durationMs,
+      phase_durations_ms: {
+        feed_fetch: feedFetchDurationMs,
+        deep_ingest: deepIngestDurationMs,
+        signals: signalsDurationMs,
+      },
+      deep_ingest_budget_ms: deepIngestBudgetMs,
+      deep_ingest_timed_out: deepIngestTimedOut,
       feeds_total: feeds.length,
       feeds_ok: feedsOk,
       feeds_failed: feedsFail,
       new_items: newItems,
       stored_items: worldMonitorNativeNewsItems.length,
+      slow_feeds: slowFeeds,
       deep_ingest_ok: Boolean(deepIngestResult?.ok),
       deep_ingest_run_at: Number(deepIngestResult?.refreshedAt || 0) || 0,
       deep_ingest: deepIngestResult?.stats && typeof deepIngestResult.stats === "object"
@@ -12299,6 +12786,11 @@ async function sendStatus(chatId) {
     : "none";
   const routerModel = String(ORCH_ROUTER_MODEL || CODEX_MODEL || "").trim() || "(default)";
   const routerReasoning = String(ORCH_ROUTER_REASONING_EFFORT || "").trim() || "(default)";
+  if (ORCH_LESSONS_ENABLED) pruneOrchLessons({ persist: false });
+  const lessonsCount = Array.isArray(orchLessons) ? orchLessons.length : 0;
+  const lessonsLastAt = lessonsCount > 0
+    ? Math.max(...orchLessons.map((x) => Number(x?.lastSeenAt || 0)))
+    : 0;
   const whisperKeepaliveState = !WHISPER_KEEPALIVE
     ? "off"
     : whisperKeepalive.ready
@@ -12359,6 +12851,7 @@ async function sendStatus(chatId) {
     `- chat_actions: ${TELEGRAM_CHAT_ACTION_ENABLED ? `enabled (default=${TELEGRAM_CHAT_ACTION_DEFAULT}, voice=${TELEGRAM_CHAT_ACTION_VOICE}, interval=${TELEGRAM_CHAT_ACTION_INTERVAL_SEC}s)` : "disabled"}`,
     `- router: ${ORCH_ROUTER_ENABLED ? "enabled" : "disabled"} (model=${routerModel}, reasoning=${routerReasoning})`,
     `- split_routing: ${ORCH_SPLIT_ENABLED ? "enabled" : "disabled"} (max_tasks=${ORCH_SPLIT_MAX_TASKS})`,
+    `- lesson_memory: ${ORCH_LESSONS_ENABLED ? "enabled" : "disabled"} (stored=${lessonsCount}, per_prompt=${ORCH_LESSONS_PER_PROMPT}, last=${lessonsLastAt ? formatRelativeAge(lessonsLastAt) : "never"})`,
     `- whisper: ${WHISPER_ENABLED ? "enabled" : "disabled"}`,
     `- whisper_keepalive: ${whisperKeepaliveState} (prewarm=${WHISPER_PREWARM_ON_STARTUP}, auto_restart=${WHISPER_KEEPALIVE_AUTO_RESTART})`,
     `- tts_keepalive: ${ttsKeepaliveState} (prewarm=${TTS_PREWARM_ON_STARTUP}, auto_restart=${TTS_KEEPALIVE_AUTO_RESTART})`,
@@ -12880,6 +13373,7 @@ function wipeChatState(chatId) {
   const out = {
     queuedRemoved: 0,
     pendingCommandCleared: false,
+    lessonsRemoved: 0,
     stateChanged: false,
   };
   if (!key) return out;
@@ -12906,6 +13400,14 @@ function wipeChatState(chatId) {
   if (dropChatKey(orchReplyRouteByChat)) changed = true;
   if (dropChatKey(orchMessageMetaByChat)) changed = true;
   if (dropChatKey(orchTasksByChat)) changed = true;
+  if (Array.isArray(orchLessons) && orchLessons.length > 0) {
+    const kept = orchLessons.filter((entry) => String(entry?.chatId || "").trim() !== key);
+    if (kept.length !== orchLessons.length) {
+      out.lessonsRemoved = Math.max(0, orchLessons.length - kept.length);
+      orchLessons.splice(0, orchLessons.length, ...kept);
+      changed = true;
+    }
+  }
   if (changed) {
     persistState();
   }
@@ -12938,6 +13440,7 @@ async function wipeRuntime(chatId) {
     `- Runtime bytes freed: ${runtime.deletedBytes}`,
     `- Queued prompts cleared (this chat): ${chat.queuedRemoved}`,
     `- Pending /cmd cleared (this chat): ${chat.pendingCommandCleared ? "yes" : "no"}`,
+    `- Learned lessons cleared (this chat): ${chat.lessonsRemoved}`,
     `- Chat context reset in state (this chat): ${chat.stateChanged ? "yes" : "no"}`,
   ];
   if (runtime.errors.length > 0) {
@@ -16700,6 +17203,13 @@ async function processLane(laneId) {
         } catch (err) {
           log(`job.onSuccess failed for #${job.id}: ${redactError(err?.message || err)}`);
         }
+      }
+    }
+    if (result && !result.ok && !job?.cancelRequested) {
+      try {
+        rememberOrchFailureLesson(job, result);
+      } catch (err) {
+        log(`rememberOrchFailureLesson failed for #${job.id}: ${redactError(err?.message || err)}`);
       }
     }
 
