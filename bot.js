@@ -1211,7 +1211,13 @@ const WORLDMONITOR_NATIVE_MACRO_REFRESH_MIN_INTERVAL_SEC = toInt(process.env.WOR
 const WORLDMONITOR_NATIVE_PREDICTION_REFRESH_MIN_INTERVAL_SEC = toInt(process.env.WORLDMONITOR_NATIVE_PREDICTION_REFRESH_MIN_INTERVAL_SEC, 1200, 180, 7200);
 const WORLDMONITOR_DEEP_INGEST_ENABLED = toBool(process.env.WORLDMONITOR_DEEP_INGEST_ENABLED, true);
 const WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS = toTimeoutMs(process.env.WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS, 15_000, 0, MAX_TIMEOUT_MS);
-const WORLDMONITOR_DEEP_INGEST_CONCURRENCY = toInt(process.env.WORLDMONITOR_DEEP_INGEST_CONCURRENCY, 4, 1, 24);
+const WORLDMONITOR_DEEP_INGEST_CONCURRENCY = toInt(process.env.WORLDMONITOR_DEEP_INGEST_CONCURRENCY, 3, 1, 24);
+const WORLDMONITOR_DEEP_INGEST_STAGE_BUDGET_MS = toTimeoutMs(
+  process.env.WORLDMONITOR_DEEP_INGEST_STAGE_BUDGET_MS,
+  45_000,
+  0,
+  MAX_TIMEOUT_MS,
+);
 const WORLDMONITOR_DEEP_INGEST_RETRY_COOLDOWN_SEC = toInt(process.env.WORLDMONITOR_DEEP_INGEST_RETRY_COOLDOWN_SEC, 43_200, 60, 604_800);
 const WORLDMONITOR_DEEP_INGEST_MAX_TEXT_CHARS = toInt(process.env.WORLDMONITOR_DEEP_INGEST_MAX_TEXT_CHARS, 18_000, 1_200, 120_000);
 const WORLDMONITOR_DEEP_INGEST_SUMMARY_MAX_WORDS = toInt(process.env.WORLDMONITOR_DEEP_INGEST_SUMMARY_MAX_WORDS, 140, 40, 500);
@@ -1220,6 +1226,12 @@ const WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE_RAW = Number(process.env.WORLDMONIT
 const WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE = Number.isFinite(WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE_RAW)
   ? Math.max(0, Math.trunc(WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE_RAW))
   : 0;
+const WORLDMONITOR_DEEP_INGEST_AUTO_MAX_PER_CYCLE = toInt(
+  process.env.WORLDMONITOR_DEEP_INGEST_AUTO_MAX_PER_CYCLE,
+  12,
+  0,
+  200,
+);
 const WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS_RAW = Number(process.env.WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS);
 const WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS = Number.isFinite(WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS_RAW)
   ? Math.max(0, Math.trunc(WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS_RAW))
@@ -1296,7 +1308,7 @@ const WORLDMONITOR_FEED_ALERTS_REQUIRE_CONTEXT_QUALITY = toBool(
   process.env.WORLDMONITOR_FEED_ALERTS_REQUIRE_CONTEXT_QUALITY,
   true,
 );
-const WORLDMONITOR_CHECK_LOOKBACK_HOURS = toInt(process.env.WORLDMONITOR_CHECK_LOOKBACK_HOURS, 168, 6, 168);
+const WORLDMONITOR_CHECK_LOOKBACK_HOURS = toInt(process.env.WORLDMONITOR_CHECK_LOOKBACK_HOURS, 72, 6, 168);
 const WORLDMONITOR_CHECK_MAX_HEADLINES = toInt(process.env.WORLDMONITOR_CHECK_MAX_HEADLINES, 16, 4, 60);
 const WORLDMONITOR_CHECK_FETCH_TIMEOUT_MS = toTimeoutMs(
   process.env.WORLDMONITOR_CHECK_FETCH_TIMEOUT_MS,
@@ -8176,8 +8188,10 @@ async function fetchAndSummarizeWorldMonitorArticle(item, options = {}) {
     throw new Error("invalid article link");
   }
   const timeoutMs = Number(options?.timeoutMs || 0);
+  const signal = options?.signal;
   const resp = await fetchTextUrl(link, {
     timeoutMs,
+    signal,
     headers: {
       "User-Agent": REDDIT_USER_AGENT,
       Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -8263,6 +8277,68 @@ function getWorldMonitorItemArticleContext(item) {
     : null;
 }
 
+function isAbortLikeError(err) {
+  const name = String(err?.name || "").trim();
+  if (name === "AbortError") return true;
+  const message = String(err?.message || err || "").trim().toLowerCase();
+  return (
+    message.includes("aborted")
+    || message.includes("abort")
+    || message.includes("canceled")
+    || message.includes("cancelled")
+  );
+}
+
+function worldMonitorDeepIngestCapLabel() {
+  if (WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE > 0) {
+    return String(WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE);
+  }
+  if (WORLDMONITOR_DEEP_INGEST_AUTO_MAX_PER_CYCLE > 0) {
+    return `auto:${WORLDMONITOR_DEEP_INGEST_AUTO_MAX_PER_CYCLE}`;
+  }
+  return "unlimited";
+}
+
+function resolveWorldMonitorDeepIngestTargetCount(candidateCount, options = {}) {
+  const total = Math.max(0, Math.trunc(Number(candidateCount || 0)));
+  if (total <= 0) return 0;
+  const configuredCap = Math.max(0, Number(WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE || 0));
+  const autoCap = Math.max(0, Number(WORLDMONITOR_DEEP_INGEST_AUTO_MAX_PER_CYCLE || 0));
+  let cap = configuredCap > 0 ? configuredCap : autoCap;
+  const stageBudgetMsRaw = Number(options?.stageBudgetMs || options?.budgetMs || 0);
+  const stageBudgetMs = Number.isFinite(stageBudgetMsRaw) && stageBudgetMsRaw > 0
+    ? Math.max(1_000, Math.trunc(stageBudgetMsRaw))
+    : 0;
+  if (stageBudgetMs > 0) {
+    const timeoutMs = Math.max(1_000, Number(WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS || 0) || 1_000);
+    const estimatedPerArticleMs = Math.max(1_000, Math.min(8_000, Math.round(timeoutMs * 0.65)));
+    const budgetCap = Math.max(1, Math.floor(stageBudgetMs / estimatedPerArticleMs));
+    cap = cap > 0 ? Math.min(cap, budgetCap) : budgetCap;
+  }
+  if (cap <= 0) return total;
+  return Math.max(1, Math.min(total, cap));
+}
+
+function resolveWorldMonitorDeepIngestConcurrency(candidateCount, options = {}) {
+  const configured = Math.max(1, Number(WORLDMONITOR_DEEP_INGEST_CONCURRENCY || 1));
+  const count = Math.max(0, Math.trunc(Number(candidateCount || 0)));
+  if (count <= 0) return 1;
+  let effective = configured;
+  if (count >= 24) {
+    effective = Math.min(effective, 2);
+  } else if (count >= 12) {
+    effective = Math.min(effective, 3);
+  }
+  const stageBudgetMsRaw = Number(options?.stageBudgetMs || 0);
+  const stageBudgetMs = Number.isFinite(stageBudgetMsRaw) && stageBudgetMsRaw > 0
+    ? Math.max(1_000, Math.trunc(stageBudgetMsRaw))
+    : 0;
+  if (stageBudgetMs > 0) {
+    effective = Math.min(effective, 2);
+  }
+  return Math.max(1, Math.min(effective, count));
+}
+
 function buildWorldMonitorDeepIngestCandidates(options = {}) {
   const force = options?.force === true;
   const now = Date.now();
@@ -8313,8 +8389,7 @@ function buildWorldMonitorDeepIngestCandidates(options = {}) {
     if (b.score !== a.score) return b.score - a.score;
     return Number(b.ts || 0) - Number(a.ts || 0);
   });
-  const cap = Math.max(0, Number(WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE || 0));
-  return cap > 0 ? candidates.slice(0, cap) : candidates;
+  return candidates;
 }
 
 function buildWorldMonitorDeepIngestStatsBase() {
@@ -8323,8 +8398,14 @@ function buildWorldMonitorDeepIngestStatsBase() {
     timeout_ms: WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS,
     concurrency: WORLDMONITOR_DEEP_INGEST_CONCURRENCY,
     max_per_cycle: WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE,
+    auto_max_per_cycle: WORLDMONITOR_DEEP_INGEST_AUTO_MAX_PER_CYCLE,
+    stage_budget_config_ms: WORLDMONITOR_DEEP_INGEST_STAGE_BUDGET_MS,
     lookback_hours: WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS,
     summary_max_words: WORLDMONITOR_DEEP_INGEST_SUMMARY_MAX_WORDS,
+    selected: 0,
+    effective_concurrency: 0,
+    stage_budget_ms: 0,
+    stage_budget_hit: false,
     scanned: 0,
     completed: 0,
     errors: 0,
@@ -8346,8 +8427,16 @@ async function runWorldMonitorNativeDeepIngest(options = {}) {
   const promise = (async () => {
     const startedAt = Date.now();
     const stats = buildWorldMonitorDeepIngestStatsBase();
-    const candidates = buildWorldMonitorDeepIngestCandidates(options);
-    stats.scanned = candidates.length;
+    const stageBudgetMsRaw = Number(options?.stageBudgetMs || 0);
+    const stageBudgetMs = Number.isFinite(stageBudgetMsRaw) && stageBudgetMsRaw > 0
+      ? Math.max(1_000, Math.trunc(stageBudgetMsRaw))
+      : 0;
+    stats.stage_budget_ms = stageBudgetMs;
+    const allCandidates = buildWorldMonitorDeepIngestCandidates(options);
+    const targetCount = resolveWorldMonitorDeepIngestTargetCount(allCandidates.length, { stageBudgetMs });
+    const candidates = targetCount > 0 ? allCandidates.slice(0, targetCount) : [];
+    stats.scanned = allCandidates.length;
+    stats.selected = candidates.length;
     if (candidates.length <= 0) {
       worldMonitorMonitor.nativeDeepIngestLastRunAt = Date.now();
       worldMonitorMonitor.nativeDeepIngestLastDurationMs = Date.now() - startedAt;
@@ -8363,10 +8452,30 @@ async function runWorldMonitorNativeDeepIngest(options = {}) {
       };
     }
 
+    let stageBudgetHit = false;
+    const deadlineAt = stageBudgetMs > 0 ? (startedAt + stageBudgetMs) : 0;
+    const stageController = stageBudgetMs > 0 ? new AbortController() : null;
+    const stageTimer = stageBudgetMs > 0
+      ? setTimeout(() => {
+        stageBudgetHit = true;
+        if (stageController && !stageController.signal.aborted) {
+          stageController.abort();
+        }
+      }, stageBudgetMs)
+      : null;
     let cursor = 0;
-    const concurrency = Math.max(1, Number(WORLDMONITOR_DEEP_INGEST_CONCURRENCY || 1));
+    const concurrency = resolveWorldMonitorDeepIngestConcurrency(candidates.length, { stageBudgetMs });
+    stats.effective_concurrency = concurrency;
     async function workerLoop() {
       for (;;) {
+        if (stageBudgetHit) break;
+        if (deadlineAt > 0 && Date.now() >= deadlineAt) {
+          stageBudgetHit = true;
+          if (stageController && !stageController.signal.aborted) {
+            stageController.abort();
+          }
+          break;
+        }
         const idx = cursor;
         cursor += 1;
         if (idx >= candidates.length) break;
@@ -8376,12 +8485,24 @@ async function runWorldMonitorNativeDeepIngest(options = {}) {
         try {
           const packed = await fetchAndSummarizeWorldMonitorArticle(item, {
             timeoutMs: WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS,
+            signal: stageController ? stageController.signal : undefined,
           });
           item.articleContext = packed;
           stats.completed += 1;
         } catch (err) {
           stats.errors += 1;
           const message = String(err?.message || err || "deep ingest failed").trim() || "deep ingest failed";
+          const budgetAbort = Boolean(
+            stageController
+            && stageController.signal.aborted
+            && stageBudgetMs > 0
+            && isAbortLikeError(err),
+          );
+          if (budgetAbort) {
+            stageBudgetHit = true;
+            stats.errors = Math.max(0, stats.errors - 1);
+            break;
+          }
           item.articleContext = {
             status: "error",
             fetchedAt: Date.now(),
@@ -8392,15 +8513,23 @@ async function runWorldMonitorNativeDeepIngest(options = {}) {
             const title = oneLine(String(item?.title || "")).slice(0, 80);
             stats.sample_errors.push(`${src}: ${title || "untitled"} (${message})`);
           }
+        } finally {
+          // Yield to keep the event loop responsive between article parses.
+          await sleep(0);
         }
       }
     }
-    const workers = [];
-    for (let i = 0; i < concurrency; i += 1) workers.push(workerLoop());
-    await Promise.all(workers);
+    try {
+      const workers = [];
+      for (let i = 0; i < concurrency; i += 1) workers.push(workerLoop());
+      await Promise.all(workers);
+    } finally {
+      if (stageTimer) clearTimeout(stageTimer);
+    }
 
     const pendingNow = buildWorldMonitorDeepIngestCandidates({ force: false, seedKeys: [] }).length;
     stats.remaining_pending = pendingNow;
+    stats.stage_budget_hit = stageBudgetHit;
 
     worldMonitorMonitor.nativeDeepIngestLastRunAt = Date.now();
     worldMonitorMonitor.nativeDeepIngestLastDurationMs = Date.now() - startedAt;
@@ -9886,28 +10015,49 @@ async function runWorldMonitorNativeFeedRefresh(options = {}) {
     persistWorldMonitorNativeStore();
     const hardTimeoutMs = Number(WORLDMONITOR_NATIVE_REFRESH_HARD_TIMEOUT_MS || 0);
     const elapsedBeforePostMs = Date.now() - startedAt;
-    const deepIngestBudgetMs = hardTimeoutMs > 0
-      ? Math.max(1_000, hardTimeoutMs - elapsedBeforePostMs - 2_000)
-      : 0;
+    const configuredDeepIngestBudgetMs = Math.max(0, Number(WORLDMONITOR_DEEP_INGEST_STAGE_BUDGET_MS || 0));
+    let deepIngestBudgetMs = configuredDeepIngestBudgetMs;
+    if (hardTimeoutMs > 0) {
+      const remainingWithinHardTimeout = hardTimeoutMs - elapsedBeforePostMs - 2_000;
+      if (remainingWithinHardTimeout <= 0) {
+        deepIngestBudgetMs = 0;
+      } else if (deepIngestBudgetMs > 0) {
+        deepIngestBudgetMs = Math.min(deepIngestBudgetMs, remainingWithinHardTimeout);
+      } else {
+        deepIngestBudgetMs = remainingWithinHardTimeout;
+      }
+    }
+    if (deepIngestBudgetMs > 0) {
+      if (hardTimeoutMs > 0 && deepIngestBudgetMs < 1_000) {
+        deepIngestBudgetMs = 0;
+      } else {
+        deepIngestBudgetMs = Math.max(1_000, Math.trunc(deepIngestBudgetMs));
+      }
+    }
     let deepIngestDurationMs = 0;
     let signalsDurationMs = 0;
     let deepIngestTimedOut = false;
     let deepIngestError = "";
+    let deepIngestBudgetHit = false;
     const deepIngestPromise = (async () => {
       const phaseStartedAt = Date.now();
       try {
-        const task = runWorldMonitorNativeDeepIngest({ force, seedKeys: newItemKeys });
+        const task = runWorldMonitorNativeDeepIngest({
+          force,
+          seedKeys: newItemKeys,
+          stageBudgetMs: deepIngestBudgetMs,
+        });
         if (deepIngestBudgetMs > 0) {
           return await withPromiseTimeout(
             task,
-            deepIngestBudgetMs,
-            `native deep ingest stage timed out after ${Math.round(deepIngestBudgetMs / 1000)}s`,
+            deepIngestBudgetMs + 2_000,
+            `native deep ingest stage did not stop within ${Math.round(deepIngestBudgetMs / 1000)}s budget`,
           );
         }
         return await task;
       } catch (err) {
         deepIngestError = String(err?.message || err || "").trim() || "native deep ingest failed";
-        deepIngestTimedOut = /timed out/i.test(deepIngestError);
+        deepIngestTimedOut = /timed out|did not stop within/i.test(deepIngestError);
         return {
           ok: false,
           error: deepIngestError,
@@ -9927,12 +10077,18 @@ async function runWorldMonitorNativeFeedRefresh(options = {}) {
       }
     })();
     const [deepIngestResult, signalsResult] = await Promise.all([deepIngestPromise, signalsPromise]);
+    deepIngestBudgetHit = Boolean(deepIngestResult?.stats?.stage_budget_hit);
 
     const durationMs = Date.now() - startedAt;
     if (deepIngestTimedOut) {
       log(
         `worldmonitor native refresh: deep ingest exceeded stage budget `
-        + `(${Math.round(deepIngestBudgetMs / 1000)}s) and was detached.`,
+        + `(${Math.round(deepIngestBudgetMs / 1000)}s) and did not stop cleanly.`,
+      );
+    } else if (deepIngestBudgetHit) {
+      log(
+        `worldmonitor native refresh: deep ingest reached stage budget `
+        + `(${Math.round(deepIngestBudgetMs / 1000)}s) and deferred remaining items.`,
       );
     } else if (deepIngestError) {
       log(`worldmonitor native refresh: deep ingest stage error (${redactError(deepIngestError)})`);
@@ -9959,6 +10115,7 @@ async function runWorldMonitorNativeFeedRefresh(options = {}) {
       },
       deep_ingest_budget_ms: deepIngestBudgetMs,
       deep_ingest_timed_out: deepIngestTimedOut,
+      deep_ingest_stage_budget_hit: deepIngestBudgetHit,
       feeds_total: feeds.length,
       feeds_ok: feedsOk,
       feeds_failed: feedsFail,
@@ -10227,13 +10384,16 @@ function buildWorldMonitorSnapshotHeadlineContext(items, topCountries, options =
 function buildWorldMonitorNativeRiskSnapshot() {
   const items = getWorldMonitorNativeRecentItems({ lookbackHours: WORLDMONITOR_CHECK_LOOKBACK_HOURS });
   const seenCluster = new Set();
+  const dedupedItems = [];
   const countryScores = new Map();
   let weightedPoints = 0;
 
   for (const item of items) {
-    const titleKey = normalizeWorldMonitorTitleForKey(item?.title || "");
+    const titleKey = worldMonitorFeedAlertTitleKey({ title: String(item?.title || "") })
+      || normalizeWorldMonitorTitleForKey(item?.title || "");
     if (!titleKey || seenCluster.has(titleKey)) continue;
     seenCluster.add(titleKey);
+    dedupedItems.push(item);
     const level = String(item?.threatLevel || "low").toLowerCase();
     const base = level === "critical"
       ? 6
@@ -10300,7 +10460,7 @@ function buildWorldMonitorNativeRiskSnapshot() {
   if (prediction && Number(prediction.taiwanRelatedCount || 0) >= 3) signalFactors.push("PREDICTION_TW_ACTIVITY");
   if (prediction && Number(prediction.highVolumeUncertainCount || 0) >= 6) signalFactors.push("PREDICTION_UNCERTAINTY_SPIKE");
 
-  const headlineContext = buildWorldMonitorSnapshotHeadlineContext(items, topCountries, {
+  const headlineContext = buildWorldMonitorSnapshotHeadlineContext(dedupedItems, topCountries, {
     maxGlobal: 10,
     maxCountries: 5,
     maxPerCountry: 2,
@@ -10311,7 +10471,7 @@ function buildWorldMonitorNativeRiskSnapshot() {
     sourceUrl: "native://worldmonitor-feed-engine",
     globalScore,
     globalLevel,
-    globalFactors: [...new Set([...getWorldMonitorNativeFactors(items), ...signalFactors])].slice(0, 8),
+    globalFactors: [...new Set([...getWorldMonitorNativeFactors(dedupedItems), ...signalFactors])].slice(0, 8),
     topCountries,
     headlineEvidence: headlineContext.globalHeadlines,
     countryHeadlineEvidence: headlineContext.countryHeadlines,
@@ -11009,18 +11169,60 @@ function worldMonitorFeedAlertLevelRank(level) {
   return 1;
 }
 
+const WORLDMONITOR_FEED_ALERT_TITLE_STOPWORDS = new Set([
+  "a", "an", "the", "and", "or", "but",
+  "to", "for", "of", "in", "on", "at", "by", "from", "with", "without", "into", "over", "under",
+  "after", "before", "during", "amid", "amidst", "as",
+  "is", "are", "was", "were", "be", "been", "being",
+  "it", "its", "this", "that", "these", "those", "their", "his", "her", "they", "he", "she", "we",
+  "new", "latest", "breaking", "live", "update", "updates", "analysis", "watch",
+  "video", "videos", "photo", "photos", "report", "reports",
+]);
+
+function normalizeWorldMonitorFeedAlertTitleToken(rawToken) {
+  let token = String(rawToken || "").trim().toLowerCase();
+  if (!token) return "";
+  if (/^\d+$/.test(token)) return "";
+  if (token.length > 5 && token.endsWith("ing")) {
+    token = token.slice(0, -3);
+  } else if (token.length > 4 && token.endsWith("ed")) {
+    token = token.slice(0, -2);
+  } else if (token.length > 4 && token.endsWith("es")) {
+    token = token.slice(0, -2);
+  } else if (token.length > 4 && token.endsWith("s")) {
+    token = token.slice(0, -1);
+  }
+  if (token.length < 3) return "";
+  if (WORLDMONITOR_FEED_ALERT_TITLE_STOPWORDS.has(token)) return "";
+  return token;
+}
+
 function worldMonitorFeedAlertTitleKey(raw) {
   const title = String(raw?.title || "").trim();
   if (!title) return "";
   const withoutTrailer = title
     .replace(/\s+[|]\s+[\p{L}\p{N} .,&'()/-]{2,50}$/u, "")
     .replace(/\s+-\s+[\p{L}\p{N} .,&'()/-]{2,50}$/u, "");
-  return withoutTrailer
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+  const normalized = normalizeWorldMonitorTitleForKey(withoutTrailer)
+    .replace(/\b\d{1,2}[:.]\d{2}(?:\s?[ap]m)?\b/g, " ")
+    .replace(/\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun|utc|gmt)\b/g, " ")
     .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 220);
+    .trim();
+  if (!normalized) return "";
+  const reduced = [];
+  const seen = new Set();
+  const tokens = normalized.split(" ");
+  for (const token of tokens) {
+    const compact = normalizeWorldMonitorFeedAlertTitleToken(token);
+    if (!compact || seen.has(compact)) continue;
+    seen.add(compact);
+    reduced.push(compact);
+    if (reduced.length >= 16) break;
+  }
+  if (reduced.length <= 0) return normalized.slice(0, 220);
+  const anchor = reduced.slice(0, 8).join(" ");
+  const bag = reduced.slice().sort().join(" ");
+  return `${anchor}|${bag}`.slice(0, 220);
 }
 
 function buildWorldMonitorFeedAlertSummary(alert, item = null, ctx = null) {
@@ -12770,7 +12972,7 @@ async function sendWorldMonitorStatus(chatId) {
     `- native_feed_stats: total=${Math.round(Number(nativeStats.feeds_total || 0) || 0)}, ok=${Math.round(Number(nativeStats.feeds_ok || 0) || 0)}, failed=${Math.round(Number(nativeStats.feeds_failed || 0) || 0)}, new=${Math.round(Number(nativeStats.new_items || 0) || 0)}`,
     `- native_article_context_refresh: ${worldMonitorMonitor.nativeDeepIngestLastRunAt ? `${nowIso(worldMonitorMonitor.nativeDeepIngestLastRunAt)} (${formatRelativeAge(worldMonitorMonitor.nativeDeepIngestLastRunAt)})` : "never"}`,
     `- native_article_context_duration_ms: ${Math.round(Number(worldMonitorMonitor.nativeDeepIngestLastDurationMs || 0) || 0)}`,
-    `- native_article_context_stats: scanned=${Math.round(Number(deepIngestStats.scanned || 0) || 0)}, ok=${Math.round(Number(deepIngestStats.completed || 0) || 0)}, errors=${Math.round(Number(deepIngestStats.errors || 0) || 0)}, pending=${Math.round(Number(deepIngestStats.remaining_pending || 0) || 0)}`,
+    `- native_article_context_stats: scanned=${Math.round(Number(deepIngestStats.scanned || 0) || 0)}, selected=${Math.round(Number(deepIngestStats.selected || 0) || 0)}, ok=${Math.round(Number(deepIngestStats.completed || 0) || 0)}, errors=${Math.round(Number(deepIngestStats.errors || 0) || 0)}, pending=${Math.round(Number(deepIngestStats.remaining_pending || 0) || 0)}, budget_hit=${Boolean(deepIngestStats.stage_budget_hit)}`,
     `- native_signals_refresh: ${worldMonitorMonitor.nativeSignalsLastRefreshAt ? `${nowIso(worldMonitorMonitor.nativeSignalsLastRefreshAt)} (${formatRelativeAge(worldMonitorMonitor.nativeSignalsLastRefreshAt)})` : "never"}`,
     `- native_signals_points: market=${Array.isArray(worldMonitorNativeSignals.marketSeries) ? worldMonitorNativeSignals.marketSeries.length : 0}, crypto=${Array.isArray(worldMonitorNativeSignals.cryptoSeries) ? worldMonitorNativeSignals.cryptoSeries.length : 0}, seismic=${Array.isArray(worldMonitorNativeSignals.seismicSeries) ? worldMonitorNativeSignals.seismicSeries.length : 0}, infra=${Array.isArray(worldMonitorNativeSignals.infrastructureSeries) ? worldMonitorNativeSignals.infrastructureSeries.length : 0}, adsb=${Array.isArray(worldMonitorNativeSignals.adsbSeries) ? worldMonitorNativeSignals.adsbSeries.length : 0}, disaster=${Array.isArray(worldMonitorNativeSignals.disasterSeries) ? worldMonitorNativeSignals.disasterSeries.length : 0}, maritime=${Array.isArray(worldMonitorNativeSignals.maritimeSeries) ? worldMonitorNativeSignals.maritimeSeries.length : 0}, services=${Array.isArray(worldMonitorNativeSignals.serviceSeries) ? worldMonitorNativeSignals.serviceSeries.length : 0}, macro=${Array.isArray(worldMonitorNativeSignals.macroSeries) ? worldMonitorNativeSignals.macroSeries.length : 0}, prediction=${Array.isArray(worldMonitorNativeSignals.predictionSeries) ? worldMonitorNativeSignals.predictionSeries.length : 0}`,
     `- startup_catchup: ${WORLDMONITOR_STARTUP_CATCHUP_ENABLED ? "enabled" : "disabled"} (min_lookback_h=${WORLDMONITOR_STARTUP_CATCHUP_MIN_LOOKBACK_HOURS}, per_source=${WORLDMONITOR_STARTUP_CATCHUP_ITEMS_PER_SOURCE})`,
@@ -12781,7 +12983,7 @@ async function sendWorldMonitorStatus(chatId) {
     `- interval_headlines_min_level: ${WORLDMONITOR_INTERVAL_HEADLINES_MIN_LEVEL}`,
     `- interval_report_policy: baseline_per_day=${WORLDMONITOR_INTERVAL_REPORT_BASELINE_PER_DAY}, max_per_day=${worldMonitorIntervalReportMaxLabel()}, min_interval_sec=${WORLDMONITOR_INTERVAL_REPORT_MIN_INTERVAL_SEC}, significant_delta>=${WORLDMONITOR_INTERVAL_REPORT_SIGNIFICANT_DELTA}`,
     `- cooldown_sec: ${WORLDMONITOR_ALERT_COOLDOWN_SEC}`,
-    `- article_context: ${WORLDMONITOR_DEEP_INGEST_ENABLED ? `enabled (concurrency=${WORLDMONITOR_DEEP_INGEST_CONCURRENCY}, timeout=${WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS}ms, max_per_cycle=${WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE}, lookback_hours=${WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS})` : "disabled"}`,
+    `- article_context: ${WORLDMONITOR_DEEP_INGEST_ENABLED ? `enabled (concurrency=${WORLDMONITOR_DEEP_INGEST_CONCURRENCY}, timeout=${WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS}ms, stage_budget=${WORLDMONITOR_DEEP_INGEST_STAGE_BUDGET_MS}ms, max_per_cycle=${worldMonitorDeepIngestCapLabel()}, lookback_hours=${WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS})` : "disabled"}`,
     `- thresholds: global>=${WORLDMONITOR_MIN_GLOBAL_RISK_SCORE}, country>=${WORLDMONITOR_MIN_COUNTRY_RISK_SCORE}, delta>=${WORLDMONITOR_MIN_GLOBAL_DELTA}`,
     `- feed_alerts: ${WORLDMONITOR_FEED_ALERTS_ENABLED ? `enabled (interval=${WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC}s, engine=native, min_level=${WORLDMONITOR_FEED_ALERTS_MIN_LEVEL}, max_article_age_h=${WORLDMONITOR_FEED_ALERTS_MAX_ARTICLE_AGE_HOURS}, sent_key_cap=${WORLDMONITOR_FEED_ALERTS_SENT_KEY_CAP}, skip_aggregators=${WORLDMONITOR_FEED_ALERTS_SKIP_AGGREGATOR_LINKS}, skip_documents=${WORLDMONITOR_FEED_ALERTS_SKIP_DOCUMENT_LINKS}, require_context_quality=${WORLDMONITOR_FEED_ALERTS_REQUIRE_CONTEXT_QUALITY})` : "disabled"}`,
     `- voice_alerts: ${WORLDMONITOR_ALERT_VOICE_ENABLED ? "enabled (uncapped)" : "disabled"}`,
@@ -12911,7 +13113,7 @@ async function sendStatus(chatId) {
     `- worldmonitor_monitor: ${WORLDMONITOR_MONITOR_ENABLED ? "enabled" : "disabled"} (interval=${WORLDMONITOR_MONITOR_INTERVAL_SEC}s, interval_alert_mode=${WORLDMONITOR_INTERVAL_ALERT_MODE}, headlines_min_level=${WORLDMONITOR_INTERVAL_HEADLINES_MIN_LEVEL}, report_baseline=${WORLDMONITOR_INTERVAL_REPORT_BASELINE_PER_DAY}/day, report_max=${worldMonitorIntervalReportMaxLabel()}/day, report_min_interval=${WORLDMONITOR_INTERVAL_REPORT_MIN_INTERVAL_SEC}s, report_sig_delta>=${WORLDMONITOR_INTERVAL_REPORT_SIGNIFICANT_DELTA}, cooldown=${WORLDMONITOR_ALERT_COOLDOWN_SEC}s)`,
     `- worldmonitor_feed_alerts: ${WORLDMONITOR_FEED_ALERTS_ENABLED ? "enabled" : "disabled"} (interval=${WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC}s, engine=native, min_level=${WORLDMONITOR_FEED_ALERTS_MIN_LEVEL}, max_article_age_h=${WORLDMONITOR_FEED_ALERTS_MAX_ARTICLE_AGE_HOURS}, sent_key_cap=${WORLDMONITOR_FEED_ALERTS_SENT_KEY_CAP}, skip_aggregators=${WORLDMONITOR_FEED_ALERTS_SKIP_AGGREGATOR_LINKS}, skip_documents=${WORLDMONITOR_FEED_ALERTS_SKIP_DOCUMENT_LINKS}, require_context_quality=${WORLDMONITOR_FEED_ALERTS_REQUIRE_CONTEXT_QUALITY})`,
     `- worldmonitor_startup_catchup: ${WORLDMONITOR_STARTUP_CATCHUP_ENABLED ? "enabled" : "disabled"} (min_lookback_h=${WORLDMONITOR_STARTUP_CATCHUP_MIN_LOOKBACK_HOURS}, per_source=${WORLDMONITOR_STARTUP_CATCHUP_ITEMS_PER_SOURCE})`,
-    `- worldmonitor_article_context: ${WORLDMONITOR_DEEP_INGEST_ENABLED ? "enabled" : "disabled"} (concurrency=${WORLDMONITOR_DEEP_INGEST_CONCURRENCY}, timeout=${WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS}ms, max_per_cycle=${WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE}, lookback_hours=${WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS})`,
+    `- worldmonitor_article_context: ${WORLDMONITOR_DEEP_INGEST_ENABLED ? "enabled" : "disabled"} (concurrency=${WORLDMONITOR_DEEP_INGEST_CONCURRENCY}, timeout=${WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS}ms, stage_budget=${WORLDMONITOR_DEEP_INGEST_STAGE_BUDGET_MS}ms, max_per_cycle=${worldMonitorDeepIngestCapLabel()}, lookback_hours=${WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS})`,
     `- worldmonitor_worker: ${worldMonitorWorkerLabel} | busy=${worldMonitorLane.busy} queued=${worldMonitorLane.queued}`,
     `- worldmonitor_check: ${worldMonitorComprehensiveRuntime.inFlight ? `running (${formatRelativeAge(worldMonitorComprehensiveRuntime.lastStartedAt)})` : "idle"}`,
     `- worldmonitor_last_run: ${worldMonitorMonitor.lastRunAt ? `${formatRelativeAge(worldMonitorMonitor.lastRunAt)}` : "never"}`,
@@ -12919,7 +13121,7 @@ async function sendStatus(chatId) {
     `- worldmonitor_feed_last_run: ${worldMonitorMonitor.feedAlertsLastRunAt ? `${formatRelativeAge(worldMonitorMonitor.feedAlertsLastRunAt)}` : "never"}`,
     `- worldmonitor_native_refresh: ${worldMonitorMonitor.nativeLastRefreshAt ? `${formatRelativeAge(worldMonitorMonitor.nativeLastRefreshAt)}` : "never"} (items=${worldMonitorNativeNewsItems.length})`,
     `- worldmonitor_startup_catchup_last_run: ${worldMonitorMonitor.startupCatchupLastRunAt ? `${formatRelativeAge(worldMonitorMonitor.startupCatchupLastRunAt)}` : "never"} (lookback_h=${Math.round(Number(startupCatchupStats.lookback_hours || 0) || 0)}, new=${Math.round(Number(startupCatchupStats.new_items || 0) || 0)}, feeds_ok=${Math.round(Number(startupCatchupStats.feeds_ok || 0) || 0)}/${Math.round(Number(startupCatchupStats.feeds_total || 0) || 0)})`,
-    `- worldmonitor_article_context_refresh: ${worldMonitorMonitor.nativeDeepIngestLastRunAt ? `${formatRelativeAge(worldMonitorMonitor.nativeDeepIngestLastRunAt)}` : "never"} (scanned=${Math.round(Number(worldMonitorMonitor?.nativeDeepIngestLastStats?.scanned || 0) || 0)}, ok=${Math.round(Number(worldMonitorMonitor?.nativeDeepIngestLastStats?.completed || 0) || 0)}, errors=${Math.round(Number(worldMonitorMonitor?.nativeDeepIngestLastStats?.errors || 0) || 0)}, pending=${Math.round(Number(worldMonitorMonitor?.nativeDeepIngestLastStats?.remaining_pending || 0) || 0)})`,
+    `- worldmonitor_article_context_refresh: ${worldMonitorMonitor.nativeDeepIngestLastRunAt ? `${formatRelativeAge(worldMonitorMonitor.nativeDeepIngestLastRunAt)}` : "never"} (scanned=${Math.round(Number(worldMonitorMonitor?.nativeDeepIngestLastStats?.scanned || 0) || 0)}, selected=${Math.round(Number(worldMonitorMonitor?.nativeDeepIngestLastStats?.selected || 0) || 0)}, ok=${Math.round(Number(worldMonitorMonitor?.nativeDeepIngestLastStats?.completed || 0) || 0)}, errors=${Math.round(Number(worldMonitorMonitor?.nativeDeepIngestLastStats?.errors || 0) || 0)}, pending=${Math.round(Number(worldMonitorMonitor?.nativeDeepIngestLastStats?.remaining_pending || 0) || 0)}, budget_hit=${Boolean(worldMonitorMonitor?.nativeDeepIngestLastStats?.stage_budget_hit)})`,
     `- worldmonitor_native_signals_refresh: ${worldMonitorMonitor.nativeSignalsLastRefreshAt ? `${formatRelativeAge(worldMonitorMonitor.nativeSignalsLastRefreshAt)}` : "never"} (market=${Array.isArray(worldMonitorNativeSignals.marketSeries) ? worldMonitorNativeSignals.marketSeries.length : 0}, crypto=${Array.isArray(worldMonitorNativeSignals.cryptoSeries) ? worldMonitorNativeSignals.cryptoSeries.length : 0}, seismic=${Array.isArray(worldMonitorNativeSignals.seismicSeries) ? worldMonitorNativeSignals.seismicSeries.length : 0}, infra=${Array.isArray(worldMonitorNativeSignals.infrastructureSeries) ? worldMonitorNativeSignals.infrastructureSeries.length : 0}, adsb=${Array.isArray(worldMonitorNativeSignals.adsbSeries) ? worldMonitorNativeSignals.adsbSeries.length : 0}, disaster=${Array.isArray(worldMonitorNativeSignals.disasterSeries) ? worldMonitorNativeSignals.disasterSeries.length : 0}, maritime=${Array.isArray(worldMonitorNativeSignals.maritimeSeries) ? worldMonitorNativeSignals.maritimeSeries.length : 0}, services=${Array.isArray(worldMonitorNativeSignals.serviceSeries) ? worldMonitorNativeSignals.serviceSeries.length : 0}, macro=${Array.isArray(worldMonitorNativeSignals.macroSeries) ? worldMonitorNativeSignals.macroSeries.length : 0}, prediction=${Array.isArray(worldMonitorNativeSignals.predictionSeries) ? worldMonitorNativeSignals.predictionSeries.length : 0})`,
     `- worldmonitor_last_error: ${String(worldMonitorMonitor.lastError || "").trim() || "(none)"}`,
     `- worldmonitor_feed_last_error: ${String(worldMonitorMonitor.feedAlertsLastError || "").trim() || "(none)"}`,
@@ -19421,7 +19623,7 @@ process.on("unhandledRejection", (err) => {
         `WorldMonitor native signals enabled (timeout=${WORLDMONITOR_NATIVE_SIGNAL_TIMEOUT_MS}ms, refresh=${WORLDMONITOR_NATIVE_SIGNALS_REFRESH_MIN_INTERVAL_SEC}s, seismic_refresh=${WORLDMONITOR_NATIVE_SEISMIC_REFRESH_MIN_INTERVAL_SEC}s, adsb_refresh=${WORLDMONITOR_NATIVE_ADSB_REFRESH_MIN_INTERVAL_SEC}s, disaster_refresh=${WORLDMONITOR_NATIVE_DISASTER_REFRESH_MIN_INTERVAL_SEC}s, maritime_refresh=${WORLDMONITOR_NATIVE_MARITIME_REFRESH_MIN_INTERVAL_SEC}s, service_refresh=${WORLDMONITOR_NATIVE_SERVICE_REFRESH_MIN_INTERVAL_SEC}s, macro_refresh=${WORLDMONITOR_NATIVE_MACRO_REFRESH_MIN_INTERVAL_SEC}s, prediction_refresh=${WORLDMONITOR_NATIVE_PREDICTION_REFRESH_MIN_INTERVAL_SEC}s, retention_days=${WORLDMONITOR_NATIVE_SIGNALS_MAX_AGE_DAYS}).`,
       );
       log(
-        `WorldMonitor article-context deep ingest ${WORLDMONITOR_DEEP_INGEST_ENABLED ? "enabled" : "disabled"} (timeout=${WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS}ms, concurrency=${WORLDMONITOR_DEEP_INGEST_CONCURRENCY}, max_per_cycle=${WORLDMONITOR_DEEP_INGEST_MAX_PER_CYCLE}, lookback_hours=${WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS}, summary_words=${WORLDMONITOR_DEEP_INGEST_SUMMARY_MAX_WORDS}).`,
+        `WorldMonitor article-context deep ingest ${WORLDMONITOR_DEEP_INGEST_ENABLED ? "enabled" : "disabled"} (timeout=${WORLDMONITOR_DEEP_INGEST_TIMEOUT_MS}ms, stage_budget=${WORLDMONITOR_DEEP_INGEST_STAGE_BUDGET_MS}ms, concurrency=${WORLDMONITOR_DEEP_INGEST_CONCURRENCY}, max_per_cycle=${worldMonitorDeepIngestCapLabel()}, lookback_hours=${WORLDMONITOR_DEEP_INGEST_LOOKBACK_HOURS}, summary_words=${WORLDMONITOR_DEEP_INGEST_SUMMARY_MAX_WORDS}).`,
       );
       log(
         `WorldMonitor startup catch-up ${WORLDMONITOR_STARTUP_CATCHUP_ENABLED ? "enabled" : "disabled"} (min_lookback_hours=${WORLDMONITOR_STARTUP_CATCHUP_MIN_LOOKBACK_HOURS}, per_source=${WORLDMONITOR_STARTUP_CATCHUP_ITEMS_PER_SOURCE}).`,
