@@ -15,6 +15,31 @@ import os
 import sys
 from pathlib import Path
 
+DEFAULT_ALLOWED_LANGUAGES = ("en", "de", "zh")
+
+
+def _normalize_language_code(value: str) -> str:
+    code = str(value or "").strip().lower().replace("_", "-")
+    if not code:
+        return ""
+    if code == "auto":
+        return "auto"
+    if code.startswith("en"):
+        return "en"
+    if code.startswith("de"):
+        return "de"
+    if code.startswith("zh"):
+        return "zh"
+    return code
+
+
+def _parse_allowed_languages(value: str) -> set[str]:
+    items = [_normalize_language_code(v) for v in str(value or "").split(",")]
+    langs = {v for v in items if v and v != "auto"}
+    if not langs:
+        langs = set(DEFAULT_ALLOWED_LANGUAGES)
+    return langs
+
 
 def _emit(payload: dict) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -34,22 +59,28 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Whisper keepalive server")
     parser.add_argument("--model", default="small", help="Whisper model name")
     parser.add_argument("--default-language", default="auto", help="Default language (or auto)")
+    parser.add_argument(
+        "--allowed-languages",
+        default="en,de,zh",
+        help="Comma-separated output language allowlist used when language=auto",
+    )
     parser.add_argument("--cache-dir", default="", help="Optional Whisper model cache dir")
     return parser.parse_args()
 
 
-def _pick_language(request_language: str, default_language: str) -> str:
-    req = (request_language or "").strip().lower()
-    if req and req != "auto":
+def _pick_language(request_language: str, default_language: str, allowed_languages: set[str]) -> str:
+    req = _normalize_language_code(request_language)
+    if req and req != "auto" and req in allowed_languages:
         return req
-    base = (default_language or "").strip().lower()
-    if base and base != "auto":
+    base = _normalize_language_code(default_language)
+    if base and base != "auto" and base in allowed_languages:
         return base
     return ""
 
 
 def main() -> int:
     args = _parse_args()
+    allowed_languages = _parse_allowed_languages(args.allowed_languages)
 
     try:
         import whisper  # type: ignore
@@ -100,6 +131,7 @@ def main() -> int:
         language = _pick_language(
             str(payload.get("language", "")).strip(),
             str(args.default_language or "").strip(),
+            allowed_languages,
         )
 
         kwargs: dict = {"fp16": False}
@@ -109,6 +141,11 @@ def main() -> int:
         try:
             result = model.transcribe(str(audio_path), **kwargs)
             text = str(result.get("text") or "").strip()
+            if not language:
+                detected_language = _normalize_language_code(result.get("language") or "")
+                if detected_language and detected_language not in allowed_languages:
+                    translated = model.transcribe(str(audio_path), fp16=False, task="translate")
+                    text = str(translated.get("text") or "").strip()
             _result(request_id, True, text=text)
         except Exception as exc:
             _result(request_id, False, error=f"Whisper transcription failed: {exc}")

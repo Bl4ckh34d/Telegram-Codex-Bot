@@ -2755,6 +2755,9 @@ function defaultPromptPreamble() {
   return [
     "You are AIDOLON CLI replying via Telegram.",
     "Keep it concise and practical.",
+    "Language policy: reply only in English, German, or Chinese.",
+    "If the user writes in another language, reply in English.",
+    "Default to English unless the user explicitly asks for German or Chinese.",
     "If ambiguous, ask one clear follow-up question.",
     "",
     "Front-end UI handling (Windows desktop automation):",
@@ -2777,6 +2780,9 @@ function defaultVoicePromptPreamble() {
   return [
     "You are AIDOLON speaking to the user via a Telegram voice message.",
     "Reply in natural conversational language suitable for text-to-speech.",
+    "Language policy: reply only in English, German, or Chinese.",
+    "If the user writes in another language, reply in English.",
+    "Default to English unless the user explicitly asks for German or Chinese.",
     "Do not output code blocks, markdown, commands, stack traces, JSON, or file paths.",
     "Do not include URLs in SPOKEN. URLs are allowed in TEXT_ONLY when useful.",
     "Avoid weird symbols and formatting; use plain words and short sentences.",
@@ -2860,6 +2866,11 @@ function formatCodexPrompt(userText, options = {}) {
   const workspaceLabel = worker ? `${workerLabel} (${worker.kind})` : workerId || "unknown";
 
   const lines = [getPromptPreamble(replyStyle)];
+  if (String(replyStyle || "").trim().toLowerCase() !== "router") {
+    lines.push("Language policy: reply only in English, German, or Chinese.");
+    lines.push("If the user writes in another language, reply in English.");
+    lines.push("Default to English unless the user explicitly asks for German or Chinese.");
+  }
   if (workdir) {
     lines.push(`Workspace: ${workspaceLabel}`);
     lines.push(`Working directory: ${workdir}`);
