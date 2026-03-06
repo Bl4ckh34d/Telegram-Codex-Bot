@@ -28,460 +28,71 @@ const AIDOLON_TTS_SCRIPT_PATH = path.join(ROOT, "aidolon_tts_synthesize.py");
 const AIDOLON_TTS_SERVER_SCRIPT_PATH = path.join(ROOT, "aidolon_tts_server.py");
 const RESTART_EXIT_CODE = 75;
 
-function ensureDir(dirPath) {
-  if (!fs.existsSync(dirPath)) {
-    fs.mkdirSync(dirPath, { recursive: true });
-  }
-}
-
-function ensureDirSafe(dirPath, { label = "", required = false } = {}) {
-  try {
-    ensureDir(dirPath);
-    return true;
-  } catch (err) {
-    const suffix = label ? ` (${label})` : "";
-    console.error(`[startup] Failed to prepare directory${suffix}: ${dirPath}: ${err?.message || err}`);
-    if (required) {
-      console.error("[startup] This directory is required. Exiting.");
-    }
-    return false;
-  }
-}
-
-function loadEnv(filePath) {
-  if (!fs.existsSync(filePath)) return true;
-  let lines = [];
-  try {
-    lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
-  } catch (err) {
-    console.error(`[startup] Failed to read .env at ${filePath}: ${err?.message || err}`);
-    return false;
-  }
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const idx = trimmed.indexOf("=");
-    if (idx === -1) continue;
-    const key = trimmed.slice(0, idx).trim();
-    let val = trimmed.slice(idx + 1).trim();
-    if (
-      (val.startsWith('"') && val.endsWith('"')) ||
-      (val.startsWith("'") && val.endsWith("'"))
-    ) {
-      val = val.slice(1, -1);
-    }
-    if (!(key in process.env) || String(process.env[key] || "").trim() === "") {
-      process.env[key] = val;
-    }
-  }
-  return true;
-}
-
-function toBool(value, fallback = false) {
-  const raw = String(value ?? "").trim().toLowerCase();
-  if (!raw) return fallback;
-  if (["1", "true", "yes", "on"].includes(raw)) return true;
-  if (["0", "false", "no", "off"].includes(raw)) return false;
-  return fallback;
-}
-
-function toInt(value, fallback, min = null, max = null) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return fallback;
-  let out = Math.trunc(n);
-  if (min !== null && out < min) out = min;
-  if (max !== null && out > max) out = max;
-  return out;
-}
-
-function toTimeoutMs(value, fallback, min = null, max = null) {
-  const raw = String(value ?? "").trim();
-  if (!raw) return fallback;
-  const n = Number(raw);
-  if (!Number.isFinite(n)) return fallback;
-  const out = Math.trunc(n);
-  // 0 or negative disables the timeout entirely.
-  if (out <= 0) return 0;
-  let clamped = out;
-  if (min !== null && clamped < min) clamped = min;
-  if (max !== null && clamped > max) clamped = max;
-  return clamped;
-}
-
-function combineAbortSignals(signals) {
-  const list = Array.isArray(signals) ? signals.filter(Boolean) : [];
-  if (list.length === 0) return { signal: undefined, cleanup: () => {} };
-  if (globalThis.AbortSignal && typeof globalThis.AbortSignal.any === "function") {
-    return { signal: globalThis.AbortSignal.any(list), cleanup: () => {} };
-  }
-
-  const controller = new AbortController();
-  const listeners = [];
-  for (const sig of list) {
-    try {
-      if (sig.aborted) {
-        controller.abort();
-        break;
-      }
-      const onAbort = () => controller.abort();
-      sig.addEventListener("abort", onAbort, { once: true });
-      listeners.push([sig, onAbort]);
-    } catch {
-      // best effort
-    }
-  }
-
-  const cleanup = () => {
-    for (const [sig, onAbort] of listeners) {
-      try {
-        sig.removeEventListener("abort", onAbort);
-      } catch {
-        // best effort
-      }
-    }
-  };
-
-  return { signal: controller.signal, cleanup };
-}
-
-function minPositive(values) {
-  const list = Array.isArray(values) ? values : [];
-  let best = 0;
-  for (const raw of list) {
-    const n = Number(raw);
-    if (!Number.isFinite(n) || n <= 0) continue;
-    if (!best || n < best) best = n;
-  }
-  return best;
-}
-
-function withPromiseTimeout(promise, timeoutMs, timeoutMessage = "operation timed out") {
-  const ms = Number(timeoutMs);
-  if (!Number.isFinite(ms) || ms <= 0) return Promise.resolve(promise);
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      reject(new Error(timeoutMessage));
-    }, ms);
-    Promise.resolve(promise).then(
-      (value) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (err) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        reject(err);
-      },
-    );
-  });
-}
-
-function hardTimeoutRemainingMs(job, hardTimeoutMs) {
-  const ms = Number(hardTimeoutMs);
-  if (!Number.isFinite(ms) || ms <= 0) return 0;
-  const startedAt = Number(job?.startedAt || 0);
-  if (!Number.isFinite(startedAt) || startedAt <= 0) return ms;
-  const remaining = startedAt + ms - Date.now();
-  // If the deadline already passed, return a tiny positive value so callers can trip timeouts immediately.
-  if (remaining <= 0) return 1;
-  return remaining;
-}
-
-function parseList(value) {
-  return String(value || "")
-    .split(",")
-    .map((v) => v.trim())
-    .filter(Boolean);
-}
-
-const TELEGRAM_CHAT_ACTIONS = new Set([
-  "typing",
-  "upload_photo",
-  "record_video",
-  "upload_video",
-  "record_voice",
-  "upload_voice",
-  "upload_document",
-  "choose_sticker",
-  "find_location",
-  "record_video_note",
-  "upload_video_note",
-]);
-
-function normalizeTelegramChatAction(value, fallback = "typing") {
-  const normalizedFallback = TELEGRAM_CHAT_ACTIONS.has(String(fallback || "").trim().toLowerCase())
-    ? String(fallback || "").trim().toLowerCase()
-    : "typing";
-  const raw = String(value || "").trim().toLowerCase();
-  if (!raw) return normalizedFallback;
-  return TELEGRAM_CHAT_ACTIONS.has(raw) ? raw : normalizedFallback;
-}
-
-function normalizeSubredditName(value) {
-  const raw = String(value || "").trim().replace(/^r\//i, "");
-  if (!raw) return "";
-  const normalized = raw.toLowerCase();
-  // Reddit community names are limited to letters, numbers, and underscores.
-  if (!/^[a-z0-9_]{2,21}$/.test(normalized)) return "";
-  return normalized;
-}
-
-function parseArgString(input) {
-  const out = [];
-  const re = /"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|(\S+)/g;
-  let m;
-  while ((m = re.exec(String(input || ""))) !== null) {
-    const token = m[1] ?? m[2] ?? m[3] ?? "";
-    if (token) out.push(token);
-  }
-  return out;
-}
-
-function sanitizeCodexExtraArgs(inputArgs) {
-  const out = [];
-  const dropped = [];
-  for (let i = 0; i < inputArgs.length; i += 1) {
-    const token = String(inputArgs[i] || "");
-    if (!token) continue;
-
-    if (token === "-a" || token === "--approval-policy" || token === "--ask-for-approval") {
-      dropped.push(token);
-      const next = String(inputArgs[i + 1] || "");
-      if (next && !next.startsWith("-")) {
-        dropped.push(next);
-        i += 1;
-      }
-      continue;
-    }
-
-    if (token.startsWith("--approval-policy=") || token.startsWith("--ask-for-approval=")) {
-      dropped.push(token);
-      continue;
-    }
-
-    out.push(token);
-  }
-  return { args: out, dropped };
-}
-
-function shQuote(value) {
-  return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
-}
+const {
+  ensureDir,
+  ensureDirSafe,
+  loadEnv,
+  writeJsonAtomic,
+  readJson,
+  toBool,
+  toInt,
+  toTimeoutMs,
+  combineAbortSignals,
+  minPositive,
+  withPromiseTimeout,
+  hardTimeoutRemainingMs,
+  parseList,
+  normalizeTelegramChatAction,
+  normalizeSubredditName,
+  parseArgString,
+  sanitizeCodexExtraArgs,
+  shQuote,
+  resolveMaybeRelativePath: coreResolveMaybeRelativePath,
+  sleep,
+  computeExponentialBackoffMs,
+  chunkText,
+  appendTail,
+  oneLine,
+  detectTtsBackendFatalError,
+  previewForLog,
+} = require("./lib/core_utils");
+const {
+  NATURAL_COMMAND_ALIASES,
+  NATURAL_NO_ARG_COMMANDS,
+  NATURAL_PREFIX_REQUIRED_COMMANDS,
+  NATURAL_DIRECT_COMMANDS,
+} = require("./lib/natural_commands");
+const { createStatePersister } = require("./lib/state_persistence");
+const { createOrchQueueRuntime } = require("./lib/orch_queue_runtime");
+const { createOrchLaneRuntime } = require("./lib/orch_lane_runtime");
+const { createOrchRouterRuntime } = require("./lib/orch_router_runtime");
+const { createOrchReplyContextRuntime } = require("./lib/orch_reply_context_runtime");
+const { createOrchTaskRuntime } = require("./lib/orch_task_runtime");
+const { createOrchWorkerRuntime } = require("./lib/orch_worker_runtime");
+const { createOrchLaneRegistryRuntime } = require("./lib/orch_lane_registry_runtime");
+const { createTelegramRouteMetaRuntime } = require("./lib/telegram_route_meta_runtime");
+const { createParsedCommandRouter } = require("./lib/command_handlers");
+const { createWorldMonitorPipelineRuntime } = require("./lib/worldmonitor/pipeline_runtime");
+const {
+  WORLDMONITOR_NATIVE_SEVERITY_DIRECT_TAGS,
+  WORLDMONITOR_NATIVE_SEVERITY_CATEGORY_TAGS,
+  WORLDMONITOR_NATIVE_SEVERITY_CATEGORY_ATTRS,
+  WORLDMONITOR_TAIWAN_KEYWORDS,
+  WORLDMONITOR_COUNTRY_PATTERNS,
+  WORLDMONITOR_MARKET_SYMBOLS,
+  WORLDMONITOR_NATIVE_ADSB_REGION,
+  WORLDMONITOR_NATIVE_ADSB_THEATERS,
+  WORLDMONITOR_MILITARY_CALLSIGN_PREFIXES,
+  WORLDMONITOR_COMMERCIAL_CALLSIGN_PREFIXES,
+  WORLDMONITOR_NATIVE_SERVICE_SOURCES,
+  WORLDMONITOR_NATIVE_MACRO_SYMBOLS,
+  WORLDMONITOR_NATIVE_PREDICTION_TAIWAN_PATTERN,
+  WORLDMONITOR_NATIVE_MARITIME_REGION_PATTERNS,
+} = require("./lib/worldmonitor/constants");
 
 function resolveMaybeRelativePath(value, baseDir = ROOT) {
-  const raw = String(value || "").trim();
-  if (!raw) return "";
-  return path.isAbsolute(raw) ? raw : path.resolve(baseDir, raw);
+  return coreResolveMaybeRelativePath(value, baseDir);
 }
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function computeExponentialBackoffMs(attempt, baseMs = 300, maxMs = 4000, jitterRatio = 0.2) {
-  const n = Math.max(1, Number(attempt) || 1) - 1;
-  const base = Number(baseMs);
-  const cap = Number(maxMs);
-  const safeBase = Number.isFinite(base) && base > 0 ? base : 300;
-  const safeCap = Number.isFinite(cap) && cap > 0 ? cap : 4000;
-  const raw = Math.min(safeCap, safeBase * (2 ** n));
-  const jitter = 1 + ((Math.random() * 2 - 1) * Math.max(0, Number(jitterRatio) || 0));
-  return Math.max(50, Math.round(raw * jitter));
-}
-
-function chunkText(text, maxLen = 3800) {
-  const chunks = [];
-  let rest = String(text || "");
-  const limitRaw = Number(maxLen);
-  // Non-positive disables chunking (may exceed Telegram's per-message limit).
-  const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.trunc(limitRaw) : Infinity;
-  if (!Number.isFinite(limit)) {
-    chunks.push(rest || "(empty)");
-    return chunks;
-  }
-  while (rest.length > limit) {
-    let idx = rest.lastIndexOf("\n", limit);
-    if (idx < 500) idx = limit;
-    chunks.push(rest.slice(0, idx));
-    rest = rest.slice(idx);
-  }
-  chunks.push(rest || "(empty)");
-  return chunks;
-}
-
-function appendTail(existing, chunk, limit = 6000) {
-  const next = `${existing}${chunk}`;
-  const lim = Number(limit);
-  // Non-positive disables tail truncation (may use unbounded memory).
-  if (!Number.isFinite(lim) || lim <= 0) return next;
-  return next.length > lim ? next.slice(-lim) : next;
-}
-
-function oneLine(text) {
-  return String(text || "")
-    .replace(/\r?\n/g, " \\n ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function detectTtsBackendFatalError(chunk, carry = "") {
-  const combined = `${String(carry || "")}${String(chunk || "")}`;
-  const window = combined.length > 8000 ? combined.slice(-8000) : combined;
-  const nextCarry = window.slice(-1200);
-  if (!window.trim()) return { message: "", carry: nextCarry };
-
-  if (/TypeError:\s*TextEncodeInput must be Union\[TextInputSequence,\s*Tuple\[InputSequence,\s*InputSequence\]\]/i.test(window)) {
-    return {
-      message: "lmdeploy tokenizer rejected prompt input type (TextEncodeInput TypeError).",
-      carry: nextCarry,
-    };
-  }
-
-  const hasLmdeployCallbackTrace =
-    /exception calling callback for <future/i.test(window) &&
-    /lmdeploy[\\/]+pipeline\.py/i.test(window);
-  const hasTokenizerBatchTrace =
-    /tokenization_utils_fast\.py/i.test(window) &&
-    /_batch_encode_plus/i.test(window);
-  if (hasLmdeployCallbackTrace && hasTokenizerBatchTrace) {
-    return {
-      message: "lmdeploy callback failed during tokenizer batch encoding.",
-      carry: nextCarry,
-    };
-  }
-
-  return { message: "", carry: nextCarry };
-}
-
-function previewForLog(text, maxChars) {
-  const normalized = oneLine(text);
-  const lim = Number(maxChars);
-  // Non-positive disables truncation.
-  if (!Number.isFinite(lim) || lim <= 0) return normalized;
-  if (normalized.length <= lim) return normalized;
-  return `${normalized.slice(0, lim)}...`;
-}
-
-const NATURAL_COMMAND_ALIASES = Object.freeze({
-  help: "/help",
-  start: "/start",
-  codex: "/codex",
-  commands: "/commands",
-  command: "/commands",
-  c: "/commands",
-  status: "/status",
-  workers: "/workers",
-  worker: "/workers",
-  use: "/use",
-  spawn: "/spawn",
-  retire: "/retire",
-  queue: "/queue",
-  news: "/news",
-  newsreport: "/newsreport",
-  cancel: "/cancel",
-  stop: "/stop",
-  clear: "/clear",
-  screenshot: "/screenshot",
-  ss: "/screenshot",
-  sendfile: "/sendfile",
-  cmd: "/cmd",
-  confirm: "/confirm",
-  run: "/run",
-  reject: "/reject",
-  deny: "/deny",
-  cancelcmd: "/cancelcmd",
-  new: "/new",
-  resume: "/resume",
-  compress: "/compress",
-  ask: "/ask",
-  see: "/see",
-  imgclear: "/imgclear",
-  model: "/model",
-  voice: "/voice",
-  tts: "/tts",
-  abtest: "/abtest",
-  voicetest: "/abtest",
-  prune: "/prune",
-  wipe: "/wipe",
-  restart: "/restart",
-  newsstatus: "/newsstatus",
-});
-
-const NATURAL_NO_ARG_COMMANDS = new Set([
-  "/help",
-  "/start",
-  "/codex",
-  "/commands",
-  "/status",
-  "/workers",
-  "/queue",
-  "/cancel",
-  "/stop",
-  "/clear",
-  "/screenshot",
-  "/confirm",
-  "/run",
-  "/reject",
-  "/deny",
-  "/cancelcmd",
-  "/new",
-  "/imgclear",
-  "/model",
-  "/voice",
-  "/abtest",
-  "/prune",
-  "/wipe",
-  "/newsstatus",
-]);
-
-const NATURAL_PREFIX_REQUIRED_COMMANDS = new Set([
-  "/use",
-  "/spawn",
-  "/retire",
-  "/sendfile",
-  "/cmd",
-  "/resume",
-  "/ask",
-  "/see",
-  "/tts",
-]);
-
-const NATURAL_DIRECT_COMMANDS = new Set([
-  "/help",
-  "/start",
-  "/codex",
-  "/commands",
-  "/status",
-  "/workers",
-  "/queue",
-  "/news",
-  "/newsreport",
-  "/cancel",
-  "/stop",
-  "/clear",
-  "/screenshot",
-  "/confirm",
-  "/run",
-  "/reject",
-  "/deny",
-  "/cancelcmd",
-  "/new",
-  "/compress",
-  "/imgclear",
-  "/model",
-  "/voice",
-  "/abtest",
-  "/prune",
-  "/wipe",
-  "/restart",
-  "/newsstatus",
-]);
 
 function senderLabel(msg) {
   const from = msg?.from || {};
@@ -493,6 +104,62 @@ function senderLabel(msg) {
   const full = `${first} ${last}`.trim();
   if (full) return `${full}${id ? `(${id})` : ""}`;
   return id || "unknown";
+}
+
+const chatLogPendingLines = [];
+let chatLogFlushTimer = null;
+let chatLogFlushInFlight = false;
+
+function scheduleChatLogFlush(delayMs = CHAT_LOG_FLUSH_INTERVAL_MS) {
+  if (chatLogFlushTimer) return;
+  const waitMs = Math.max(0, Number(delayMs) || 0);
+  chatLogFlushTimer = setTimeout(() => {
+    chatLogFlushTimer = null;
+    flushChatLogBufferAsync();
+  }, waitMs);
+}
+
+function flushChatLogBufferAsync() {
+  if (!CHAT_LOG_TO_FILE) return;
+  if (chatLogFlushInFlight) return;
+  if (chatLogPendingLines.length <= 0) return;
+
+  const payload = chatLogPendingLines.splice(0, chatLogPendingLines.length).join("");
+  chatLogFlushInFlight = true;
+  fs.appendFile(CHAT_LOG_PATH, payload, "utf8", () => {
+    chatLogFlushInFlight = false;
+    if (chatLogPendingLines.length > 0) {
+      scheduleChatLogFlush(0);
+    }
+  });
+}
+
+function flushChatLogBufferSync() {
+  if (chatLogFlushTimer) {
+    clearTimeout(chatLogFlushTimer);
+    chatLogFlushTimer = null;
+  }
+  if (chatLogPendingLines.length <= 0) return;
+  const payload = chatLogPendingLines.splice(0, chatLogPendingLines.length).join("");
+  try {
+    fs.appendFileSync(CHAT_LOG_PATH, payload, "utf8");
+  } catch {
+    // best effort
+  }
+}
+
+function enqueueChatLogLine(line) {
+  if (!CHAT_LOG_TO_FILE) return;
+  chatLogPendingLines.push(`${line}\n`);
+  if (chatLogPendingLines.length >= CHAT_LOG_BUFFER_MAX_LINES) {
+    if (chatLogFlushTimer) {
+      clearTimeout(chatLogFlushTimer);
+      chatLogFlushTimer = null;
+    }
+    flushChatLogBufferAsync();
+    return;
+  }
+  scheduleChatLogFlush(CHAT_LOG_FLUSH_INTERVAL_MS);
 }
 
 function logChat(direction, chatId, text, meta = {}) {
@@ -527,25 +194,10 @@ function logChat(direction, chatId, text, meta = {}) {
         `source=${JSON.stringify(source)}`,
         `text=${JSON.stringify(String(text || ""))}`,
       ].join(" ");
-      fs.appendFileSync(CHAT_LOG_PATH, `${line}\n`, "utf8");
+      enqueueChatLogLine(line);
     } catch {
       // best effort
     }
-  }
-}
-
-function writeJsonAtomic(filePath, obj) {
-  ensureDir(path.dirname(filePath));
-  const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), "utf8");
-  fs.renameSync(tmp, filePath);
-}
-
-function readJson(filePath, fallback) {
-  try {
-    return JSON.parse(fs.readFileSync(filePath, "utf8"));
-  } catch {
-    return fallback;
   }
 }
 
@@ -903,6 +555,8 @@ const CHAT_LOG_TO_FILE = toBool(process.env.CHAT_LOG_TO_FILE, true);
 const TERMINAL_COLORS = toBool(process.env.TERMINAL_COLORS, true);
 const CHAT_LOG_USE_COLORS = toBool(process.env.CHAT_LOG_USE_COLORS, true);
 const CHAT_LOG_MAX_CHARS = toInt(process.env.CHAT_LOG_MAX_CHARS, 700);
+const CHAT_LOG_FLUSH_INTERVAL_MS = toInt(process.env.CHAT_LOG_FLUSH_INTERVAL_MS, 400, 50, 10_000);
+const CHAT_LOG_BUFFER_MAX_LINES = toInt(process.env.CHAT_LOG_BUFFER_MAX_LINES, 120, 10, 10_000);
 const LAUNCH_REASON = String(process.env.AIDOLON_LAUNCH_REASON || "startup").trim() || "startup";
 const LAUNCH_PREV_EXIT_CODE = String(process.env.AIDOLON_LAUNCH_PREV_EXIT_CODE || "").trim();
 const CODEX_SESSIONS_DIR = resolveMaybeRelativePath(
@@ -1100,6 +754,8 @@ const MAX_PROMPT_CHARS = toInt(process.env.MAX_PROMPT_CHARS, 0);
 const MAX_RESPONSE_CHARS = toInt(process.env.MAX_RESPONSE_CHARS, 0);
 // 0 disables the queue cap.
 const MAX_QUEUE_SIZE = toInt(process.env.MAX_QUEUE_SIZE, 0);
+const STATE_WRITE_DEBOUNCE_MS = toInt(process.env.STATE_WRITE_DEBOUNCE_MS, 250, 0, 10_000);
+const STATE_WRITE_MAX_DELAY_MS = toInt(process.env.STATE_WRITE_MAX_DELAY_MS, 2000, 100, 60_000);
 const PROGRESS_UPDATES_ENABLED = toBool(process.env.PROGRESS_UPDATES_ENABLED, false);
 // When true, progress updates may include stderr. This is usually noisy (logs), so default is false.
 const PROGRESS_INCLUDE_STDERR = toBool(process.env.PROGRESS_INCLUDE_STDERR, false);
@@ -1870,13 +1526,46 @@ let orchNextWorkerNum = Number(orch.nextWorkerNum || 1);
 let orchNextTaskNum = Number(orch.nextTaskNum || 1);
 
 const lanes = new Map();
+const orchWorkerRuntime = createOrchWorkerRuntime({
+  fs,
+  path,
+  orchWorkers,
+  orchActiveWorkerByChat,
+  orchSessionByChatWorker,
+  ORCH_GENERAL_WORKER_ID,
+  persistState,
+  normalizeWorkerDisplayName,
+  collectUsedWorkerNameKeys,
+  chooseAvailableWorkerName,
+  takeNextWorkerIdCandidate: () => `w${orchNextWorkerNum++}`,
+  ensureWorkerLane,
+  getLane,
+  lanes,
+  terminateChildTree,
+  dropReplyRoutesForWorker: (...args) => orchReplyContextRuntime.dropReplyRoutesForWorker(...args),
+});
+const orchLaneRegistryRuntime = createOrchLaneRegistryRuntime({
+  fs,
+  path,
+  ROOT,
+  CODEX_WORKDIR,
+  ORCH_TTS_LANE_ID,
+  ORCH_WHISPER_LANE_ID,
+  ORCH_GENERAL_WORKER_ID,
+  ORCH_MAX_CODEX_WORKERS,
+  orchWorkers,
+  lanes,
+  persistState,
+  log,
+  getCodexWorker,
+  listCodexWorkers,
+  findWorkerByWorkdir,
+  createRepoWorker,
+});
 initOrchLanes();
 let nextJobId = 1;
 let shuttingDown = false;
 const orchPendingSpawnByChat = new Map(); // chatId -> { desiredWorkdir, title, promptText, source, options, createdAt }
-let routerSequence = 1;
-let routerInFlight = 0;
-const routerWaiters = [];
 const pendingCommandsById = new Map();
 const pendingCommandIdByChat = new Map();
 const backgroundCommandChainByChat = new Map();
@@ -2055,33 +1744,77 @@ function normalizeOrchState(stateObj, { legacyChatSessions = {} } = {}) {
   };
 }
 
-function persistState() {
-  try {
-    writeJsonAtomic(STATE_PATH, {
-      lastUpdateId,
-      lastImages,
-      chatPrefs,
-      orchLessons,
-      redditDigest,
-      worldMonitorMonitor,
-      weatherDaily: weatherDailyState,
-      weatherLocationsByChat,
-      orch: {
-        version: 1,
-        workers: orchWorkers,
-        activeWorkerByChat: orchActiveWorkerByChat,
-        sessionByChatWorker: orchSessionByChatWorker,
-        replyRouteByChat: orchReplyRouteByChat,
-        messageMetaByChat: orchMessageMetaByChat,
-        tasksByChat: orchTasksByChat,
-        nextWorkerNum: orchNextWorkerNum,
-        nextTaskNum: orchNextTaskNum,
-      },
-    });
-  } catch {
-    // best effort
-  }
+function buildStateSnapshot() {
+  return {
+    lastUpdateId,
+    lastImages,
+    chatPrefs,
+    orchLessons,
+    redditDigest,
+    worldMonitorMonitor,
+    weatherDaily: weatherDailyState,
+    weatherLocationsByChat,
+    orch: {
+      version: 1,
+      workers: orchWorkers,
+      activeWorkerByChat: orchActiveWorkerByChat,
+      sessionByChatWorker: orchSessionByChatWorker,
+      replyRouteByChat: orchReplyRouteByChat,
+      messageMetaByChat: orchMessageMetaByChat,
+      tasksByChat: orchTasksByChat,
+      nextWorkerNum: orchNextWorkerNum,
+      nextTaskNum: orchNextTaskNum,
+    },
+  };
 }
+
+const statePersister = createStatePersister({
+  writeNow: () => {
+    writeJsonAtomic(STATE_PATH, buildStateSnapshot());
+  },
+  delayMs: STATE_WRITE_DEBOUNCE_MS,
+  maxDelayMs: STATE_WRITE_MAX_DELAY_MS,
+  onError: () => {
+    // best effort
+  },
+});
+
+function persistState({ immediate = false } = {}) {
+  statePersister.markDirty({ immediate });
+}
+
+function flushStatePersistence() {
+  statePersister.flush();
+}
+
+const orchReplyContextRuntime = createOrchReplyContextRuntime({
+  orchWorkers,
+  orchReplyRouteByChat,
+  orchMessageMetaByChat,
+  ORCH_MESSAGE_META_MAX_PER_CHAT,
+  ORCH_MESSAGE_META_TTL_DAYS,
+  ORCH_THREAD_CONTEXT_MAX_DEPTH,
+  ORCH_THREAD_CONTEXT_MAX_CHARS,
+  ORCH_RECENT_CONTEXT_MESSAGES,
+  ORCH_RECENT_CONTEXT_MAX_CHARS,
+  persistState,
+  normalizeReplySnippet,
+  senderLabel,
+});
+
+const orchTaskRuntime = createOrchTaskRuntime({
+  orchTasksByChat,
+  ORCH_TASK_MAX_PER_CHAT,
+  ORCH_TASK_TTL_DAYS,
+  takeNextTaskId: () => {
+    const next = Number(orchNextTaskNum || 1);
+    const id = Number.isFinite(next) && next > 0 ? Math.trunc(next) : 1;
+    orchNextTaskNum = id + 1;
+    return id;
+  },
+  persistState,
+  normalizeReplySnippet,
+});
 
 function getChatPrefs(chatId) {
   const key = String(chatId || "").trim();
@@ -2118,7 +1851,7 @@ function setChatPrefs(chatId, patch) {
     return;
   }
   chatPrefs[key] = next;
-  persistState();
+  persistState({ immediate: true });
 }
 
 function clearChatPrefs(chatId) {
@@ -2439,909 +2172,284 @@ function getActiveSessionForChat(chatId, workerId = "") {
 }
 
 function normalizeTaskLinks(rawValue) {
-  const out = [];
-  const seen = new Set();
-  for (const item of Array.isArray(rawValue) ? rawValue : []) {
-    if (!item || typeof item !== "object") continue;
-    const taskIdNum = Number(item.taskId || item.task_id || 0);
-    const taskId = Number.isFinite(taskIdNum) && taskIdNum > 0 ? Math.trunc(taskIdNum) : 0;
-    const workerId = String(item.workerId || item.worker_id || "").trim();
-    const sessionId = String(item.sessionId || item.session_id || "").trim();
-    if (!taskId && !workerId) continue;
-    const key = `${taskId}|${workerId}|${sessionId}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const entry = {};
-    if (taskId) entry.taskId = taskId;
-    if (workerId) entry.workerId = workerId;
-    if (sessionId) entry.sessionId = sessionId;
-    out.push(entry);
-  }
-  return out;
+  return orchReplyContextRuntime.normalizeTaskLinks(rawValue);
 }
 
 function mergeTaskLinks(a, b) {
-  return normalizeTaskLinks([...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])]);
-}
-
-function ensureMessageMetaEntryForChat(chatId) {
-  const key = String(chatId || "").trim();
-  if (!key) return null;
-  const current = orchMessageMetaByChat[key];
-  if (current && typeof current === "object") return current;
-  const next = {};
-  orchMessageMetaByChat[key] = next;
-  return next;
-}
-
-function ensureTaskEntryForChat(chatId) {
-  const key = String(chatId || "").trim();
-  if (!key) return null;
-  const current = orchTasksByChat[key];
-  if (current && typeof current === "object") return current;
-  const next = {};
-  orchTasksByChat[key] = next;
-  return next;
-}
-
-function pruneMessageMetaForChat(chatId) {
-  const key = String(chatId || "").trim();
-  if (!key) return;
-  const entry = orchMessageMetaByChat[key];
-  if (!entry || typeof entry !== "object") return;
-  const rows = Object.entries(entry);
-  if (rows.length === 0) return;
-
-  const ttlMs = Math.max(1, ORCH_MESSAGE_META_TTL_DAYS) * 24 * 60 * 60 * 1000;
-  const cutoff = Date.now() - ttlMs;
-  rows.sort((a, b) => Number(b[1]?.at || 0) - Number(a[1]?.at || 0));
-
-  const next = {};
-  let kept = 0;
-  for (const [messageId, meta] of rows) {
-    if (kept >= ORCH_MESSAGE_META_MAX_PER_CHAT) break;
-    const at = Number(meta?.at || 0);
-    if (Number.isFinite(at) && at > 0 && at < cutoff) continue;
-    next[messageId] = meta;
-    kept += 1;
-  }
-  orchMessageMetaByChat[key] = next;
-}
-
-function pruneTasksForChat(chatId) {
-  const key = String(chatId || "").trim();
-  if (!key) return;
-  const entry = orchTasksByChat[key];
-  if (!entry || typeof entry !== "object") return;
-  const rows = Object.entries(entry);
-  if (rows.length === 0) return;
-
-  const ttlMs = Math.max(1, ORCH_TASK_TTL_DAYS) * 24 * 60 * 60 * 1000;
-  const cutoff = Date.now() - ttlMs;
-  rows.sort((a, b) => Number(b[1]?.createdAt || 0) - Number(a[1]?.createdAt || 0));
-
-  const next = {};
-  let kept = 0;
-  for (const [taskId, meta] of rows) {
-    if (kept >= ORCH_TASK_MAX_PER_CHAT) break;
-    const createdAt = Number(meta?.createdAt || 0);
-    if (Number.isFinite(createdAt) && createdAt > 0 && createdAt < cutoff) continue;
-    next[taskId] = meta;
-    kept += 1;
-  }
-  orchTasksByChat[key] = next;
+  return orchReplyContextRuntime.mergeTaskLinks(a, b);
 }
 
 function getMessageMetaEntry(chatId, messageId) {
-  const key = String(chatId || "").trim();
-  const id = String(messageId || "").trim();
-  if (!key || !id) return null;
-  const entry = orchMessageMetaByChat[key];
-  if (!entry || typeof entry !== "object") return null;
-  const hit = entry[id];
-  return hit && typeof hit === "object" ? hit : null;
+  return orchReplyContextRuntime.getMessageMetaEntry(chatId, messageId);
 }
 
-function recordMessageMeta(chatId, messageId, context = {}, { persist = true } = {}) {
-  const key = String(chatId || "").trim();
-  const idNum = Number(messageId || 0);
-  if (!key || !Number.isFinite(idNum) || idNum <= 0) return null;
-  const id = String(Math.trunc(idNum));
-  const byChat = ensureMessageMetaEntryForChat(key);
-  if (!byChat) return null;
-  const prev = byChat[id] && typeof byChat[id] === "object" ? byChat[id] : {};
-  const now = Date.now();
-  const next = { ...prev };
-
-  next.messageId = Math.trunc(idNum);
-  next.at = now;
-
-  if (Object.prototype.hasOwnProperty.call(context, "parentMessageId")) {
-    const parentNum = Number(context.parentMessageId || 0);
-    next.parentMessageId = Number.isFinite(parentNum) && parentNum > 0 ? Math.trunc(parentNum) : 0;
-  } else if (!Number.isFinite(Number(next.parentMessageId || 0))) {
-    next.parentMessageId = 0;
-  }
-
-  if (Object.prototype.hasOwnProperty.call(context, "source")) {
-    const source = String(context.source || "").trim().toLowerCase();
-    if (source) next.source = source;
-  }
-
-  if (Object.prototype.hasOwnProperty.call(context, "snippet")) {
-    const snippet = normalizeReplySnippet(context.snippet || "");
-    if (snippet) next.snippet = snippet;
-  }
-
-  if (Object.prototype.hasOwnProperty.call(context, "from")) {
-    const from = String(context.from || "").trim();
-    if (from) next.from = from;
-  }
-
-  if (Object.prototype.hasOwnProperty.call(context, "fromIsBot")) {
-    next.fromIsBot = context.fromIsBot === true;
-  }
-
-  if (Object.prototype.hasOwnProperty.call(context, "role")) {
-    const role = String(context.role || "").trim().toLowerCase();
-    if (role) next.role = role;
-  }
-
-  if (Object.prototype.hasOwnProperty.call(context, "workerId")) {
-    const workerId = String(context.workerId || "").trim();
-    if (workerId) next.workerId = workerId;
-  }
-
-  if (Object.prototype.hasOwnProperty.call(context, "taskId")) {
-    const taskIdNum = Number(context.taskId || 0);
-    if (Number.isFinite(taskIdNum) && taskIdNum > 0) {
-      next.taskId = Math.trunc(taskIdNum);
-    }
-  }
-
-  if (Object.prototype.hasOwnProperty.call(context, "sessionId")) {
-    const sessionId = String(context.sessionId || "").trim();
-    if (sessionId) next.sessionId = sessionId;
-  }
-
-  const incomingTaskLinks = normalizeTaskLinks(context.taskLinks);
-  if (incomingTaskLinks.length > 0) {
-    next.taskLinks = mergeTaskLinks(next.taskLinks, incomingTaskLinks);
-  } else if (!Array.isArray(next.taskLinks)) {
-    delete next.taskLinks;
-  }
-
-  byChat[id] = next;
-  pruneMessageMetaForChat(key);
-  if (persist) persistState();
-  return next;
+function recordMessageMeta(chatId, messageId, context = {}, options = {}) {
+  return orchReplyContextRuntime.recordMessageMeta(chatId, messageId, context, options);
 }
 
 function recordIncomingTelegramMessageMeta(msg, context = {}) {
-  const chatId = String(msg?.chat?.id || "").trim();
-  const messageId = Number(msg?.message_id || 0);
-  if (!chatId || !Number.isFinite(messageId) || messageId <= 0) return null;
-
-  const summary = summarizeTelegramMessageForReplyContext(msg);
-  const fallbackSource = summary?.source ? `user-${String(summary.source || "").trim().toLowerCase()}` : "user-message";
-  const source = Object.prototype.hasOwnProperty.call(context, "source")
-    ? String(context.source || "").trim().toLowerCase()
-    : fallbackSource;
-  const snippet = Object.prototype.hasOwnProperty.call(context, "snippet")
-    ? String(context.snippet || "")
-    : String(summary?.snippet || "");
-  const parentMessageId = Number(msg?.reply_to_message?.message_id || 0);
-  const from = senderLabel(msg);
-  const fromIsBot = msg?.from?.is_bot === true;
-
-  return recordMessageMeta(
-    chatId,
-    messageId,
-    {
-      parentMessageId: Number.isFinite(parentMessageId) && parentMessageId > 0 ? Math.trunc(parentMessageId) : 0,
-      source,
-      snippet,
-      from,
-      fromIsBot,
-      role: fromIsBot ? "assistant" : "user",
-      workerId: context.workerId,
-      taskId: context.taskId,
-      sessionId: context.sessionId,
-      taskLinks: context.taskLinks,
-    },
-    { persist: true },
-  );
-}
-
-function allocateOrchTaskId() {
-  const next = Number(orchNextTaskNum || 1);
-  const id = Number.isFinite(next) && next > 0 ? Math.trunc(next) : 1;
-  orchNextTaskNum = id + 1;
-  return id;
+  return orchReplyContextRuntime.recordIncomingTelegramMessageMeta(msg, context);
 }
 
 function createOrchTask(chatId, context = {}) {
-  const key = String(chatId || "").trim();
-  if (!key) return 0;
-  const byChat = ensureTaskEntryForChat(key);
-  if (!byChat) return 0;
-
-  const taskId = allocateOrchTaskId();
-  const now = Date.now();
-  const workerId = String(context.workerId || "").trim();
-  const prompt = String(context.prompt || "").trim();
-  const source = String(context.source || "").trim().toLowerCase() || "message";
-  const splitGroupId = String(context.splitGroupId || "").trim();
-  const originMessageIdNum = Number(context.originMessageId || 0);
-  const originMessageId = Number.isFinite(originMessageIdNum) && originMessageIdNum > 0 ? Math.trunc(originMessageIdNum) : 0;
-  const replyToMessageIdNum = Number(context.replyToMessageId || 0);
-  const replyToMessageId = Number.isFinite(replyToMessageIdNum) && replyToMessageIdNum > 0 ? Math.trunc(replyToMessageIdNum) : 0;
-
-  const entry = {
-    id: taskId,
-    status: "queued",
-    workerId,
-    source,
-    prompt: normalizeReplySnippet(prompt),
-    createdAt: now,
-    updatedAt: now,
-    startedAt: 0,
-    completedAt: 0,
-    success: null,
-    sessionId: "",
-    outputSnippet: "",
-    outputMessageIds: [],
-    originMessageId,
-    replyToMessageId,
-  };
-  if (splitGroupId) entry.splitGroupId = splitGroupId;
-  byChat[String(taskId)] = entry;
-  pruneTasksForChat(key);
-  persistState();
-  return taskId;
+  return orchTaskRuntime.createOrchTask(chatId, context);
 }
 
 function updateOrchTask(chatId, taskId, patch = {}, { persist = true } = {}) {
-  const key = String(chatId || "").trim();
-  const taskNum = Number(taskId || 0);
-  if (!key || !Number.isFinite(taskNum) || taskNum <= 0) return null;
-  const byChat = ensureTaskEntryForChat(key);
-  if (!byChat) return null;
-  const idKey = String(Math.trunc(taskNum));
-  const prev = byChat[idKey] && typeof byChat[idKey] === "object"
-    ? byChat[idKey]
-    : { id: Math.trunc(taskNum), createdAt: Date.now() };
-  const now = Date.now();
-  const next = { ...prev, updatedAt: now };
-
-  if (Object.prototype.hasOwnProperty.call(patch, "status")) {
-    const status = String(patch.status || "").trim().toLowerCase();
-    if (status) next.status = status;
-  }
-  if (Object.prototype.hasOwnProperty.call(patch, "workerId")) {
-    const workerId = String(patch.workerId || "").trim();
-    if (workerId) next.workerId = workerId;
-  }
-  if (Object.prototype.hasOwnProperty.call(patch, "startedAt")) {
-    const startedAt = Number(patch.startedAt || 0);
-    next.startedAt = Number.isFinite(startedAt) && startedAt > 0 ? Math.trunc(startedAt) : 0;
-  }
-  if (Object.prototype.hasOwnProperty.call(patch, "completedAt")) {
-    const completedAt = Number(patch.completedAt || 0);
-    next.completedAt = Number.isFinite(completedAt) && completedAt > 0 ? Math.trunc(completedAt) : 0;
-  }
-  if (Object.prototype.hasOwnProperty.call(patch, "success")) {
-    next.success = patch.success === null ? null : patch.success === true;
-  }
-  if (Object.prototype.hasOwnProperty.call(patch, "sessionId")) {
-    const sessionId = String(patch.sessionId || "").trim();
-    next.sessionId = sessionId;
-  }
-  if (Object.prototype.hasOwnProperty.call(patch, "outputSnippet")) {
-    next.outputSnippet = normalizeReplySnippet(String(patch.outputSnippet || ""));
-  }
-  if (Object.prototype.hasOwnProperty.call(patch, "outputMessageIds")) {
-    const ids = Array.isArray(patch.outputMessageIds)
-      ? patch.outputMessageIds
-          .map((x) => Number(x || 0))
-          .filter((x) => Number.isFinite(x) && x > 0)
-          .map((x) => Math.trunc(x))
-      : [];
-    next.outputMessageIds = [...new Set(ids)];
-  }
-  if (Object.prototype.hasOwnProperty.call(patch, "error")) {
-    const err = String(patch.error || "").trim();
-    next.error = err;
-  }
-
-  byChat[idKey] = next;
-  pruneTasksForChat(key);
-  if (persist) persistState();
-  return next;
+  return orchTaskRuntime.updateOrchTask(chatId, taskId, patch, { persist });
 }
 
 function markOrchTaskRunning(job) {
-  const taskId = Number(job?.taskId || 0);
-  if (!Number.isFinite(taskId) || taskId <= 0) return;
-  updateOrchTask(
-    String(job?.chatId || ""),
-    taskId,
-    {
-      status: "running",
-      workerId: String(job?.workerId || "").trim(),
-      startedAt: Date.now(),
-    },
-    { persist: true },
-  );
+  orchTaskRuntime.markOrchTaskRunning(job);
 }
 
 function markOrchTaskCompleted(job, result, context = {}) {
-  const taskId = Number(job?.taskId || 0);
-  if (!Number.isFinite(taskId) || taskId <= 0) return;
-  const ok = Boolean(result?.ok);
-  const sessionId = String(context.sessionId || result?.sessionId || "").trim();
-  const messageIds = Array.isArray(context.outputMessageIds) ? context.outputMessageIds : [];
-  const outputText = String(result?.afterText || result?.text || "").trim();
-  updateOrchTask(
-    String(job?.chatId || ""),
-    taskId,
-    {
-      status: ok ? "completed" : "failed",
-      workerId: String(job?.workerId || "").trim(),
-      completedAt: Date.now(),
-      success: ok,
-      sessionId,
-      outputSnippet: outputText,
-      outputMessageIds: messageIds,
-      error: ok ? "" : String(result?.text || "").trim(),
-    },
-    { persist: true },
-  );
+  orchTaskRuntime.markOrchTaskCompleted(job, result, context);
 }
 
 function getLane(laneId) {
-  const key = String(laneId || "").trim();
-  if (!key) return null;
-  return lanes.get(key) || null;
+  return orchLaneRegistryRuntime.getLane(laneId);
 }
 
 function makeLane({ id, type, title, workdir, countTowardCap = false } = {}) {
-  const laneId = String(id || "").trim();
-  if (!laneId) throw new Error("lane id is required");
-  const lane = {
-    id: laneId,
-    type: String(type || "").trim() || "codex",
-    title: String(title || laneId).trim() || laneId,
-    workdir: String(workdir || "").trim(),
-    countTowardCap: Boolean(countTowardCap),
-    queue: [],
-    currentJob: null,
-  };
-  lanes.set(laneId, lane);
-  return lane;
+  return orchLaneRegistryRuntime.makeLane({ id, type, title, workdir, countTowardCap });
 }
 
 function listCodexWorkers() {
-  const out = [];
-  for (const [id, w] of Object.entries(orchWorkers || {})) {
-    if (!w || typeof w !== "object") continue;
-    const wid = String(id || "").trim();
-    if (!wid) continue;
-    out.push({
-      id: wid,
-      kind: String(w.kind || "").trim() || "repo",
-      name: normalizeWorkerDisplayName(w.name),
-      title: String(w.title || wid).trim() || wid,
-      workdir: String(w.workdir || "").trim(),
-      createdAt: Number(w.createdAt || 0) || 0,
-      lastUsedAt: Number(w.lastUsedAt || 0) || 0,
-    });
-  }
-  out.sort((a, b) => (b.lastUsedAt || 0) - (a.lastUsedAt || 0));
-  return out;
+  return orchWorkerRuntime.listCodexWorkers();
 }
 
 function getCodexWorker(workerId) {
-  const wid = String(workerId || "").trim();
-  if (!wid) return null;
-  const w = orchWorkers[wid];
-  if (!w || typeof w !== "object") return null;
-  return {
-    id: wid,
-    kind: String(w.kind || "").trim() || "repo",
-    name: normalizeWorkerDisplayName(w.name),
-    title: String(w.title || wid).trim() || wid,
-    workdir: String(w.workdir || "").trim(),
-    createdAt: Number(w.createdAt || 0) || 0,
-    lastUsedAt: Number(w.lastUsedAt || 0) || 0,
-  };
+  return orchWorkerRuntime.getCodexWorker(workerId);
 }
 
 function touchWorker(workerId) {
-  const wid = String(workerId || "").trim();
-  if (!wid) return;
-  const w = orchWorkers[wid];
-  if (!w || typeof w !== "object") return;
-  w.lastUsedAt = Date.now();
-  persistState();
+  orchWorkerRuntime.touchWorker(workerId);
 }
 
 function normalizePathKey(inputPath) {
-  const raw = String(inputPath || "").trim();
-  if (!raw) return "";
-  try {
-    // Use forward slashes + lowercase so Windows paths compare reliably.
-    return path.resolve(raw).replace(/\\/g, "/").toLowerCase();
-  } catch {
-    return raw.replace(/\\/g, "/").toLowerCase();
-  }
+  return orchWorkerRuntime.normalizePathKey(inputPath);
 }
 
 function resolveWorkdirInput(inputPath) {
-  const raw = String(inputPath || "").trim();
-  if (!raw) return "";
-  try {
-    return path.resolve(raw);
-  } catch {
-    return raw;
-  }
+  return orchWorkerRuntime.resolveWorkdirInput(inputPath);
 }
 
 function findWorkerByWorkdir(workdir) {
-  const key = normalizePathKey(workdir);
-  if (!key) return "";
-  for (const w of listCodexWorkers()) {
-    const wk = normalizePathKey(w.workdir);
-    if (wk && wk === key) return w.id;
-  }
-  return "";
+  return orchWorkerRuntime.findWorkerByWorkdir(workdir);
 }
 
 function createRepoWorker(workdir, title = "") {
-  const resolved = resolveWorkdirInput(workdir);
-  if (!resolved) throw new Error("workdir is required");
-  if (!fs.existsSync(resolved)) throw new Error(`workdir does not exist: ${resolved}`);
-
-  const existing = findWorkerByWorkdir(resolved);
-  if (existing) return existing;
-
-  const now = Date.now();
-  const baseTitle = String(title || "").trim() || path.basename(resolved) || "Repo";
-  const usedNameKeys = collectUsedWorkerNameKeys(orchWorkers);
-  const workerName = chooseAvailableWorkerName(usedNameKeys);
-
-  let id = "";
-  for (let attempt = 0; attempt < 2000; attempt += 1) {
-    const candidate = `w${orchNextWorkerNum++}`;
-    if (!orchWorkers[candidate]) {
-      id = candidate;
-      break;
-    }
-  }
-  if (!id) throw new Error("Failed to allocate worker id");
-
-  orchWorkers[id] = {
-    id,
-    kind: "repo",
-    name: workerName,
-    title: baseTitle,
-    workdir: resolved,
-    createdAt: now,
-    lastUsedAt: now,
-  };
-  persistState();
-  ensureWorkerLane(id);
-  return id;
+  return orchWorkerRuntime.createRepoWorker(workdir, title);
 }
 
 function retireWorker(workerId, { cancelActive = true } = {}) {
-  const wid = String(workerId || "").trim();
-  if (!wid) throw new Error("worker id is required");
-  if (wid === ORCH_GENERAL_WORKER_ID) throw new Error("Cannot retire the general worker");
-  if (!orchWorkers[wid]) throw new Error(`Unknown worker: ${wid}`);
-
-  const lane = getLane(wid);
-  if (lane) {
-    try {
-      if (cancelActive && lane.currentJob) {
-        const job = lane.currentJob;
-        job.cancelRequested = true;
-        try {
-          if (job.abortController instanceof AbortController) {
-            job.abortController.abort();
-          }
-        } catch {
-          // best effort
-        }
-        if (job.process) {
-          terminateChildTree(job.process, { forceAfterMs: 2000 });
-        }
-      }
-      if (Array.isArray(lane.queue)) lane.queue = [];
-    } catch {
-      // best effort
-    }
-    lanes.delete(wid);
-  }
-
-  delete orchWorkers[wid];
-
-  // If any chat had this as active worker, fall back to general.
-  for (const [chatKey, cur] of Object.entries(orchActiveWorkerByChat || {})) {
-    if (String(cur || "").trim() === wid) {
-      orchActiveWorkerByChat[chatKey] = ORCH_GENERAL_WORKER_ID;
-    }
-  }
-
-  // Drop sessions for this worker.
-  for (const [chatKey, entry] of Object.entries(orchSessionByChatWorker || {})) {
-    if (!entry || typeof entry !== "object") continue;
-    if (!(wid in entry)) continue;
-    const next = { ...entry };
-    delete next[wid];
-    orchSessionByChatWorker[chatKey] = next;
-  }
-
-  // Drop reply-route entries for this worker.
-  for (const [chatKey, entry] of Object.entries(orchReplyRouteByChat || {})) {
-    if (!entry || typeof entry !== "object") continue;
-    let changed = false;
-    const next = {};
-    for (const [msgId, v] of Object.entries(entry)) {
-      const vw = String(v?.workerId || "").trim();
-      if (vw && vw === wid) {
-        changed = true;
-        continue;
-      }
-      next[msgId] = v;
-    }
-    if (changed) {
-      orchReplyRouteByChat[chatKey] = next;
-    }
-  }
-
-  persistState();
+  orchWorkerRuntime.retireWorker(workerId, { cancelActive });
 }
 
 function resolveWorkerIdFromUserInput(input) {
-  const raw = String(input || "").trim();
-  if (!raw) return "";
-  if (orchWorkers[raw]) return raw;
-
-  const lower = raw.toLowerCase();
-  const workers = listCodexWorkers();
-
-  // Exact title match.
-  for (const w of workers) {
-    if (String(w.title || "").trim().toLowerCase() === lower) return w.id;
-  }
-
-  // Exact worker name match.
-  for (const w of workers) {
-    if (String(w.name || "").trim().toLowerCase() === lower) return w.id;
-  }
-
-  // Basename match (repo folder name).
-  for (const w of workers) {
-    const base = String(path.basename(String(w.workdir || "")) || "").trim().toLowerCase();
-    if (base && base === lower) return w.id;
-  }
-
-  // Substring match (first).
-  for (const w of workers) {
-    const name = String(w.name || "").trim().toLowerCase();
-    const title = String(w.title || "").trim().toLowerCase();
-    const dir = String(w.workdir || "").trim().toLowerCase();
-    if ((name && name.includes(lower)) || (title && title.includes(lower)) || (dir && dir.includes(lower))) return w.id;
-  }
-
-  return "";
+  return orchWorkerRuntime.resolveWorkerIdFromUserInput(input);
 }
 
 function ensureTtsLane() {
-  let lane = getLane(ORCH_TTS_LANE_ID);
-  if (lane) return lane;
-  lane = makeLane({
-    id: ORCH_TTS_LANE_ID,
-    type: "tts",
-    title: "TTS",
-    workdir: ROOT,
-    countTowardCap: false,
-  });
-  return lane;
+  return orchLaneRegistryRuntime.ensureTtsLane();
 }
 
 function ensureWhisperLane() {
-  let lane = getLane(ORCH_WHISPER_LANE_ID);
-  if (lane) return lane;
-  lane = makeLane({
-    id: ORCH_WHISPER_LANE_ID,
-    type: "whisper",
-    title: "Whisper",
-    workdir: ROOT,
-    countTowardCap: false,
-  });
-  return lane;
+  return orchLaneRegistryRuntime.ensureWhisperLane();
 }
 
 function resolveFallbackWorkdir() {
-  if (CODEX_WORKDIR && fs.existsSync(CODEX_WORKDIR)) return CODEX_WORKDIR;
-  return ROOT;
+  return orchLaneRegistryRuntime.resolveFallbackWorkdir();
 }
 
 function resolveUsableWorkdir(preferredWorkdir) {
-  const preferred = String(preferredWorkdir || "").trim();
-  if (preferred && fs.existsSync(preferred)) return preferred;
-  return resolveFallbackWorkdir();
+  return orchLaneRegistryRuntime.resolveUsableWorkdir(preferredWorkdir);
 }
 
 function refreshLaneWorkdir(lane, { logPrefix = "" } = {}) {
-  if (!lane || typeof lane !== "object") return resolveFallbackWorkdir();
-  const current = String(lane.workdir || "").trim();
-  if (current && fs.existsSync(current)) return current;
-  const worker = getCodexWorker(String(lane.id || "").trim());
-  const next = resolveUsableWorkdir(worker?.workdir || current);
-  lane.workdir = next;
-  if (current !== next) {
-    const prefix = String(logPrefix || "").trim();
-    log(
-      `${prefix ? `${prefix} ` : ""}worker ${String(lane.id || "").trim() || "unknown"} workdir unavailable: ${current || "(empty)"}; using ${next}.`,
-    );
-  }
-  return next;
+  return orchLaneRegistryRuntime.refreshLaneWorkdir(lane, { logPrefix });
 }
 
 function ensureWorkerLane(workerId) {
-  const wid = String(workerId || "").trim();
-  if (!wid) return null;
-  const existing = getLane(wid);
-  if (existing) {
-    refreshLaneWorkdir(existing, { logPrefix: "[orch]" });
-    return existing;
-  }
-  const w = getCodexWorker(wid);
-  if (!w) return null;
-  const workdir = resolveUsableWorkdir(w.workdir);
-  return makeLane({
-    id: wid,
-    type: "codex",
-    title: String(w.name || w.title || wid).trim() || wid,
-    workdir,
-    countTowardCap: true,
-  });
+  return orchLaneRegistryRuntime.ensureWorkerLane(workerId);
 }
 
 function initOrchLanes() {
-  ensureTtsLane();
-  ensureWhisperLane();
-  // Convenience: ensure the bot's own repo has a dedicated worker when possible.
-  try {
-    const isRepo = fs.existsSync(path.join(ROOT, ".git"));
-    const hasWorker = Boolean(findWorkerByWorkdir(ROOT));
-    if (isRepo && !hasWorker && listCodexWorkers().length < ORCH_MAX_CODEX_WORKERS) {
-      createRepoWorker(ROOT, path.basename(ROOT) || "Bot Repo");
-    }
-  } catch {
-    // best effort
-  }
-  // Ensure lanes exist for all known workers (including the general worker).
-  for (const w of listCodexWorkers()) {
-    ensureWorkerLane(w.id);
-  }
-  // Enforce the cap at startup (best-effort): keep most recently used workers + general.
-  const all = listCodexWorkers();
-  const keep = [];
-  for (const w of all) {
-    if (w.id === ORCH_GENERAL_WORKER_ID) keep.push(w);
-  }
-  for (const w of all) {
-    if (w.id === ORCH_GENERAL_WORKER_ID) continue;
-    if (keep.length >= ORCH_MAX_CODEX_WORKERS) break;
-    keep.push(w);
-  }
-  const keepIds = new Set(keep.map((w) => w.id));
-  for (const w of all) {
-    if (keepIds.has(w.id)) continue;
-    delete orchWorkers[w.id];
-    lanes.delete(w.id);
-  }
-  if (all.length !== keep.length) {
-    persistState();
-  }
+  orchLaneRegistryRuntime.initOrchLanes();
 }
 
+const orchQueueRuntime = createOrchQueueRuntime({
+  lanes,
+  fs,
+  RESTART_REASON_PATH,
+  RESTART_EXIT_CODE,
+  getPendingRestartRequest: () => pendingRestartRequest,
+  setPendingRestartRequest: (value) => {
+    pendingRestartRequest = value;
+  },
+  getShuttingDown: () => shuttingDown,
+  getRestartTriggerInFlight: () => restartTriggerInFlight,
+  setRestartTriggerInFlight: (value) => {
+    restartTriggerInFlight = Boolean(value);
+  },
+  sendMessage,
+  logSystemEvent,
+  shutdown,
+  updateOrchTask,
+  persistState,
+  fmtBold,
+  normalizeTtsPresetName,
+  getCodexWorker,
+  terminateChildTree,
+});
+
+const orchLaneRuntime = createOrchLaneRuntime({
+  path,
+  OUT_DIR,
+  ORCH_GENERAL_WORKER_ID,
+  MAX_QUEUE_SIZE,
+  TELEGRAM_CHAT_ACTION_ENABLED,
+  TELEGRAM_CHAT_ACTION_DEFAULT,
+  TELEGRAM_CHAT_ACTION_VOICE,
+  TELEGRAM_CHAT_ACTION_INTERVAL_SEC,
+  PROGRESS_UPDATES_ENABLED,
+  PROGRESS_INCLUDE_STDERR,
+  PROGRESS_FIRST_UPDATE_SEC,
+  PROGRESS_UPDATE_INTERVAL_SEC,
+  TTS_REPLY_TO_VOICE,
+  TTS_ENABLED,
+  WORLDMONITOR_ALERT_VOICE_ENABLED,
+  WORLDMONITOR_CHECK_VOICE_ENABLED,
+  takeNextJobId: () => nextJobId++,
+  getShuttingDown: () => shuttingDown,
+  sendMessage,
+  sendChatAction,
+  log,
+  redactError,
+  getActiveWorkerForChat,
+  setActiveWorkerForChat,
+  ensureWorkerLane,
+  ensureTtsLane,
+  totalQueuedJobs,
+  touchWorker,
+  refreshLaneWorkdir,
+  normalizePrompt,
+  getActiveSessionForChat,
+  createOrchTask,
+  normalizeTtsText,
+  resolveTtsPresetForChat,
+  getLane,
+  markOrchTaskRunning,
+  runRawCodexJob,
+  runTtsJob,
+  runTtsBatchJob,
+  runWhisperJob,
+  runCodexJob,
+  setSessionForChatWorker,
+  rememberOrchFailureLesson,
+  getSessionForChatWorker,
+  extractAttachDirectives,
+  injectForcedTextOnlySection,
+  splitVoiceReplyParts,
+  makeSpeakableTextForTts,
+  makeWorldMonitorTextTtsFriendly,
+  makeWorldMonitorCheckVoiceSummary,
+  splitSpeakableTextIntoVoiceChunks,
+  extractNonSpeakableInfo,
+  normalizeResponse,
+  sendAttachments,
+  markOrchTaskCompleted,
+  maybeTriggerPendingRestart,
+  truncateLine,
+  isProgressNoiseLine,
+});
+
+const orchRouterRuntime = createOrchRouterRuntime({
+  fs,
+  path,
+  OUT_DIR,
+  ROOT,
+  CODEX_WORKDIR,
+  ORCH_GENERAL_WORKER_ID,
+  ORCH_MAX_CODEX_WORKERS,
+  ORCH_ROUTER_ENABLED,
+  ORCH_ROUTER_MAX_CONCURRENCY,
+  ORCH_ROUTER_TIMEOUT_MS,
+  ORCH_ROUTER_MODEL,
+  ORCH_ROUTER_REASONING_EFFORT,
+  ORCH_SPLIT_ENABLED,
+  ORCH_SPLIT_MAX_TASKS,
+  MAX_QUEUE_SIZE,
+  ORCH_DELEGATION_ACK_ENABLED,
+  ORCH_DELEGATION_ACK_SILENT,
+  orchPendingSpawnByChat,
+  listCodexWorkers,
+  getCodexWorker,
+  hasWorker: (workerId) => {
+    const wid = String(workerId || "").trim();
+    return Boolean(wid && orchWorkers[wid]);
+  },
+  getActiveWorkerForChat,
+  ensureWorkerLane,
+  getLane,
+  runCodexJob,
+  createRepoWorker,
+  resolveWorkdirInput,
+  findWorkerByWorkdir,
+  createOrchTask,
+  getSessionForChatWorker,
+  totalQueuedJobs,
+  enqueuePrompt,
+  sendMessage,
+  log,
+  redactError,
+  normalizeReplySnippet,
+  recordReplyRoute,
+});
+
 function totalQueuedJobs() {
-  let n = 0;
-  for (const lane of lanes.values()) {
-    n += Array.isArray(lane?.queue) ? lane.queue.length : 0;
-  }
-  return n;
+  return orchQueueRuntime.totalQueuedJobs();
 }
 
 function listActiveJobs() {
-  const out = [];
-  for (const lane of lanes.values()) {
-    if (lane && lane.currentJob) out.push({ laneId: lane.id, job: lane.currentJob });
-  }
-  return out;
+  return orchQueueRuntime.listActiveJobs();
 }
 
 function laneWorkloadCounts() {
-  let active = 0;
-  let queued = 0;
-  for (const lane of lanes.values()) {
-    if (!lane) continue;
-    if (lane.currentJob) active += 1;
-    queued += Array.isArray(lane.queue) ? lane.queue.length : 0;
-  }
-  return { active, queued };
+  return orchQueueRuntime.laneWorkloadCounts();
 }
 
 function hasPendingRestartRequest() {
-  return Boolean(pendingRestartRequest && pendingRestartRequest.chatIds instanceof Set);
+  return orchQueueRuntime.hasPendingRestartRequest();
 }
 
 function cancelPendingRestartRequest() {
-  const hadPending = hasPendingRestartRequest();
-  pendingRestartRequest = null;
-  return hadPending;
-}
-
-function ensurePendingRestartRequest(chatId = "") {
-  if (!hasPendingRestartRequest()) {
-    pendingRestartRequest = {
-      requestedAt: Date.now(),
-      chatIds: new Set(),
-    };
-  }
-  const key = String(chatId || "").trim();
-  if (key) pendingRestartRequest.chatIds.add(key);
-}
-
-function listRestartNotifyChats() {
-  if (!hasPendingRestartRequest()) return [];
-  return [...pendingRestartRequest.chatIds].map((x) => String(x || "").trim()).filter(Boolean);
-}
-
-function normalizeRestartReasonTag(reason = "") {
-  const raw = String(reason || "").trim().toLowerCase();
-  if (!raw || raw === "idle") return "manual_idle";
-  if (raw === "forced") return "manual_forced";
-  return raw.replace(/[^a-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "") || "manual_other";
-}
-
-function persistRestartReason(reasonTag = "") {
-  const tag = String(reasonTag || "").trim();
-  if (!tag) return;
-  try {
-    fs.writeFileSync(RESTART_REASON_PATH, `${tag}\n`, "utf8");
-  } catch {
-    // best effort
-  }
+  return orchQueueRuntime.cancelPendingRestartRequest();
 }
 
 async function triggerRestartNow(reason = "") {
-  if (shuttingDown || restartTriggerInFlight) return false;
-  restartTriggerInFlight = true;
-  const notifyChats = listRestartNotifyChats();
-  pendingRestartRequest = null;
-  const restartReasonTag = normalizeRestartReasonTag(reason);
-  const counts = laneWorkloadCounts();
-  persistRestartReason(restartReasonTag);
-  logSystemEvent(
-    `Restart requested (reason=${restartReasonTag}, active=${counts.active}, queued=${counts.queued}, notify_chats=${notifyChats.length}).`,
-    "restart",
-  );
-  const normalizedReason = String(reason || "").trim().toLowerCase();
-  let text = "Restart confirmed. Restarting bot now...";
-  if (normalizedReason === "forced") {
-    text = "Force restart confirmed. Restarting bot now...";
-  } else if (normalizedReason === "job completion") {
-    text = "Task completed. Restart confirmed. Restarting bot now...";
-  } else if (normalizedReason === "idle" || !normalizedReason) {
-    text = "All workers are finished. Restart confirmed. Restarting bot now...";
-  } else {
-    text = `All workers are finished (${reason}). Restart confirmed. Restarting bot now...`;
-  }
-  for (const chatId of notifyChats) {
-    try {
-      await sendMessage(chatId, text);
-    } catch {
-      // best effort
-    }
-  }
-  setTimeout(() => {
-    void shutdown(RESTART_EXIT_CODE, `restart:${restartReasonTag}`);
-  }, 200);
-  return true;
+  return await orchQueueRuntime.triggerRestartNow(reason);
 }
 
 async function maybeTriggerPendingRestart(reason = "") {
-  if (!hasPendingRestartRequest()) return false;
-  if (shuttingDown || restartTriggerInFlight) return false;
-  const { active, queued } = laneWorkloadCounts();
-  if (active > 0 || queued > 0) return false;
-  return await triggerRestartNow(reason);
+  return await orchQueueRuntime.maybeTriggerPendingRestart(reason);
 }
 
 async function requestRestartWhenIdle(chatId, { forceNow = false } = {}) {
-  const key = String(chatId || "").trim();
-  if (shuttingDown || restartTriggerInFlight) {
-    if (key) await sendMessage(key, "Restart is already in progress.");
-    return;
-  }
-
-  const { active, queued } = laneWorkloadCounts();
-  if (active > 0 || queued > 0) {
-    cancelPendingRestartRequest();
-    if (key) {
-      await sendMessage(
-        key,
-        `Restart blocked. Workers are still busy (active=${active}, queued=${queued}). Try again when everything is idle.`,
-      );
-    }
-    return;
-  }
-
-  ensurePendingRestartRequest(key);
-  await triggerRestartNow(forceNow ? "forced" : "idle");
+  return await orchQueueRuntime.requestRestartWhenIdle(chatId, { forceNow });
 }
 
 function listActiveJobsForChat(chatId) {
-  const key = String(chatId || "").trim();
-  if (!key) return [];
-  return listActiveJobs().filter((x) => String(x?.job?.chatId || "") === key);
+  return orchQueueRuntime.listActiveJobsForChat(chatId);
 }
 
 function listQueuedJobsForChat(chatId) {
-  const key = String(chatId || "").trim();
-  if (!key) return [];
-  const out = [];
-  for (const lane of lanes.values()) {
-    if (!lane || !Array.isArray(lane.queue) || lane.queue.length === 0) continue;
-    for (const job of lane.queue) {
-      if (String(job?.chatId || "") !== key) continue;
-      out.push({ laneId: lane.id, job });
-    }
-  }
-  out.sort((a, b) => Number(a.job?.id || 0) - Number(b.job?.id || 0));
-  return out;
+  return orchQueueRuntime.listQueuedJobsForChat(chatId);
 }
 
 function dropQueuedJobsForChat(chatId) {
-  const key = String(chatId || "").trim();
-  if (!key) return 0;
-  let removed = 0;
-  const removedJobs = [];
-  for (const lane of lanes.values()) {
-    if (!lane || !Array.isArray(lane.queue) || lane.queue.length === 0) continue;
-    const kept = [];
-    for (const j of lane.queue) {
-      if (String(j?.chatId || "") !== key) {
-        kept.push(j);
-        continue;
-      }
-      removed += 1;
-      removedJobs.push(j);
-    }
-    lane.queue = kept;
-  }
-  let changedTasks = 0;
-  for (const job of removedJobs) {
-    const taskId = Number(job?.taskId || 0);
-    if (!Number.isFinite(taskId) || taskId <= 0) continue;
-    updateOrchTask(key, taskId, {
-      status: "canceled",
-      completedAt: Date.now(),
-      success: false,
-      error: "Canceled while queued.",
-    }, { persist: false });
-    changedTasks += 1;
-  }
-  if (changedTasks > 0) {
-    persistState();
-  }
-  return removed;
+  return orchQueueRuntime.dropQueuedJobsForChat(chatId);
 }
 
 function normalizeReplySnippet(text) {
@@ -3354,1065 +2462,68 @@ function normalizeReplySnippet(text) {
 }
 
 function lookupReplyRouteEntry(chatId, messageId) {
-  const chatKey = String(chatId || "").trim();
-  const msgKey = String(messageId || "").trim();
-  if (!chatKey || !msgKey) return null;
-  const entry = orchReplyRouteByChat[chatKey];
-  if (!entry || typeof entry !== "object") return null;
-  const hit = entry[msgKey];
-  if (!hit || typeof hit !== "object") return null;
-
-  const workerId = String(hit.workerId || "").trim();
-  const source = String(hit.source || "").trim();
-  const snippet = normalizeReplySnippet(hit.snippet || "");
-  const sessionId = String(hit.sessionId || "").trim();
-  const taskId = Number(hit.taskId || 0);
-  const taskLinks = normalizeTaskLinks(hit.taskLinks);
-  const at = Number(hit.at || 0);
-  return {
-    workerId,
-    source,
-    snippet,
-    sessionId,
-    taskId: Number.isFinite(taskId) && taskId > 0 ? Math.trunc(taskId) : 0,
-    taskLinks,
-    at: Number.isFinite(at) && at > 0 ? at : 0,
-  };
+  return orchReplyContextRuntime.lookupReplyRouteEntry(chatId, messageId);
 }
 
 function summarizeTelegramMessageForReplyContext(msg) {
-  const text = String(msg?.text || "").trim();
-  if (text) {
-    return { source: "text", snippet: text };
-  }
-
-  const caption = String(msg?.caption || "").trim();
-  const photo = Array.isArray(msg?.photo) && msg.photo.length > 0;
-  const imageDoc = Boolean(msg?.document && String(msg.document.mime_type || "").toLowerCase().startsWith("image/"));
-  if (photo || imageDoc) {
-    const fileName = String(msg?.document?.file_name || "").trim();
-    const lead = photo ? "[image]" : `[image document${fileName ? `: ${fileName}` : ""}]`;
-    return { source: "image", snippet: caption ? `${lead}\n${caption}` : lead };
-  }
-
-  const voice = msg?.voice || null;
-  if (voice && typeof voice === "object") {
-    const sec = Number(voice.duration || 0);
-    const lead = sec > 0 ? `[voice ${Math.round(sec)}s]` : "[voice]";
-    return { source: "voice", snippet: caption ? `${lead}\n${caption}` : lead };
-  }
-
-  const audio = msg?.audio || null;
-  if (audio && typeof audio === "object") {
-    const sec = Number(audio.duration || 0);
-    const title = String(audio.title || "").trim();
-    const performer = String(audio.performer || "").trim();
-    const label = [performer, title].filter(Boolean).join(" - ");
-    const lead = sec > 0
-      ? `[audio ${Math.round(sec)}s${label ? `: ${label}` : ""}]`
-      : `[audio${label ? `: ${label}` : ""}]`;
-    return { source: "audio", snippet: caption ? `${lead}\n${caption}` : lead };
-  }
-
-  const doc = msg?.document || null;
-  if (doc && typeof doc === "object") {
-    const fileName = String(doc.file_name || "").trim();
-    const mime = String(doc.mime_type || "").trim();
-    const lead = `[document${fileName ? `: ${fileName}` : mime ? `: ${mime}` : ""}]`;
-    return { source: "document", snippet: caption ? `${lead}\n${caption}` : lead };
-  }
-
-  const sticker = msg?.sticker || null;
-  if (sticker && typeof sticker === "object") {
-    const emoji = String(sticker.emoji || "").trim();
-    return { source: "sticker", snippet: emoji ? `[sticker ${emoji}]` : "[sticker]" };
-  }
-
-  const contact = msg?.contact || null;
-  if (contact && typeof contact === "object") {
-    const name = [String(contact.first_name || "").trim(), String(contact.last_name || "").trim()].filter(Boolean).join(" ").trim();
-    return { source: "contact", snippet: name ? `[contact: ${name}]` : "[contact]" };
-  }
-
-  const location = msg?.location || null;
-  if (location && typeof location === "object") {
-    return { source: "location", snippet: "[location]" };
-  }
-
-  return { source: "message", snippet: "[non-text message]" };
+  return orchReplyContextRuntime.summarizeTelegramMessageForReplyContext(msg);
 }
 
 function isImageRelatedReplyContext(replyContext) {
-  const source = String(replyContext?.source || "").trim().toLowerCase();
-  if (!source) return false;
-  return (
-    source === "image" ||
-    source === "bot-photo" ||
-    source === "user-image" ||
-    source === "user-image-caption" ||
-    source === "image-caption" ||
-    source === "image-followup" ||
-    source === "image-saved" ||
-    source === "ask-image" ||
-    source === "see-screenshot"
-  );
+  return orchReplyContextRuntime.isImageRelatedReplyContext(replyContext);
 }
 
 function buildReplyContextFromIncomingMessage(msg) {
-  const chatId = String(msg?.chat?.id || "").trim();
-  const reply = msg?.reply_to_message;
-  if (!chatId || !reply || typeof reply !== "object") return null;
-
-  const messageId = Number(reply.message_id || 0);
-  if (!Number.isFinite(messageId) || messageId <= 0) return null;
-
-  const storedRoute = lookupReplyRouteEntry(chatId, messageId);
-  const storedMeta = getMessageMetaEntry(chatId, messageId);
-  const workerCandidate = String(
-    (storedRoute && storedRoute.workerId) ||
-      (storedMeta && storedMeta.workerId) ||
-      "",
-  ).trim();
-  const workerId = workerCandidate && orchWorkers[workerCandidate]
-    ? workerCandidate
-    : "";
-  const summary = summarizeTelegramMessageForReplyContext(reply);
-  const snippet = normalizeReplySnippet(
-    (storedRoute && storedRoute.snippet) ||
-      (storedMeta && storedMeta.snippet) ||
-      summary.snippet ||
-      "",
-  );
-  const source = String(
-    (storedRoute && storedRoute.source) ||
-      (storedMeta && storedMeta.source) ||
-      summary.source ||
-      "message",
-  ).trim().toLowerCase() || "message";
-  const from = String((storedMeta && storedMeta.from) || senderLabel(reply)).trim();
-  const fromIsBot = storedMeta
-    ? storedMeta.fromIsBot === true
-    : reply?.from?.is_bot === true;
-  const taskId = Number((storedRoute && storedRoute.taskId) || (storedMeta && storedMeta.taskId) || 0);
-  const sessionId = String(
-    (storedRoute && storedRoute.sessionId) ||
-      (storedMeta && storedMeta.sessionId) ||
-      "",
-  ).trim();
-  const taskLinks = mergeTaskLinks(
-    normalizeTaskLinks(storedRoute?.taskLinks),
-    normalizeTaskLinks(storedMeta?.taskLinks),
-  );
-
-  return {
-    messageId,
-    workerId,
-    source,
-    snippet,
-    from,
-    fromIsBot,
-    at: Number((storedRoute && storedRoute.at) || (storedMeta && storedMeta.at) || 0),
-    taskId,
-    sessionId,
-    taskLinks: mergeTaskLinks(
-      taskLinks,
-      normalizeTaskLinks([
-        {
-          taskId,
-          workerId,
-          sessionId,
-        },
-      ]),
-    ),
-  };
+  return orchReplyContextRuntime.buildReplyContextFromIncomingMessage(msg);
 }
 
 function trimContextBlock(text, maxChars, truncatedLead = "[...older context truncated]") {
-  const src = String(text || "").trim();
-  const lim = Number(maxChars || 0);
-  if (!src || !Number.isFinite(lim) || lim <= 0 || src.length <= lim) return src;
-  const budget = Math.max(40, lim - truncatedLead.length - 1);
-  return `${truncatedLead}\n${src.slice(src.length - budget).trimStart()}`.trim();
+  return orchReplyContextRuntime.trimContextBlock(text, maxChars, truncatedLead);
 }
 
 function formatMessageContextLine(item) {
-  const messageId = Number(item?.messageId || 0);
-  const idLabel = Number.isFinite(messageId) && messageId > 0 ? `#${Math.trunc(messageId)}` : "#?";
-  const from = String(item?.from || "").trim() || "unknown";
-  const source = String(item?.source || "").trim() || "message";
-  const snippet = normalizeReplySnippet(item?.snippet || "") || "[no content]";
-  const role = String(item?.role || "").trim().toLowerCase();
-  const roleLabel = role === "assistant" || role === "bot"
-    ? "assistant"
-    : role === "user"
-      ? "user"
-      : item?.fromIsBot === true
-        ? "assistant"
-        : "user";
-  return `- ${idLabel} ${roleLabel} ${from} (${source}): ${snippet}`;
+  return orchReplyContextRuntime.formatMessageContextLine(item);
 }
 
 function buildReplyThreadContextFromIncomingMessage(msg) {
-  const chatId = String(msg?.chat?.id || "").trim();
-  const reply = msg?.reply_to_message;
-  if (!chatId || !reply || typeof reply !== "object") return null;
-
-  const maxDepth = Math.max(1, ORCH_THREAD_CONTEXT_MAX_DEPTH);
-  const visited = new Set();
-  const chain = [];
-  let cursorMsg = reply;
-  let cursorId = Number(reply?.message_id || 0);
-  let depth = 0;
-
-  while (depth < maxDepth) {
-    if (!Number.isFinite(cursorId) || cursorId <= 0) break;
-    const id = Math.trunc(cursorId);
-    if (visited.has(id)) break;
-    visited.add(id);
-
-    const stored = getMessageMetaEntry(chatId, id);
-    const summary = cursorMsg ? summarizeTelegramMessageForReplyContext(cursorMsg) : null;
-    const source = String((stored && stored.source) || (summary && summary.source) || "message").trim().toLowerCase() || "message";
-    const snippet = normalizeReplySnippet((stored && stored.snippet) || (summary && summary.snippet) || "") || "[no content]";
-    const from = String((stored && stored.from) || (cursorMsg ? senderLabel(cursorMsg) : "") || "unknown").trim() || "unknown";
-    const fromIsBot = stored
-      ? stored.fromIsBot === true
-      : cursorMsg?.from?.is_bot === true;
-    const role = String(stored?.role || "").trim().toLowerCase() || (fromIsBot ? "assistant" : "user");
-    const taskLinks = mergeTaskLinks(
-      normalizeTaskLinks(stored?.taskLinks),
-      normalizeTaskLinks([
-        {
-          taskId: Number(stored?.taskId || 0),
-          workerId: String(stored?.workerId || "").trim(),
-          sessionId: String(stored?.sessionId || "").trim(),
-        },
-      ]),
-    );
-
-    let parentMessageId = 0;
-    const directParent = Number(cursorMsg?.reply_to_message?.message_id || 0);
-    if (Number.isFinite(directParent) && directParent > 0) {
-      parentMessageId = Math.trunc(directParent);
-    } else {
-      const storedParent = Number(stored?.parentMessageId || 0);
-      parentMessageId = Number.isFinite(storedParent) && storedParent > 0 ? Math.trunc(storedParent) : 0;
-    }
-
-    chain.push({
-      messageId: id,
-      parentMessageId,
-      source,
-      snippet,
-      from,
-      fromIsBot,
-      role,
-      taskLinks,
-    });
-
-    if (cursorMsg?.reply_to_message && typeof cursorMsg.reply_to_message === "object") {
-      cursorMsg = cursorMsg.reply_to_message;
-      const nextId = Number(cursorMsg?.message_id || 0);
-      cursorId = Number.isFinite(nextId) && nextId > 0 ? Math.trunc(nextId) : parentMessageId;
-    } else {
-      cursorMsg = null;
-      cursorId = parentMessageId;
-    }
-    depth += 1;
-  }
-
-  if (chain.length === 0) return null;
-  const ordered = [...chain].reverse();
-  const lines = ordered.map((x) => formatMessageContextLine(x));
-  const text = trimContextBlock(lines.join("\n"), ORCH_THREAD_CONTEXT_MAX_CHARS);
-  const allTaskLinks = normalizeTaskLinks(ordered.flatMap((x) => x.taskLinks || []));
-  return {
-    depth: ordered.length,
-    items: ordered,
-    text,
-    taskLinks: allTaskLinks,
-    messageIds: ordered.map((x) => Number(x.messageId || 0)).filter((x) => Number.isFinite(x) && x > 0),
-  };
+  return orchReplyContextRuntime.buildReplyThreadContextFromIncomingMessage(msg);
 }
 
 function buildRecentHistoryContext(chatId, { excludeMessageIds = [], limit = ORCH_RECENT_CONTEXT_MESSAGES } = {}) {
-  const key = String(chatId || "").trim();
-  if (!key) return null;
-  const maxRows = Math.max(0, Number(limit || 0));
-  if (maxRows <= 0) return null;
-  const byChat = orchMessageMetaByChat[key];
-  if (!byChat || typeof byChat !== "object") return null;
-  const exclude = new Set(
-    (Array.isArray(excludeMessageIds) ? excludeMessageIds : [])
-      .map((x) => Number(x || 0))
-      .filter((x) => Number.isFinite(x) && x > 0)
-      .map((x) => Math.trunc(x)),
-  );
-
-  const rows = Object.values(byChat)
-    .filter((x) => x && typeof x === "object")
-    .filter((x) => {
-      const id = Number(x.messageId || 0);
-      if (!Number.isFinite(id) || id <= 0) return false;
-      return !exclude.has(Math.trunc(id));
-    })
-    .sort((a, b) => Number(a?.at || 0) - Number(b?.at || 0));
-  if (rows.length === 0) return null;
-
-  const tail = rows.slice(Math.max(0, rows.length - maxRows));
-  const items = tail.map((x) => ({
-    messageId: Number(x.messageId || 0),
-    parentMessageId: Number(x.parentMessageId || 0),
-    source: String(x.source || "").trim().toLowerCase() || "message",
-    snippet: normalizeReplySnippet(x.snippet || "") || "[no content]",
-    from: String(x.from || "").trim() || "unknown",
-    fromIsBot: x.fromIsBot === true,
-    role: String(x.role || "").trim().toLowerCase() || (x.fromIsBot === true ? "assistant" : "user"),
-  }));
-  const lines = items.map((x) => formatMessageContextLine(x));
-  const text = trimContextBlock(lines.join("\n"), ORCH_RECENT_CONTEXT_MAX_CHARS, "[...older recent history truncated]");
-  return {
-    items,
-    text,
-    count: items.length,
-  };
+  return orchReplyContextRuntime.buildRecentHistoryContext(chatId, { excludeMessageIds, limit });
 }
 
 function recordReplyRoute(chatId, messageId, workerId, context = {}) {
-  const chatKey = String(chatId || "").trim();
-  const msgKey = String(messageId || "").trim();
-  const wid = String(workerId || "").trim();
-  if (!chatKey || !msgKey || !wid) return;
-  if (!orchWorkers[wid]) return;
-
-  const prev = orchReplyRouteByChat[chatKey] && typeof orchReplyRouteByChat[chatKey] === "object"
-    ? orchReplyRouteByChat[chatKey]
-    : {};
-  const current = prev[msgKey] && typeof prev[msgKey] === "object" ? prev[msgKey] : {};
-  const sourceRaw = Object.prototype.hasOwnProperty.call(context, "source") ? context.source : current.source;
-  const snippetRaw = Object.prototype.hasOwnProperty.call(context, "snippet") ? context.snippet : current.snippet;
-  const taskIdRaw = Object.prototype.hasOwnProperty.call(context, "taskId") ? context.taskId : current.taskId;
-  const sessionIdRaw = Object.prototype.hasOwnProperty.call(context, "sessionId") ? context.sessionId : current.sessionId;
-  const taskLinksRaw = Object.prototype.hasOwnProperty.call(context, "taskLinks") ? context.taskLinks : current.taskLinks;
-
-  const source = String(sourceRaw || "").trim().toLowerCase();
-  const snippet = normalizeReplySnippet(snippetRaw || "");
-  const taskId = Number(taskIdRaw || 0);
-  const sessionId = String(sessionIdRaw || "").trim();
-  const mergedTaskLinks = mergeTaskLinks(
-    normalizeTaskLinks(taskLinksRaw),
-    normalizeTaskLinks([
-      {
-        taskId: Number.isFinite(taskId) && taskId > 0 ? Math.trunc(taskId) : 0,
-        workerId: wid,
-        sessionId,
-      },
-    ]),
-  );
-
-  const entry = {
-    workerId: wid,
-    at: Date.now(),
-  };
-  if (source) entry.source = source;
-  if (snippet) entry.snippet = snippet;
-  if (Number.isFinite(taskId) && taskId > 0) entry.taskId = Math.trunc(taskId);
-  if (sessionId) entry.sessionId = sessionId;
-  if (mergedTaskLinks.length > 0) entry.taskLinks = mergedTaskLinks;
-  prev[msgKey] = entry;
-  orchReplyRouteByChat[chatKey] = prev;
-
-  recordMessageMeta(
-    chatKey,
-    msgKey,
-    {
-      source,
-      snippet,
-      workerId: wid,
-      taskId,
-      sessionId,
-      taskLinks: mergedTaskLinks,
-    },
-    { persist: false },
-  );
-
-  // Best-effort cleanup: keep the most recent ~600 per chat and drop very old entries.
-  const entries = Object.entries(prev);
-  if (entries.length > 700) {
-    entries.sort((a, b) => Number(b[1]?.at || 0) - Number(a[1]?.at || 0));
-    const keep = new Set(entries.slice(0, 600).map((x) => x[0]));
-    const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000;
-    const next = {};
-    for (const [k, v] of entries) {
-      const at = Number(v?.at || 0);
-      if (!keep.has(k)) continue;
-      if (Number.isFinite(at) && at > 0 && at < cutoff) continue;
-      next[k] = v;
-    }
-    orchReplyRouteByChat[chatKey] = next;
-  }
-
-  persistState();
+  orchReplyContextRuntime.recordReplyRoute(chatId, messageId, workerId, context);
 }
 
 function lookupReplyRouteWorker(chatId, messageId) {
-  const hit = lookupReplyRouteEntry(chatId, messageId);
-  if (!hit) return "";
-  const wid = String(hit.workerId || "").trim();
-  return wid && orchWorkers[wid] ? wid : "";
+  return orchReplyContextRuntime.lookupReplyRouteWorker(chatId, messageId);
 }
 
-async function acquireRouterSlot() {
-  if (routerInFlight < ORCH_ROUTER_MAX_CONCURRENCY) {
-    routerInFlight += 1;
-    return;
-  }
-  await new Promise((resolve) => routerWaiters.push(resolve));
-  routerInFlight += 1;
-}
-
-function releaseRouterSlot() {
-  routerInFlight = Math.max(0, routerInFlight - 1);
-  const next = routerWaiters.shift();
-  if (typeof next === "function") next();
-}
-
-function buildRouterPrompt({
-  userText,
-  activeWorkerId,
-  replyHintWorkerId,
-  workers,
-  cap,
-  splitEnabled = false,
-  splitMaxTasks = 0,
-  replyContext = null,
-  replyThreadContext = null,
-  recentHistoryContext = null,
-}) {
-  const safeUserText = String(userText || "").trim();
-  const lines = [
-    `Max workers: ${Number(cap) || ORCH_MAX_CODEX_WORKERS}`,
-    `Active worker: ${String(activeWorkerId || "").trim() || ORCH_GENERAL_WORKER_ID}`,
-    `Split routing: ${splitEnabled ? `enabled (max tasks ${Number(splitMaxTasks) || ORCH_SPLIT_MAX_TASKS})` : "disabled"}`,
-    replyHintWorkerId ? `Reply hint worker (strong signal): ${String(replyHintWorkerId || "").trim()}` : "",
-    "",
-    "Workers:",
-  ].filter(Boolean);
-
-  for (const w of Array.isArray(workers) ? workers : []) {
-    const workdir = String(w?.workdir || "").replace(/\\/g, "/");
-    lines.push(`- ${w.id} | kind=${w.kind} | name=${String(w?.name || "").trim()} | title=${w.title} | workdir=${workdir}`);
-  }
-
-  if (replyContext && typeof replyContext === "object") {
-    const replyMessageId = Number(replyContext.messageId || 0);
-    const replySource = String(replyContext.source || "").trim();
-    const replyFrom = String(replyContext.from || "").trim();
-    const replySnippet = normalizeReplySnippet(replyContext.snippet || "");
-    lines.push("", "Reply context:");
-    if (Number.isFinite(replyMessageId) && replyMessageId > 0) {
-      lines.push(`- Replied message id: ${Math.trunc(replyMessageId)}`);
-    }
-    if (replyFrom) {
-      lines.push(`- Replied sender: ${replyFrom}${replyContext.fromIsBot === true ? " (bot)" : ""}`);
-    }
-    if (replySource) {
-      lines.push(`- Replied type: ${replySource}`);
-    }
-    if (replySnippet) {
-      lines.push("- Replied content:");
-      lines.push(replySnippet);
-    }
-  }
-
-  const threadText = String(replyThreadContext?.text || "").trim();
-  if (threadText) {
-    lines.push("", "Reply thread context (oldest -> newest):", threadText);
-  }
-
-  const recentText = String(recentHistoryContext?.text || "").trim();
-  if (recentText) {
-    lines.push("", "Recent chat context:", recentText);
-  }
-
-  lines.push("", "User message:", safeUserText);
-  return lines.join("\n");
-}
-
-function parseRouterOutput(text) {
-  const src = String(text || "").trim();
-  if (!src) return null;
-
-  let routeLine = "";
-  const lines = src.split(/\r?\n/);
-  for (const raw of lines) {
-    const line = String(raw || "").trim();
-    if (!line) continue;
-    if (/^ROUTE\s*:/i.test(line)) {
-      routeLine = line;
-      break;
-    }
-  }
-  if (!routeLine) {
-    const idx = src.toUpperCase().lastIndexOf("ROUTE:");
-    if (idx >= 0) {
-      routeLine = String(src.slice(idx).split(/\r?\n/)[0] || "").trim();
-    }
-  }
-  if (!routeLine) return null;
-
-  const after = routeLine.replace(/^ROUTE\s*:\s*/i, "").trim();
-  const start = after.indexOf("{");
-  const end = after.lastIndexOf("}");
-  if (start < 0 || end < 0 || end <= start) return null;
-  const jsonText = after.slice(start, end + 1);
-
-  let obj;
-  try {
-    obj = JSON.parse(jsonText);
-  } catch {
-    return null;
-  }
-  if (!obj || typeof obj !== "object") return null;
-
-  const decision = String(obj.decision || "").trim();
-  const workerId = String(obj.worker_id || "").trim();
-  const workdir = String(obj.workdir || "").trim();
-  const title = String(obj.title || "").trim();
-  const question = String(obj.question || "").trim();
-  const tasks = Array.isArray(obj.tasks)
-    ? obj.tasks
-      .map((item) => {
-        if (!item || typeof item !== "object") return null;
-        return {
-          workerId: String(item.worker_id || "").trim(),
-          workdir: String(item.workdir || "").trim(),
-          title: String(item.title || "").trim(),
-          prompt: String(item.prompt || "").trim(),
-        };
-      })
-      .filter(Boolean)
-    : [];
-  if (!decision) return null;
-
-  return { decision, workerId, workdir, title, question, tasks, raw: obj };
-}
-
-async function runRouterDecision(
-  chatId,
-  userText,
-  {
-    activeWorkerId = "",
-    replyHintWorkerId = "",
-    replyContext = null,
-    replyThreadContext = null,
-    recentHistoryContext = null,
-  } = {},
-) {
-  if (!ORCH_ROUTER_ENABLED) return null;
-  const workers = listCodexWorkers();
-  if (workers.length <= 1) {
-    return {
-      decision: "use",
-      workerId: ORCH_GENERAL_WORKER_ID,
-      workdir: "",
-      title: "",
-      question: "",
-      tasks: [],
-    };
-  }
-
-  const prompt = buildRouterPrompt({
-    userText,
-    activeWorkerId: String(activeWorkerId || "").trim() || getActiveWorkerForChat(chatId),
-    replyHintWorkerId: String(replyHintWorkerId || "").trim(),
-    workers,
-    cap: ORCH_MAX_CODEX_WORKERS,
-    splitEnabled: ORCH_SPLIT_ENABLED,
-    splitMaxTasks: ORCH_SPLIT_MAX_TASKS,
-    replyContext: replyContext && typeof replyContext === "object" ? replyContext : null,
-    replyThreadContext: replyThreadContext && typeof replyThreadContext === "object" ? replyThreadContext : null,
-    recentHistoryContext: recentHistoryContext && typeof recentHistoryContext === "object" ? recentHistoryContext : null,
-  });
-
-  const outputFile = path.join(OUT_DIR, `router-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
-  const job = {
-    id: routerSequence++,
-    chatId: "", // router should ignore per-chat model overrides
-    text: prompt,
-    source: "router",
-    kind: "codex",
-    workerId: ORCH_GENERAL_WORKER_ID,
-    replyStyle: "router",
-    resumeSessionId: "",
-    model: ORCH_ROUTER_MODEL,
-    reasoning: ORCH_ROUTER_REASONING_EFFORT,
-    imagePaths: [],
-    workdir: String(getCodexWorker(ORCH_GENERAL_WORKER_ID)?.workdir || CODEX_WORKDIR || ROOT).trim() || ROOT,
-    replyToMessageId: 0,
-    startedAt: Date.now(),
-    cancelRequested: false,
-    timedOut: false,
-    process: null,
-    stdoutTail: "",
-    stderrTail: "",
-    timeoutMs: ORCH_ROUTER_TIMEOUT_MS,
-    outputFile,
-  };
-
-  await acquireRouterSlot();
-  try {
-    const result = await runCodexJob(job);
-    if (!result || !result.ok) {
-      return null;
-    }
-    return parseRouterOutput(String(result.text || ""));
-  } finally {
-    releaseRouterSlot();
-    try {
-      if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile);
-    } catch {
-      // best effort
-    }
-  }
-}
-
-function buildWorkerRetireKeyboard() {
-  const candidates = listCodexWorkers().filter((w) => w.id !== ORCH_GENERAL_WORKER_ID);
-  const rows = [];
-  for (const w of candidates) {
-    const displayName = String(w.name || "").trim() || String(w.title || "").trim() || w.id;
-    const context = String(w.title || "").trim();
-    const label = context && context !== displayName ? `${displayName} (${context})` : displayName;
-    rows.push([{ text: `Retire ${w.id}: ${label}`, callback_data: `orch_retire:${w.id}` }]);
-  }
-  rows.push([{ text: "Cancel", callback_data: "orch_retire_cancel" }]);
-  return { inline_keyboard: rows };
-}
+const telegramRouteMetaRuntime = createTelegramRouteMetaRuntime({
+  recordMessageMeta,
+  recordReplyRoute,
+});
 
 function dedupeRouteAssignments(items) {
-  const out = [];
-  const seen = new Set();
-  for (const raw of Array.isArray(items) ? items : []) {
-    const workerId = String(raw?.workerId || "").trim();
-    const prompt = String(raw?.prompt || "").trim();
-    if (!workerId || !prompt) continue;
-    const key = `${workerId}\u0000${prompt}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({ workerId, prompt });
-  }
-  return out;
-}
-
-function describeWorkerForDelegation(workerId) {
-  const wid = String(workerId || "").trim();
-  if (!wid) return "";
-  const worker = getCodexWorker(wid);
-  if (!worker) return wid;
-  const name = String(worker.name || "").trim();
-  const title = String(worker.title || "").trim();
-  if (name && title && title !== name) return `${name} (${wid}, ${title})`;
-  if (name) return `${name} (${wid})`;
-  return title ? `${wid} (${title})` : wid;
+  return orchRouterRuntime.dedupeRouteAssignments(items);
 }
 
 function summarizeDelegationQueueState(assignments) {
-  const rows = dedupeRouteAssignments(assignments);
-  const laneStateByWorker = new Map();
-  let queuedCount = 0;
-
-  for (const row of rows) {
-    const wid = String(row.workerId || "").trim();
-    if (!wid) continue;
-
-    let state = laneStateByWorker.get(wid);
-    if (!state) {
-      const lane = getLane(wid) || ensureWorkerLane(wid);
-      state = {
-        busy: Boolean(lane?.currentJob),
-        queued: Array.isArray(lane?.queue) ? lane.queue.length : 0,
-      };
-    }
-
-    const willQueue = state.busy || state.queued > 0;
-    if (willQueue) {
-      queuedCount += 1;
-      state.queued += 1;
-    } else {
-      state.busy = true;
-    }
-    laneStateByWorker.set(wid, state);
-  }
-
-  const total = rows.length;
-  const inProgressCount = Math.max(0, total - queuedCount);
-  return {
-    total,
-    queuedCount,
-    inProgressCount,
-    allQueued: total > 0 && queuedCount === total,
-    allInProgress: total > 0 && queuedCount === 0,
-    mixed: total > 0 && queuedCount > 0 && inProgressCount > 0,
-  };
+  return orchRouterRuntime.summarizeDelegationQueueState(assignments);
 }
 
 function buildDelegationAckText(assignments, stateSummary = null) {
-  const rows = dedupeRouteAssignments(assignments);
-  if (rows.length === 0) return "";
-  const summary = stateSummary && typeof stateSummary === "object"
-    ? stateSummary
-    : summarizeDelegationQueueState(rows);
-  const isQueued = Boolean(summary.allQueued);
-  if (rows.length === 1) {
-    const label = describeWorkerForDelegation(rows[0].workerId);
-    return label
-      ? `Got it. I delegated this to ${label}, and it is now ${isQueued ? "in queue" : "in progress"}.`
-      : `Got it. I delegated this request, and it is now ${isQueued ? "in queue" : "in progress"}.`;
-  }
-  const labels = [];
-  const seen = new Set();
-  for (const x of rows) {
-    const label = describeWorkerForDelegation(x.workerId);
-    if (!label || seen.has(label)) continue;
-    seen.add(label);
-    labels.push(label);
-  }
-  if (summary.mixed) {
-    const lead = `Got it. I delegated this into ${rows.length} parallel tasks; ${summary.inProgressCount} are now in progress and ${summary.queuedCount} are in queue.`;
-    if (labels.length === 0) return lead;
-    return `${lead}\n- ${labels.join("\n- ")}`;
-  }
-  const stateWord = summary.allQueued ? "in queue" : "in progress";
-  if (labels.length === 0) {
-    return `Got it. I delegated this into ${rows.length} parallel tasks, and they are now ${stateWord}.`;
-  }
-  return `Got it. I delegated this into ${rows.length} parallel tasks, and they are now ${stateWord}:\n- ${labels.join("\n- ")}`;
+  return orchRouterRuntime.buildDelegationAckText(assignments, stateSummary);
 }
 
-function buildUseDecision(workerId, prompt) {
-  const wid = String(workerId || "").trim() || ORCH_GENERAL_WORKER_ID;
-  const text = String(prompt || "").trim();
-  return {
-    decision: "use",
-    assignments: [{ workerId: wid, prompt: text }],
-    question: "",
-  };
-}
-
-async function resolveRouteTask(task, { fallbackWorkerId = "", defaultPrompt = "" } = {}) {
-  const fallback = String(fallbackWorkerId || "").trim() || ORCH_GENERAL_WORKER_ID;
-  const defaultText = String(defaultPrompt || "").trim();
-  const taskPrompt = String(task?.prompt || "").trim() || defaultText;
-  const requestedWorkerId = String(task?.workerId || task?.worker_id || "").trim();
-  if (requestedWorkerId && orchWorkers[requestedWorkerId]) {
-    return buildUseDecision(requestedWorkerId, taskPrompt);
-  }
-
-  const workdirRaw = String(task?.workdir || "").trim();
-  const title = String(task?.title || "").trim();
-  if (workdirRaw) {
-    const resolved = resolveWorkdirInput(workdirRaw);
-    if (!resolved || !fs.existsSync(resolved)) {
-      return {
-        decision: "ask",
-        assignments: [],
-        workerId: "",
-        question: "I could not find that path on disk. What is the correct local path?",
-      };
-    }
-
-    const existing = findWorkerByWorkdir(resolved);
-    if (existing) {
-      return buildUseDecision(existing, taskPrompt);
-    }
-
-    const workerCount = listCodexWorkers().length;
-    if (workerCount >= ORCH_MAX_CODEX_WORKERS) {
-      return {
-        decision: "need_retire",
-        assignments: [],
-        workerId: "",
-        workdir: resolved,
-        title: title || path.basename(resolved) || "Repo",
-      };
-    }
-
-    let newId = "";
-    try {
-      newId = createRepoWorker(resolved, title);
-    } catch {
-      return {
-        decision: "ask",
-        assignments: [],
-        workerId: "",
-        question: "I could not create a new workspace for that path. Can you confirm the path and try again?",
-      };
-    }
-    return buildUseDecision(newId, taskPrompt);
-  }
-
-  return buildUseDecision(fallback, taskPrompt);
-}
-
-async function decideRoutePlanForPrompt(
-  chatId,
-  userText,
-  {
-    replyHintWorkerId = "",
-    allowSplit = true,
-    replyContext = null,
-    replyThreadContext = null,
-    recentHistoryContext = null,
-  } = {},
-) {
-  const text = String(userText || "").trim();
-  const activeWorkerId = getActiveWorkerForChat(chatId);
-  const replyHint = String(replyHintWorkerId || "").trim();
-  const fallback = replyHint && orchWorkers[replyHint] ? replyHint : activeWorkerId || ORCH_GENERAL_WORKER_ID;
-
-  const route = await runRouterDecision(chatId, text, {
-    activeWorkerId,
-    replyHintWorkerId: replyHint,
-    replyContext,
-    replyThreadContext,
-    recentHistoryContext,
-  }).catch(() => null);
-  if (!route) {
-    return buildUseDecision(fallback, text);
-  }
-
-  const decision = String(route.decision || "").trim().toLowerCase();
-  if (decision === "ask") {
-    const q = String(route.question || "").trim();
-    return {
-      decision: "ask",
-      assignments: [],
-      workerId: "",
-      question: q || "Which workspace should I use for this?",
-    };
-  }
-
-  if (decision === "use") {
-    const resolved = await resolveRouteTask(
-      { workerId: String(route.workerId || "").trim(), prompt: text },
-      { fallbackWorkerId: fallback, defaultPrompt: text },
-    );
-    return resolved;
-  }
-
-  if (decision === "spawn_repo") {
-    const workdirRaw = String(route.workdir || "").trim();
-    if (!workdirRaw) {
-      return {
-        decision: "ask",
-        assignments: [],
-        workerId: "",
-        question: "What is the local path to the repo/workspace?",
-      };
-    }
-    const resolved = await resolveRouteTask(
-      {
-        workdir: workdirRaw,
-        title: String(route.title || "").trim(),
-        prompt: text,
-      },
-      { fallbackWorkerId: fallback, defaultPrompt: text },
-    );
-    if (resolved.decision === "ask" && !resolved.question) {
-      return {
-        decision: "ask",
-        assignments: [],
-        workerId: "",
-        question: "What is the local path to the repo/workspace?",
-      };
-    }
-    return resolved;
-  }
-
-  if (decision === "split" && allowSplit && ORCH_SPLIT_ENABLED) {
-    const rawTasks = Array.isArray(route.tasks) ? route.tasks : [];
-    const limitedTasks = rawTasks.slice(0, ORCH_SPLIT_MAX_TASKS);
-    const assignments = [];
-
-    for (const task of limitedTasks) {
-      const resolved = await resolveRouteTask(task, { fallbackWorkerId: fallback, defaultPrompt: text });
-      if (resolved.decision === "ask" || resolved.decision === "need_retire") return resolved;
-      if (resolved.decision !== "use") continue;
-      for (const assignment of Array.isArray(resolved.assignments) ? resolved.assignments : []) {
-        assignments.push(assignment);
-      }
-    }
-
-    const deduped = dedupeRouteAssignments(assignments);
-    if (deduped.length >= 2) {
-      return {
-        decision: "split",
-        assignments: deduped,
-        workerId: "",
-        question: "",
-      };
-    }
-    if (deduped.length === 1) {
-      return {
-        decision: "use",
-        assignments: deduped,
-        workerId: deduped[0].workerId,
-        question: "",
-      };
-    }
-  }
-
-  // Unknown or unusable router output; fall back.
-  return buildUseDecision(fallback, text);
+async function decideRoutePlanForPrompt(chatId, userText, options = {}) {
+  return await orchRouterRuntime.decideRoutePlanForPrompt(chatId, userText, options);
 }
 
 async function routeAndEnqueuePrompt(chatId, userText, source, options = {}) {
-  const replyToMessageId = Number(options?.replyToMessageId || 0);
-  const replyHintWorkerId = String(options?.replyHintWorkerId || "").trim();
-  const replyContext = options?.replyContext && typeof options.replyContext === "object"
-    ? options.replyContext
-    : null;
-  const replyThreadContext = options?.replyThreadContext && typeof options.replyThreadContext === "object"
-    ? options.replyThreadContext
-    : null;
-  const recentHistoryContext = options?.recentHistoryContext && typeof options.recentHistoryContext === "object"
-    ? options.recentHistoryContext
-    : null;
-  const originMessageId = Number(options?.originMessageId || 0);
-  const originSource = String(options?.originSource || "").trim();
-  const originSnippet = String(options?.originSnippet || "").trim();
-  const src = String(source || "").trim().toLowerCase();
-  const allowSplit = src !== "voice" && src !== "whisper";
-  const decision = await decideRoutePlanForPrompt(chatId, userText, {
-    replyHintWorkerId,
-    allowSplit,
-    replyContext,
-    replyThreadContext,
-    recentHistoryContext,
-  });
-
-  if (decision.decision === "ask") {
-    await sendMessage(chatId, decision.question || "Which workspace should I use?", {
-      replyToMessageId,
-    });
-    return false;
-  }
-
-  if (decision.decision === "need_retire") {
-    const workdir = String(decision.workdir || "").trim();
-    const title = String(decision.title || "").trim();
-    orchPendingSpawnByChat.set(String(chatId || "").trim(), {
-      desiredWorkdir: workdir,
-      title,
-      promptText: String(userText || ""),
-      source: String(source || "").trim(),
-      options: { ...options },
-      createdAt: Date.now(),
-    });
-
-    await sendMessage(
-      chatId,
-      `Worker limit reached (${ORCH_MAX_CODEX_WORKERS}). Pick a worker to retire so I can create a new workspace for:\n- title: ${title}\n- workdir: ${String(workdir || "").replace(/\\\\/g, "/")}`,
-      {
-        replyToMessageId,
-        replyMarkup: buildWorkerRetireKeyboard(),
-      },
-    );
-    return false;
-  }
-
-  const assignmentsRaw = Array.isArray(decision.assignments) ? decision.assignments : [];
-  const assignments = dedupeRouteAssignments(assignmentsRaw);
-  if (assignments.length === 0) {
-    const fallbackWorkerId = getActiveWorkerForChat(chatId) || ORCH_GENERAL_WORKER_ID;
-    assignments.push({ workerId: fallbackWorkerId, prompt: String(userText || "").trim() });
-  }
-
-  if (MAX_QUEUE_SIZE > 0 && totalQueuedJobs() + assignments.length > MAX_QUEUE_SIZE) {
-    await sendMessage(
-      chatId,
-      `Queue is full (${MAX_QUEUE_SIZE}). Need room for ${assignments.length} job(s). Use /queue or /clear.`,
-      { replyToMessageId },
-    );
-    return false;
-  }
-
-  const splitGroupId = assignments.length > 1
-    ? `split-${Date.now()}-${Math.random().toString(36).slice(2)}`
-    : "";
-  const assignmentsWithTasks = assignments.map((assignment) => {
-    const workerId = String(assignment.workerId || "").trim();
-    const prompt = String(assignment.prompt || "").trim();
-    const taskId = createOrchTask(chatId, {
-      workerId,
-      prompt,
-      source: src || "message",
-      originMessageId,
-      replyToMessageId,
-      splitGroupId,
-    });
-    return {
-      ...assignment,
-      workerId,
-      prompt,
-      taskId,
-    };
-  });
-
-  if (Number.isFinite(originMessageId) && originMessageId > 0 && assignmentsWithTasks.length > 0) {
-    const primaryWorkerId = String(assignmentsWithTasks[0]?.workerId || "").trim();
-    const primaryTaskId = Number(assignmentsWithTasks[0]?.taskId || 0);
-    const snippet = originSnippet || String(userText || "").trim();
-    if (primaryWorkerId) {
-      recordReplyRoute(chatId, originMessageId, primaryWorkerId, {
-        source: originSource || `user-${src || "message"}`,
-        snippet,
-        taskId: Number.isFinite(primaryTaskId) && primaryTaskId > 0 ? Math.trunc(primaryTaskId) : 0,
-        taskLinks: assignmentsWithTasks.map((x) => ({
-          taskId: Number(x.taskId || 0),
-          workerId: String(x.workerId || "").trim(),
-          sessionId: String(getSessionForChatWorker(chatId, String(x.workerId || "").trim()) || "").trim(),
-        })),
-      });
-    }
-  }
-
-  if (ORCH_DELEGATION_ACK_ENABLED) {
-    const ackStateSummary = summarizeDelegationQueueState(assignmentsWithTasks);
-    const ackText = buildDelegationAckText(assignmentsWithTasks, ackStateSummary);
-    if (ackText) {
-      const ackWorkerId = assignmentsWithTasks.length === 1 ? String(assignmentsWithTasks[0].workerId || "").trim() : "";
-      try {
-        await sendMessage(chatId, ackText, {
-          replyToMessageId,
-          routeWorkerId: ackWorkerId,
-          silent: ORCH_DELEGATION_ACK_SILENT,
-        });
-      } catch (err) {
-        log(`sendMessage(delegation-ack) failed: ${redactError(err?.message || err)}`);
-      }
-    }
-  }
-
-  for (const assignment of assignmentsWithTasks) {
-    await enqueuePrompt(chatId, assignment.prompt, source, {
-      ...options,
-      replyContext,
-      replyThreadContext,
-      recentHistoryContext,
-      workerId: assignment.workerId,
-      taskId: Number(assignment.taskId || 0),
-      splitGroupId,
-      originMessageId,
-      originSource,
-      originSnippet: originSnippet || String(userText || "").trim(),
-      replyToMessageId,
-      // Don't flip active workspace when one user request fans out to multiple workers.
-      setActiveWorker: assignmentsWithTasks.length > 1 ? false : options?.setActiveWorker,
-    });
-  }
-  return true;
+  return await orchRouterRuntime.routeAndEnqueuePrompt(chatId, userText, source, options);
 }
 
 function getLastImageForChat(chatId) {
@@ -6036,27 +4147,19 @@ async function sendMessage(chatId, text, options = {}) {
         if (msg && typeof msg === "object" && msg.message_id) {
           const messageId = Number(msg.message_id || 0);
           if (Number.isFinite(messageId) && messageId > 0) {
-            recordMessageMeta(chatId, messageId, {
+            telegramRouteMetaRuntime.recordOutgoingMessage(chatId, messageId, {
               parentMessageId: previousSentMessageId,
               source: routeSource || "bot-text",
               snippet: routeSnippet || formatted.text,
               from: "bot",
               fromIsBot: true,
               role: "assistant",
-              workerId: routeWorkerId,
-              taskId: routeTaskId,
-              sessionId: routeSessionId,
-            }, { persist: !routeWorkerId });
+              routeWorkerId,
+              routeTaskId,
+              routeSessionId,
+            });
             previousSentMessageId = Math.trunc(messageId);
           }
-        }
-        if (routeWorkerId && msg && typeof msg === "object" && msg.message_id) {
-          recordReplyRoute(chatId, msg.message_id, routeWorkerId, {
-            source: routeSource || "bot-text",
-            snippet: routeSnippet || formatted.text,
-            taskId: Number.isFinite(routeTaskId) && routeTaskId > 0 ? Math.trunc(routeTaskId) : 0,
-            sessionId: routeSessionId,
-          });
         }
         logChat("out", chatId, formatted.text, { source: "telegram-send" });
         break;
@@ -6103,24 +4206,16 @@ async function sendPhoto(chatId, filePath, options = {}) {
       form.append("photo", blob, fileName);
       const msg = await telegramApiMultipart("sendPhoto", form, timeoutMs, { signal });
       if (msg && typeof msg === "object" && msg.message_id) {
-        recordMessageMeta(chatId, msg.message_id, {
+        telegramRouteMetaRuntime.recordOutgoingMessage(chatId, msg.message_id, {
           parentMessageId: Number.isFinite(replyToMessageId) && replyToMessageId > 0 ? Math.trunc(replyToMessageId) : 0,
           source: "bot-photo",
           snippet: caption || "[photo]",
           from: "bot",
           fromIsBot: true,
           role: "assistant",
-          workerId: routeWorkerId,
-          taskId: routeTaskId,
-          sessionId: routeSessionId,
-        }, { persist: !routeWorkerId });
-      }
-      if (routeWorkerId && msg && typeof msg === "object" && msg.message_id) {
-        recordReplyRoute(chatId, msg.message_id, routeWorkerId, {
-          source: "bot-photo",
-          snippet: caption || "[photo]",
-          taskId: Number.isFinite(routeTaskId) && routeTaskId > 0 ? Math.trunc(routeTaskId) : 0,
-          sessionId: routeSessionId,
+          routeWorkerId,
+          routeTaskId,
+          routeSessionId,
         });
       }
       logChat("out", chatId, caption || "[photo]", { source: "telegram-photo" });
@@ -6174,24 +4269,16 @@ async function sendVoice(chatId, filePath, options = {}) {
       form.append("voice", blob, fileName);
       const msg = await telegramApiMultipart("sendVoice", form, timeoutMs, { signal });
       if (msg && typeof msg === "object" && msg.message_id) {
-        recordMessageMeta(chatId, msg.message_id, {
+        telegramRouteMetaRuntime.recordOutgoingMessage(chatId, msg.message_id, {
           parentMessageId: Number.isFinite(replyToMessageId) && replyToMessageId > 0 ? Math.trunc(replyToMessageId) : 0,
           source: "bot-voice",
           snippet: replyContextText || caption || "[voice]",
           from: "bot",
           fromIsBot: true,
           role: "assistant",
-          workerId: routeWorkerId,
-          taskId: routeTaskId,
-          sessionId: routeSessionId,
-        }, { persist: !routeWorkerId });
-      }
-      if (routeWorkerId && msg && typeof msg === "object" && msg.message_id) {
-        recordReplyRoute(chatId, msg.message_id, routeWorkerId, {
-          source: "bot-voice",
-          snippet: replyContextText || caption || "[voice]",
-          taskId: Number.isFinite(routeTaskId) && routeTaskId > 0 ? Math.trunc(routeTaskId) : 0,
-          sessionId: routeSessionId,
+          routeWorkerId,
+          routeTaskId,
+          routeSessionId,
         });
       }
       logChat("out", chatId, caption || "[voice]", { source: "telegram-voice" });
@@ -6242,24 +4329,16 @@ async function sendDocument(chatId, filePath, options = {}) {
       form.append("document", blob, fileName);
       const msg = await telegramApiMultipart("sendDocument", form, timeoutMs, { signal });
       if (msg && typeof msg === "object" && msg.message_id) {
-        recordMessageMeta(chatId, msg.message_id, {
+        telegramRouteMetaRuntime.recordOutgoingMessage(chatId, msg.message_id, {
           parentMessageId: Number.isFinite(replyToMessageId) && replyToMessageId > 0 ? Math.trunc(replyToMessageId) : 0,
           source: "bot-document",
           snippet: caption || `[document] ${fileName}`,
           from: "bot",
           fromIsBot: true,
           role: "assistant",
-          workerId: routeWorkerId,
-          taskId: routeTaskId,
-          sessionId: routeSessionId,
-        }, { persist: !routeWorkerId });
-      }
-      if (routeWorkerId && msg && typeof msg === "object" && msg.message_id) {
-        recordReplyRoute(chatId, msg.message_id, routeWorkerId, {
-          source: "bot-document",
-          snippet: caption || `[document] ${fileName}`,
-          taskId: Number.isFinite(routeTaskId) && routeTaskId > 0 ? Math.trunc(routeTaskId) : 0,
-          sessionId: routeSessionId,
+          routeWorkerId,
+          routeTaskId,
+          routeSessionId,
         });
       }
       logChat("out", chatId, caption || `[document] ${fileName}`, { source: "telegram-document" });
@@ -7493,49 +5572,6 @@ function formatRelativeAge(timestampMs) {
   return `${day}d ago`;
 }
 
-const WORLDMONITOR_NATIVE_SEVERITY_DIRECT_TAGS = [
-  "severity",
-  "alert_level",
-  "alertlevel",
-  "threat_level",
-  "threatlevel",
-  "priority",
-  "urgency",
-];
-const WORLDMONITOR_NATIVE_SEVERITY_CATEGORY_TAGS = ["category", "subject", "label", "tag"];
-const WORLDMONITOR_NATIVE_SEVERITY_CATEGORY_ATTRS = ["term", "label", "name", "value", "severity", "priority"];
-const WORLDMONITOR_TAIWAN_KEYWORDS = [
-  "taiwan", "taipei", "taiwan strait", "strait", "pla", "prc", "beijing", "china",
-  "kinmen", "matsu", "penghu", "south china sea", "east china sea",
-];
-const WORLDMONITOR_COUNTRY_PATTERNS = Object.freeze([
-  { code: "TW", patterns: ["taiwan", "taipei", "kinmen", "matsu", "penghu"] },
-  { code: "CN", patterns: ["china", "beijing", "pla", "prc"] },
-  { code: "US", patterns: ["united states", "u.s.", "washington", "pentagon", "white house", "american"] },
-  { code: "RU", patterns: ["russia", "moscow", "kremlin"] },
-  { code: "UA", patterns: ["ukraine", "kyiv", "kiev"] },
-  { code: "IL", patterns: ["israel", "israeli", "tel aviv"] },
-  { code: "IR", patterns: ["iran", "tehran"] },
-  { code: "SY", patterns: ["syria", "damascus"] },
-  { code: "YE", patterns: ["yemen", "houthi"] },
-  { code: "KP", patterns: ["north korea", "pyongyang"] },
-  { code: "KR", patterns: ["south korea", "seoul"] },
-  { code: "JP", patterns: ["japan", "tokyo"] },
-  { code: "PH", patterns: ["philippines", "manila"] },
-  { code: "VN", patterns: ["vietnam", "hanoi"] },
-  { code: "IN", patterns: ["india", "new delhi"] },
-  { code: "PK", patterns: ["pakistan", "islamabad"] },
-  { code: "SA", patterns: ["saudi arabia", "riyadh"] },
-  { code: "AE", patterns: ["united arab emirates", "uae", "abu dhabi", "dubai"] },
-  { code: "TR", patterns: ["turkey", "ankara"] },
-  { code: "DE", patterns: ["germany", "berlin"] },
-  { code: "FR", patterns: ["france", "paris"] },
-  { code: "GB", patterns: ["united kingdom", "uk", "britain", "london"] },
-  { code: "PL", patterns: ["poland", "warsaw"] },
-  { code: "VE", patterns: ["venezuela", "caracas"] },
-  { code: "MM", patterns: ["myanmar", "burma"] },
-]);
-
 function decodeWorldMonitorXmlText(raw) {
   const text = String(raw || "");
   const withoutCdata = text.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1");
@@ -8599,97 +6635,6 @@ function pruneWorldMonitorNativeStore(nowMs = Date.now()) {
   worldMonitorNativeNewsItems.length = 0;
   worldMonitorNativeNewsItems.push(...kept);
 }
-
-const WORLDMONITOR_MARKET_SYMBOLS = Object.freeze({
-  "^GSPC": "SP500",
-  "^IXIC": "NASDAQ",
-  "^DJI": "DOW",
-  "^TWII": "TWSE",
-  "^HSI": "HANG_SENG",
-  "000001.SS": "SSE_COMPOSITE",
-  "^N225": "NIKKEI225",
-  "CL=F": "WTI_OIL",
-  "GC=F": "GOLD",
-  "DX-Y.NYB": "DOLLAR_INDEX",
-  "TWD=X": "USD_TWD",
-  "CNY=X": "USD_CNY",
-  "JPY=X": "USD_JPY",
-});
-
-const WORLDMONITOR_NATIVE_ADSB_REGION = Object.freeze({
-  lamin: 4,
-  lamax: 44,
-  lomin: 104,
-  lomax: 133,
-});
-
-const WORLDMONITOR_NATIVE_ADSB_THEATERS = Object.freeze([
-  {
-    id: "taiwan_strait",
-    name: "Taiwan Strait",
-    bounds: { north: 30, south: 18, east: 130, west: 115 },
-  },
-  {
-    id: "south_china_sea",
-    name: "South China Sea",
-    bounds: { north: 25, south: 5, east: 121, west: 105 },
-  },
-  {
-    id: "east_china_sea",
-    name: "East China Sea",
-    bounds: { north: 33, south: 24, east: 132, west: 122 },
-  },
-  {
-    id: "korean_peninsula",
-    name: "Korean Peninsula",
-    bounds: { north: 43, south: 33, east: 132, west: 124 },
-  },
-]);
-
-const WORLDMONITOR_MILITARY_CALLSIGN_PREFIXES = Object.freeze([
-  "RCH", "REACH", "MOOSE", "EVAC", "DUSTOFF", "PEDRO",
-  "DUKE", "HAVOC", "KNIFE", "WARHAWK", "VIPER", "RAGE", "FURY",
-  "SHELL", "TEXACO", "ARCO", "ESSO", "PETRO",
-  "SENTRY", "AWACS", "MAGIC", "DISCO", "DARKSTAR",
-  "COBRA", "PYTHON", "RAPTOR", "EAGLE", "HAWK", "TALON",
-  "NATO", "RAF", "USAF", "USMC", "USCG",
-  "RSAF", "UAEAF", "QAF", "KAF", "IRIAF", "IRGC", "TAF",
-  "VKS", "RUSAF", "PLAAF", "PLA", "CNV",
-]);
-
-const WORLDMONITOR_COMMERCIAL_CALLSIGN_PREFIXES = new Set([
-  "AAL", "DAL", "UAL", "SWA", "JBU", "FFT", "ACA", "WJA",
-  "BAW", "AFR", "DLH", "KLM", "AUA", "SAS", "FIN", "LOT",
-  "CPA", "SIA", "JAL", "ANA", "KAL", "EVA", "CAL", "CCA",
-]);
-
-const WORLDMONITOR_NATIVE_SERVICE_SOURCES = Object.freeze([
-  { id: "openai", name: "OpenAI", url: "https://status.openai.com/api/v2/status.json" },
-  { id: "cloudflare", name: "Cloudflare", url: "https://www.cloudflarestatus.com/api/v2/status.json" },
-  { id: "github", name: "GitHub", url: "https://www.githubstatus.com/api/v2/status.json" },
-  { id: "discord", name: "Discord", url: "https://discordstatus.com/api/v2/status.json" },
-  { id: "zoom", name: "Zoom", url: "https://www.zoomstatus.com/api/v2/status.json" },
-  { id: "twilio", name: "Twilio", url: "https://status.twilio.com/api/v2/status.json" },
-]);
-
-const WORLDMONITOR_NATIVE_MACRO_SYMBOLS = Object.freeze({
-  "BTC-USD": "BTC",
-  "QQQ": "QQQ",
-  "XLP": "XLP",
-  "JPY=X": "USD_JPY",
-});
-
-const WORLDMONITOR_NATIVE_PREDICTION_TAIWAN_PATTERN = /(taiwan|taipei|taiwan strait|formosa|china[-\s]?taiwan|south china sea|east china sea)/i;
-
-const WORLDMONITOR_NATIVE_MARITIME_REGION_PATTERNS = Object.freeze([
-  { id: "taiwan_strait", name: "Taiwan Strait", regex: /(taiwan strait|formosa strait)/i },
-  { id: "south_china_sea", name: "South China Sea", regex: /(south china sea|spratly|paracel)/i },
-  { id: "east_china_sea", name: "East China Sea", regex: /(east china sea|senkaku|diaoyu)/i },
-  { id: "red_sea", name: "Red Sea", regex: /(red sea|bab el[-\s]?mandeb|gulf of aden)/i },
-  { id: "persian_gulf", name: "Persian Gulf", regex: /(persian gulf|strait of hormuz|gulf of oman)/i },
-  { id: "suez", name: "Suez", regex: /(suez canal)/i },
-  { id: "panama", name: "Panama Canal", regex: /(panama canal)/i },
-]);
 
 function worldMonitorNonEmptyObject(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -11637,268 +9582,78 @@ function buildWorldMonitorAlertPrompt(snapshot, decision, source = "interval") {
   ].join("\n");
 }
 
+const worldMonitorPipelineRuntime = createWorldMonitorPipelineRuntime({
+  getShuttingDown: () => shuttingDown,
+  log,
+  redactError,
+  ensureWorkerLane,
+  getLane,
+  fetchWorldMonitorRiskSnapshot,
+  evaluateWorldMonitorSnapshot,
+  buildWorldMonitorSnapshotSummary,
+  evaluateWorldMonitorIntervalReportPolicy,
+  worldMonitorFeedAlertLevelRank,
+  ensureWorldMonitorWorker,
+  buildWorldMonitorAlertPrompt,
+  enqueuePrompt,
+  normalizeWorldMonitorIntervalReportCounters,
+  compactWorldMonitorCountryList,
+  nowIso,
+  formatRelativeAge,
+  fmtBold,
+  resolveWorldMonitorRegionName,
+  sendMessage,
+  runWorldMonitorNativeFeedRefresh,
+  fetchWorldMonitorFeedAlerts,
+  findWorldMonitorItemForAlert,
+  getWorldMonitorItemArticleContext,
+  isWorldMonitorAlertForwardable,
+  resolveWorldMonitorAlertBestLink,
+  translateWorldMonitorHeadlineToEnglish,
+  oneLine,
+  formatWorldMonitorFeedAlertMessage,
+  rememberWorldMonitorFeedAlertKey,
+  rememberWorldMonitorFeedAlertTitleKey,
+  persistState,
+  worldMonitorRuntime,
+  worldMonitorMonitor,
+  worldMonitorFeedAlertsRuntime,
+  worldMonitorNativeRuntime,
+  worldMonitorNativeNewsItems,
+  worldMonitorFeedAlertSentKeySet,
+  worldMonitorFeedAlertSentTitleKeySet,
+  WORLDMONITOR_MONITOR_ENABLED,
+  WORLDMONITOR_FEED_ALERTS_ENABLED,
+  WORLDMONITOR_INTERVAL_ALERT_MODE,
+  WORLDMONITOR_INTERVAL_HEADLINES_MIN_LEVEL,
+  WORLDMONITOR_FEED_ALERTS_MIN_LEVEL,
+  WORLDMONITOR_ALERT_COOLDOWN_SEC,
+  WORLDMONITOR_ALERT_CHAT_ID,
+  WORLDMONITOR_SUMMARY_MODEL,
+  WORLDMONITOR_SUMMARY_REASONING,
+  WORLDMONITOR_MIN_COUNTRY_RISK_SCORE,
+  WORLDMONITOR_MIN_GLOBAL_RISK_SCORE,
+  WORLDMONITOR_MIN_GLOBAL_DELTA,
+  WORLDMONITOR_NOTIFY_ERRORS,
+  WORLDMONITOR_MONITOR_INTERVAL_SEC,
+  WORLDMONITOR_STARTUP_DELAY_SEC,
+  WORLDMONITOR_NATIVE_STORE_MAX_AGE_DAYS,
+  WORLDMONITOR_STARTUP_CATCHUP_ENABLED,
+  WORLDMONITOR_STARTUP_CATCHUP_MIN_LOOKBACK_HOURS,
+  WORLDMONITOR_CHECK_LOOKBACK_HOURS,
+  WORLDMONITOR_NATIVE_FEED_ITEMS_PER_SOURCE,
+  WORLDMONITOR_STARTUP_CATCHUP_ITEMS_PER_SOURCE,
+  WORLDMONITOR_FEED_ALERTS_MAX_PER_CYCLE,
+  WORLDMONITOR_FEED_ALERTS_CHAT_ID,
+  WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC,
+});
+
 function getWorldMonitorWorkerLaneState(workerId) {
-  const lane = ensureWorkerLane(workerId) || getLane(workerId);
-  const busy = Boolean(lane?.currentJob);
-  const queued = Array.isArray(lane?.queue) ? lane.queue.length : 0;
-  return { busy, queued };
+  return worldMonitorPipelineRuntime.getWorldMonitorWorkerLaneState(workerId);
 }
 
 async function runWorldMonitorMonitorCycle(options = {}) {
-  const source = String(options?.source || "interval").trim().toLowerCase() || "interval";
-  const allowWhenDisabled = options?.allowWhenDisabled === true;
-  const forceAlert = options?.forceAlert === true;
-  const replyChatId = String(options?.replyChatId || "").trim();
-  const now = Date.now();
-
-  if (!WORLDMONITOR_MONITOR_ENABLED && !allowWhenDisabled) {
-    return { ok: false, skipped: "disabled" };
-  }
-  if (worldMonitorRuntime.inFlight) {
-    return { ok: false, skipped: "busy" };
-  }
-
-  worldMonitorRuntime.inFlight = true;
-  try {
-    const snapshot = await fetchWorldMonitorRiskSnapshot();
-    const decision = evaluateWorldMonitorSnapshot(snapshot, { forceAlert });
-    const summary = buildWorldMonitorSnapshotSummary(snapshot);
-
-    worldMonitorMonitor.lastRunAt = now;
-    worldMonitorMonitor.lastRunSource = source;
-    worldMonitorMonitor.lastErrorAt = 0;
-    worldMonitorMonitor.lastError = "";
-    worldMonitorMonitor.lastObservedGlobalScore = Number(snapshot.globalScore || 0);
-    worldMonitorMonitor.lastObservedFingerprint = String(decision.fingerprint || "").trim();
-    worldMonitorMonitor.lastSnapshotSummary = summary;
-    persistState();
-
-    let enqueued = false;
-    let enqueueReason = "not triggered";
-    let intervalReportPolicy = null;
-    const isIntervalSource = source === "interval";
-    const intervalMode = isIntervalSource ? WORLDMONITOR_INTERVAL_ALERT_MODE : "report";
-    const wantsHeadlines = intervalMode === "headlines" || intervalMode === "smart";
-    const wantsReport = intervalMode === "report" || intervalMode === "smart";
-
-    if (isIntervalSource && wantsReport && !forceAlert) {
-      intervalReportPolicy = evaluateWorldMonitorIntervalReportPolicy(decision, now);
-      if (intervalReportPolicy.changed) persistState();
-    }
-    const shouldProcessAlertActions = decision.shouldAlert || Boolean(intervalReportPolicy?.shouldReport);
-
-    if (shouldProcessAlertActions) {
-      const actionReasons = [];
-      const decisionReasonText = String(decision.reasons.join("; ") || "").trim();
-
-      if (intervalMode === "off") {
-        enqueueReason = "interval alerts disabled";
-        worldMonitorMonitor.lastAlertAt = Date.now();
-        worldMonitorMonitor.lastAlertReason = decisionReasonText || "interval alerts disabled";
-        worldMonitorMonitor.lastAlertFingerprint = String(decision.fingerprint || "").trim();
-        persistState();
-      } else {
-        if (wantsHeadlines && decision.shouldAlert) {
-          const levelNow = String(snapshot?.globalLevel || "unknown").trim().toLowerCase();
-          const minLevel = isIntervalSource ? WORLDMONITOR_INTERVAL_HEADLINES_MIN_LEVEL : WORLDMONITOR_FEED_ALERTS_MIN_LEVEL;
-          const minRank = worldMonitorFeedAlertLevelRank(minLevel);
-          const levelRank = worldMonitorFeedAlertLevelRank(levelNow);
-          const cooldownMs = Math.max(0, Number(WORLDMONITOR_ALERT_COOLDOWN_SEC || 0) * 1000);
-          const lastAlertAt = Number(worldMonitorMonitor.lastAlertAt || 0) || 0;
-          const inCooldown = !forceAlert && cooldownMs > 0 && lastAlertAt > 0 && (now - lastAlertAt) < cooldownMs;
-          const duplicate = !forceAlert
-            && String(worldMonitorMonitor.lastAlertFingerprint || "").trim()
-            && String(worldMonitorMonitor.lastAlertFingerprint || "").trim() === String(decision.fingerprint || "").trim();
-
-          if (!forceAlert && isIntervalSource && minRank > 1 && levelRank < minRank) {
-            actionReasons.push(`headlines gated by level (${levelNow || "unknown"} < ${minLevel})`);
-          } else if (inCooldown) {
-            actionReasons.push("headlines cooldown");
-          } else if (duplicate) {
-            actionReasons.push("headlines duplicate");
-          } else {
-            let feedRes = { ok: false, skipped: "feed alerts disabled", sent: 0, seen: 0 };
-            if (WORLDMONITOR_FEED_ALERTS_ENABLED) {
-              feedRes = await runWorldMonitorFeedAlertsCycle({
-                source: "monitor-headlines",
-                minLevel,
-              });
-            }
-            if (feedRes?.ok) {
-              const sent = Math.max(0, Number(feedRes?.sent || 0) || 0);
-              const seen = Math.max(0, Number(feedRes?.seen || 0) || 0);
-              const skipped = String(feedRes?.skipped || "").trim();
-              actionReasons.push(
-                sent > 0
-                  ? `headlines sent (${sent}/${seen}, min=${minLevel})`
-                  : (skipped ? `headlines ${skipped}` : "headlines no new"),
-              );
-            } else {
-              actionReasons.push(
-                `headlines ${String(feedRes?.skipped || feedRes?.error || "failed").trim() || "failed"}`,
-              );
-            }
-            worldMonitorMonitor.lastAlertAt = Date.now();
-            worldMonitorMonitor.lastAlertReason = decisionReasonText || "headlines forwarded";
-            worldMonitorMonitor.lastAlertFingerprint = String(decision.fingerprint || "").trim();
-            persistState();
-          }
-        }
-
-        if (wantsReport) {
-          let allowReport = true;
-          if (isIntervalSource && !forceAlert) {
-            if (!intervalReportPolicy) {
-              intervalReportPolicy = evaluateWorldMonitorIntervalReportPolicy(decision, now);
-              if (intervalReportPolicy.changed) persistState();
-            }
-            if (!intervalReportPolicy.shouldReport) {
-              allowReport = false;
-              actionReasons.push(`report ${intervalReportPolicy.reason}`);
-            }
-          }
-
-          if (allowReport) {
-            const cooldownMs = Math.max(0, Number(WORLDMONITOR_ALERT_COOLDOWN_SEC || 0) * 1000);
-            const lastAlertAt = Number(worldMonitorMonitor.lastAlertAt || 0) || 0;
-            const inCooldown = !forceAlert && !isIntervalSource && cooldownMs > 0 && lastAlertAt > 0 && (now - lastAlertAt) < cooldownMs;
-            const duplicate = !forceAlert
-              && !isIntervalSource
-              && String(worldMonitorMonitor.lastAlertFingerprint || "").trim()
-              && String(worldMonitorMonitor.lastAlertFingerprint || "").trim() === String(decision.fingerprint || "").trim();
-
-            if (inCooldown) {
-              actionReasons.push("report cooldown");
-            } else if (duplicate) {
-              actionReasons.push("report duplicate");
-            } else {
-              const workerId = ensureWorldMonitorWorker();
-              const laneState = getWorldMonitorWorkerLaneState(workerId);
-              if (laneState.busy || laneState.queued > 0) {
-                actionReasons.push(`report worker busy (queued=${laneState.queued})`);
-              } else {
-                const prompt = buildWorldMonitorAlertPrompt(snapshot, decision, source);
-                await enqueuePrompt(WORLDMONITOR_ALERT_CHAT_ID, prompt, "worldmonitor-monitor", {
-                  workerId,
-                  setActiveWorker: false,
-                  model: WORLDMONITOR_SUMMARY_MODEL,
-                  reasoning: WORLDMONITOR_SUMMARY_REASONING,
-                });
-                enqueued = true;
-                const alertAt = Date.now();
-                worldMonitorMonitor.workerId = workerId;
-                worldMonitorMonitor.lastAlertAt = alertAt;
-                worldMonitorMonitor.lastAlertReason = decisionReasonText
-                  || String(intervalReportPolicy?.reason || "interval report queued").trim();
-                worldMonitorMonitor.lastAlertFingerprint = String(decision.fingerprint || "").trim();
-                if (isIntervalSource) {
-                  const normalized = normalizeWorldMonitorIntervalReportCounters(alertAt);
-                  worldMonitorMonitor.intervalReportDayKey = normalized.dayKey || worldMonitorMonitor.intervalReportDayKey;
-                  worldMonitorMonitor.intervalReportCount = Math.max(0, Number(normalized.count || 0) || 0) + 1;
-                  worldMonitorMonitor.intervalReportLastAt = alertAt;
-                  worldMonitorMonitor.intervalReportLastReason = String(
-                    intervalReportPolicy?.reason || "interval report queued",
-                  ).trim();
-                }
-                persistState();
-                actionReasons.push(
-                  isIntervalSource
-                    ? `report enqueued (${String(intervalReportPolicy?.reason || "interval policy").trim()})`
-                    : "report enqueued",
-                );
-              }
-            }
-          }
-        }
-
-        enqueueReason = actionReasons.length > 0 ? actionReasons.join("; ") : "no actions";
-      }
-    }
-
-    if (replyChatId) {
-      const factors = Array.isArray(snapshot?.globalFactors) && snapshot.globalFactors.length > 0
-        ? snapshot.globalFactors.slice(0, 8).join(", ")
-        : "none";
-      const hotList = compactWorldMonitorCountryList(decision.hotCountries, 5) || "none";
-      const topCountries = Array.isArray(snapshot?.topCountries) ? snapshot.topCountries.slice(0, 5) : [];
-      const signedDelta = Number(decision?.globalDeltaSigned || 0);
-      const deltaText = Number(decision?.previousGlobalScore || 0) > 0
-        ? `${signedDelta >= 0 ? "+" : ""}${signedDelta.toFixed(1)} (prev ${Number(decision.previousGlobalScore || 0).toFixed(1)})`
-        : "n/a (first observation)";
-      const lines = [
-        fmtBold("WorldMonitor Check"),
-        `- source: ${source}`,
-        `- fetched: ${nowIso(snapshot.fetchedAt)} (${formatRelativeAge(snapshot.fetchedAt)})`,
-        `- source_url: ${String(snapshot.sourceUrl || "").trim() || "(unknown)"}`,
-        `- global_risk: ${Math.round(snapshot.globalScore)}/${snapshot.globalLevel}`,
-        `- delta_vs_last: ${deltaText}`,
-        `- global_factors: ${factors}`,
-        `- hot_countries(>=${WORLDMONITOR_MIN_COUNTRY_RISK_SCORE}): ${hotList}`,
-        `- thresholds: global>=${WORLDMONITOR_MIN_GLOBAL_RISK_SCORE}, country>=${WORLDMONITOR_MIN_COUNTRY_RISK_SCORE}, delta>=${WORLDMONITOR_MIN_GLOBAL_DELTA}`,
-        `- trigger: ${decision.shouldAlert ? "yes" : "no"}`,
-        `- alert_action: ${enqueued ? "queued_codex_alert" : enqueueReason}`,
-      ];
-      if (topCountries.length > 0) {
-        lines.push("- top_countries:");
-        for (let i = 0; i < topCountries.length; i += 1) {
-          const it = topCountries[i] || {};
-          const region = String(it.region || "").trim().toUpperCase();
-          const name = String(it.name || resolveWorldMonitorRegionName(region)).trim();
-          const label = !region
-            ? (name || "unknown")
-            : (name && name.toUpperCase() !== region ? `${name} (${region})` : (name || region));
-          lines.push(`  ${i + 1}. ${label}: ${Math.round(Number(it.score || 0))}`);
-        }
-      } else {
-        lines.push("- top_countries: none");
-      }
-      if (decision.reasons.length > 0) {
-        lines.push("- reasons:");
-        for (let i = 0; i < decision.reasons.length; i += 1) {
-          lines.push(`  ${i + 1}. ${decision.reasons[i]}`);
-        }
-      }
-      await sendMessage(replyChatId, lines.join("\n"));
-    }
-
-    return {
-      ok: true,
-      enqueued,
-      enqueueReason,
-      decision,
-      snapshot,
-    };
-  } catch (err) {
-    const message = String(err?.message || err || "").trim() || "worldmonitor monitor error";
-    worldMonitorMonitor.lastRunAt = now;
-    worldMonitorMonitor.lastRunSource = source;
-    worldMonitorMonitor.lastErrorAt = Date.now();
-    worldMonitorMonitor.lastError = message;
-    persistState();
-
-    if (WORLDMONITOR_NOTIFY_ERRORS) {
-      const cooldownMs = Math.max(0, Number(WORLDMONITOR_ALERT_COOLDOWN_SEC || 0) * 1000);
-      const lastNotified = Number(worldMonitorMonitor.lastNotifiedErrorAt || 0) || 0;
-      const canNotify = cooldownMs <= 0 || (Date.now() - lastNotified) >= cooldownMs;
-      if (canNotify) {
-        worldMonitorMonitor.lastNotifiedErrorAt = Date.now();
-        persistState();
-        await sendMessage(
-          WORLDMONITOR_ALERT_CHAT_ID,
-          `WorldMonitor monitor error: ${message}`,
-          { silent: true },
-        );
-      }
-    }
-
-    if (replyChatId) {
-      await sendMessage(replyChatId, `WorldMonitor check failed: ${message}`);
-    }
-
-    return { ok: false, error: message };
-  } finally {
-    worldMonitorRuntime.inFlight = false;
-  }
+  return await worldMonitorPipelineRuntime.runWorldMonitorMonitorCycle(options);
 }
 
 async function runWorldMonitorComprehensiveCheck(options = {}) {
@@ -12215,249 +9970,39 @@ async function runWorldMonitorComprehensiveCheck(options = {}) {
 }
 
 function stopWorldMonitorMonitorLoop() {
-  if (worldMonitorRuntime.timer) {
-    clearTimeout(worldMonitorRuntime.timer);
-    worldMonitorRuntime.timer = null;
-  }
+  worldMonitorPipelineRuntime.stopWorldMonitorMonitorLoop();
 }
 
 function buildWorldMonitorStartupCatchupWindow(now = Date.now()) {
-  const hardMaxHours = Math.max(24, Math.trunc(Number(WORLDMONITOR_NATIVE_STORE_MAX_AGE_DAYS || 30) * 24) || 24);
-  const configuredMinLookback = Math.max(
-    6,
-    Math.min(hardMaxHours, Number(WORLDMONITOR_STARTUP_CATCHUP_MIN_LOOKBACK_HOURS || WORLDMONITOR_CHECK_LOOKBACK_HOURS || 168)),
-  );
-  const lastSeenAt = Math.max(
-    Number(worldMonitorMonitor.nativeLastRefreshAt || 0) || 0,
-    Number(worldMonitorMonitor.feedAlertsLastSeenAt || 0) || 0,
-    Number(worldMonitorMonitor.lastRunAt || 0) || 0,
-  );
-  const downtimeHours = lastSeenAt > 0
-    ? Math.max(0, Math.ceil(Math.max(0, now - lastSeenAt) / (60 * 60 * 1000)))
-    : 0;
-  const dynamicLookback = downtimeHours > 0 ? (downtimeHours + 6) : configuredMinLookback;
-  const lookbackHours = Math.max(configuredMinLookback, Math.min(hardMaxHours, dynamicLookback));
-  return {
-    lookbackHours,
-    minPublishedAtMs: Math.max(0, now - (lookbackHours * 60 * 60 * 1000)),
-    downtimeHours,
-    lastSeenAt,
-  };
+  return worldMonitorPipelineRuntime.buildWorldMonitorStartupCatchupWindow(now);
 }
 
 async function runWorldMonitorStartupCatchup() {
-  if (!WORLDMONITOR_MONITOR_ENABLED || !WORLDMONITOR_STARTUP_CATCHUP_ENABLED) {
-    return { ok: false, skipped: "disabled" };
-  }
-  if (worldMonitorNativeRuntime.startupCatchupPromise) {
-    return worldMonitorNativeRuntime.startupCatchupPromise;
-  }
-
-  const promise = (async () => {
-    const now = Date.now();
-    const window = buildWorldMonitorStartupCatchupWindow(now);
-    const maxItemsPerSource = Math.max(
-      WORLDMONITOR_NATIVE_FEED_ITEMS_PER_SOURCE,
-      Number(WORLDMONITOR_STARTUP_CATCHUP_ITEMS_PER_SOURCE || WORLDMONITOR_NATIVE_FEED_ITEMS_PER_SOURCE) || WORLDMONITOR_NATIVE_FEED_ITEMS_PER_SOURCE,
-    );
-    const refresh = await runWorldMonitorNativeFeedRefresh({
-      force: true,
-      minPublishedAtMs: window.minPublishedAtMs,
-      maxItemsPerSource,
-    });
-    const completedAt = Date.now();
-    const compactStats = {
-      lookback_hours: window.lookbackHours,
-      downtime_hours: window.downtimeHours,
-      max_items_per_source: maxItemsPerSource,
-      refreshed_at: Number(refresh?.refreshedAt || 0) || 0,
-      duration_ms: Number(refresh?.durationMs || 0) || 0,
-      feeds_total: Math.round(Number(refresh?.stats?.feeds_total || 0) || 0),
-      feeds_ok: Math.round(Number(refresh?.stats?.feeds_ok || 0) || 0),
-      feeds_failed: Math.round(Number(refresh?.stats?.feeds_failed || 0) || 0),
-      new_items: Math.round(Number(refresh?.stats?.new_items || 0) || 0),
-      stored_items: Math.round(Number(refresh?.stats?.stored_items || worldMonitorNativeNewsItems.length) || worldMonitorNativeNewsItems.length),
-    };
-    worldMonitorMonitor.startupCatchupLastRunAt = completedAt;
-    worldMonitorMonitor.startupCatchupLastStats = compactStats;
-    if (refresh?.ok) {
-      worldMonitorMonitor.startupCatchupLastErrorAt = 0;
-      worldMonitorMonitor.startupCatchupLastError = "";
-      persistState();
-      log(
-        `WorldMonitor startup catch-up complete (lookback=${window.lookbackHours}h, downtime=${window.downtimeHours}h, per_source=${maxItemsPerSource}, new_items=${compactStats.new_items}, feeds_ok=${compactStats.feeds_ok}/${compactStats.feeds_total}).`,
-      );
-      return {
-        ok: true,
-        refreshedAt: Number(refresh?.refreshedAt || completedAt) || completedAt,
-        stats: compactStats,
-      };
-    }
-
-    const message = String(refresh?.error || "startup catch-up failed").trim() || "startup catch-up failed";
-    worldMonitorMonitor.startupCatchupLastErrorAt = completedAt;
-    worldMonitorMonitor.startupCatchupLastError = message;
-    persistState();
-    log(`WorldMonitor startup catch-up failed: ${redactError(message)}`);
-    return { ok: false, error: message, stats: compactStats };
-  })().catch((err) => {
-    const message = String(err?.message || err || "startup catch-up failed").trim() || "startup catch-up failed";
-    worldMonitorMonitor.startupCatchupLastRunAt = Date.now();
-    worldMonitorMonitor.startupCatchupLastErrorAt = Date.now();
-    worldMonitorMonitor.startupCatchupLastError = message;
-    worldMonitorMonitor.startupCatchupLastStats = {};
-    persistState();
-    log(`WorldMonitor startup catch-up failed: ${redactError(message)}`);
-    return { ok: false, error: message, stats: {} };
-  }).finally(() => {
-    worldMonitorNativeRuntime.startupCatchupPromise = null;
-  });
-
-  worldMonitorNativeRuntime.startupCatchupPromise = promise;
-  return promise;
+  return await worldMonitorPipelineRuntime.runWorldMonitorStartupCatchup();
 }
 
 function scheduleWorldMonitorMonitorLoop(delayMs) {
-  if (shuttingDown || !WORLDMONITOR_MONITOR_ENABLED) return;
-  stopWorldMonitorMonitorLoop();
-  const ms = Math.max(1_000, Number(delayMs || 0) || Number(WORLDMONITOR_MONITOR_INTERVAL_SEC) * 1000);
-  worldMonitorRuntime.timer = setTimeout(() => {
-    worldMonitorRuntime.timer = null;
-    void (async () => {
-      const res = await runWorldMonitorMonitorCycle({ source: "interval" });
-      if (!res?.ok && String(res?.error || "").trim()) {
-        log(`worldmonitor monitor cycle failed: ${redactError(res.error)}`);
-      }
-      scheduleWorldMonitorMonitorLoop(Number(WORLDMONITOR_MONITOR_INTERVAL_SEC) * 1000);
-    })();
-  }, ms);
+  worldMonitorPipelineRuntime.scheduleWorldMonitorMonitorLoop(delayMs);
 }
 
 function startWorldMonitorMonitorLoop() {
-  if (!WORLDMONITOR_MONITOR_ENABLED) return;
-  const initialDelayMs = Math.max(0, Number(WORLDMONITOR_STARTUP_DELAY_SEC || 0) * 1000);
-  scheduleWorldMonitorMonitorLoop(initialDelayMs);
+  worldMonitorPipelineRuntime.startWorldMonitorMonitorLoop();
 }
 
 async function runWorldMonitorFeedAlertsCycle(options = {}) {
-  const source = String(options?.source || "interval").trim().toLowerCase() || "interval";
-  const now = Date.now();
-  const configuredFeedMinLevel = worldMonitorFeedAlertLevelRank(WORLDMONITOR_FEED_ALERTS_MIN_LEVEL) > 1
-    ? WORLDMONITOR_FEED_ALERTS_MIN_LEVEL
-    : "critical";
-  const minLevelRaw = String(options?.minLevel || configuredFeedMinLevel || "critical")
-    .trim()
-    .toLowerCase();
-  const minLevel = worldMonitorFeedAlertLevelRank(minLevelRaw) > 1
-    ? minLevelRaw
-    : configuredFeedMinLevel;
-  const minLevelRank = worldMonitorFeedAlertLevelRank(minLevel);
-
-  if (!WORLDMONITOR_MONITOR_ENABLED || !WORLDMONITOR_FEED_ALERTS_ENABLED) {
-    return { ok: false, skipped: "disabled" };
-  }
-  if (worldMonitorFeedAlertsRuntime.inFlight) {
-    return { ok: false, skipped: "busy" };
-  }
-
-  worldMonitorFeedAlertsRuntime.inFlight = true;
-  try {
-    if (Number(worldMonitorMonitor.feedAlertsLastSeenAt || 0) <= 0) {
-      worldMonitorMonitor.feedAlertsLastSeenAt = now;
-      worldMonitorMonitor.feedAlertsLastRunAt = now;
-      worldMonitorMonitor.feedAlertsLastErrorAt = 0;
-      worldMonitorMonitor.feedAlertsLastError = "";
-      persistState();
-      return { ok: true, skipped: "warmup", sent: 0, minLevel };
-    }
-
-    const sinceMs = Number(worldMonitorMonitor.feedAlertsLastSeenAt || 0) || 0;
-    const alerts = await fetchWorldMonitorFeedAlerts({ sinceMs });
-    let sent = 0;
-    let maxSeenAt = sinceMs;
-    const maxPerCycle = Math.max(1, Number(WORLDMONITOR_FEED_ALERTS_MAX_PER_CYCLE || 1));
-
-    for (const alert of alerts) {
-      const key = String(alert?.key || "").trim();
-      const titleKey = String(alert?.titleKey || "").trim();
-      const seenAt = Number(alert?.firstSeenAt || 0) || 0;
-      if (seenAt > maxSeenAt) maxSeenAt = seenAt;
-      if (worldMonitorFeedAlertLevelRank(alert?.threatLevel) < minLevelRank) {
-        continue;
-      }
-      const item = findWorldMonitorItemForAlert(alert);
-      const ctx = getWorldMonitorItemArticleContext(item);
-      if (!isWorldMonitorAlertForwardable(alert, item, ctx)) {
-        continue;
-      }
-      if (!key || worldMonitorFeedAlertSentKeySet.has(key)) continue;
-      if (titleKey && worldMonitorFeedAlertSentTitleKeySet.has(titleKey)) continue;
-      if (sent >= maxPerCycle) break;
-      const bestLink = resolveWorldMonitorAlertBestLink(alert, item, ctx);
-      const translatedHeadline = await translateWorldMonitorHeadlineToEnglish(String(alert?.title || ""));
-      const translatedTitle = oneLine(String(translatedHeadline?.title || "")).trim();
-      const outboundAlertBase = bestLink ? { ...alert, link: bestLink } : { ...alert };
-      const outboundAlert = translatedTitle
-        ? { ...outboundAlertBase, title: translatedTitle }
-        : outboundAlertBase;
-      await sendMessage(
-        WORLDMONITOR_FEED_ALERTS_CHAT_ID,
-        formatWorldMonitorFeedAlertMessage(outboundAlert, { item, ctx }),
-      );
-      rememberWorldMonitorFeedAlertKey(key);
-      if (titleKey) rememberWorldMonitorFeedAlertTitleKey(titleKey);
-      sent += 1;
-    }
-
-    worldMonitorMonitor.feedAlertsLastSeenAt = Math.max(
-      Number(worldMonitorMonitor.feedAlertsLastSeenAt || 0) || 0,
-      maxSeenAt,
-    );
-    worldMonitorMonitor.feedAlertsLastRunAt = now;
-    worldMonitorMonitor.feedAlertsLastErrorAt = 0;
-    worldMonitorMonitor.feedAlertsLastError = "";
-    persistState();
-
-    return { ok: true, sent, seen: alerts.length, minLevel };
-  } catch (err) {
-    const message = String(err?.message || err || "").trim() || "worldmonitor feed alerts error";
-    worldMonitorMonitor.feedAlertsLastRunAt = now;
-    worldMonitorMonitor.feedAlertsLastErrorAt = Date.now();
-    worldMonitorMonitor.feedAlertsLastError = message;
-    persistState();
-    return { ok: false, error: message };
-  } finally {
-    worldMonitorFeedAlertsRuntime.inFlight = false;
-  }
+  return await worldMonitorPipelineRuntime.runWorldMonitorFeedAlertsCycle(options);
 }
 
 function stopWorldMonitorFeedAlertsLoop() {
-  if (worldMonitorFeedAlertsRuntime.timer) {
-    clearTimeout(worldMonitorFeedAlertsRuntime.timer);
-    worldMonitorFeedAlertsRuntime.timer = null;
-  }
+  worldMonitorPipelineRuntime.stopWorldMonitorFeedAlertsLoop();
 }
 
 function scheduleWorldMonitorFeedAlertsLoop(delayMs) {
-  if (shuttingDown || !WORLDMONITOR_MONITOR_ENABLED || !WORLDMONITOR_FEED_ALERTS_ENABLED) return;
-  stopWorldMonitorFeedAlertsLoop();
-  const ms = Math.max(1_000, Number(delayMs || 0) || Number(WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC) * 1000);
-  worldMonitorFeedAlertsRuntime.timer = setTimeout(() => {
-    worldMonitorFeedAlertsRuntime.timer = null;
-    void (async () => {
-      const res = await runWorldMonitorFeedAlertsCycle({ source: "interval" });
-      if (!res?.ok && String(res?.error || "").trim()) {
-        log(`worldmonitor feed-alert cycle failed: ${redactError(res.error)}`);
-      }
-      scheduleWorldMonitorFeedAlertsLoop(Number(WORLDMONITOR_FEED_ALERTS_INTERVAL_SEC) * 1000);
-    })();
-  }, ms);
+  worldMonitorPipelineRuntime.scheduleWorldMonitorFeedAlertsLoop(delayMs);
 }
 
 function startWorldMonitorFeedAlertsLoop() {
-  if (!WORLDMONITOR_MONITOR_ENABLED || !WORLDMONITOR_FEED_ALERTS_ENABLED) return;
-  const initialDelayMs = Math.max(0, Number(WORLDMONITOR_STARTUP_DELAY_SEC || 0) * 1000);
-  scheduleWorldMonitorFeedAlertsLoop(initialDelayMs);
+  worldMonitorPipelineRuntime.startWorldMonitorFeedAlertsLoop();
 }
 
 function describeOpenMeteoWeatherCode(rawCode) {
@@ -13459,43 +11004,7 @@ async function refreshVoicePresetPickerMessage(chatId, messageId) {
 }
 
 async function sendQueue(chatId) {
-  const items = listQueuedJobsForChat(chatId);
-  if (items.length === 0) {
-    await sendMessage(chatId, `${fmtBold("Queue")} is empty.`);
-    return;
-  }
-  const lines = [fmtBold("Queued prompts")];
-  for (const entry of items.slice(0, 10)) {
-    const item = entry.job;
-    const laneId = String(entry.laneId || "").trim();
-    const kind = String(item?.kind || "codex");
-    const ttsPreset = normalizeTtsPresetName(item?.ttsPreset) || "";
-    const presetTag = ttsPreset ? `:${ttsPreset}` : "";
-    let preview = "";
-    if (kind === "tts-batch") {
-      const texts = Array.isArray(item?.texts) ? item.texts : [];
-      const count = texts.length;
-      const first = String(texts[0] || "").trim();
-      const head = first.length > 70 ? `${first.slice(0, 70)}...` : first;
-      preview = `[tts-batch${presetTag} x${count || "?"}] ${head || "(empty)"}`;
-    } else {
-      const t = String(item?.text || "").trim();
-      preview = t.length > 90 ? `${t.slice(0, 90)}...` : t || "(empty)";
-      if (kind === "tts") preview = `[tts${presetTag}] ${preview}`;
-      if (kind === "raw") preview = `[raw] ${preview}`;
-    }
-    const workerId = String(item?.workerId || "").trim();
-    const worker = workerId ? getCodexWorker(workerId) : null;
-    const workerName = String(worker?.name || worker?.title || worker?.id || "").trim();
-    const label = worker
-      ? `${worker.id}:${workerName || worker.id}`
-      : laneId || "(unknown)";
-    lines.push(`- #${item.id} (${label}): ${preview}`);
-  }
-  if (items.length > 10) {
-    lines.push(`- ...and ${items.length - 10} more`);
-  }
-  await sendMessage(chatId, lines.join("\n"));
+  return await orchQueueRuntime.sendQueue(chatId);
 }
 
 async function sendResumePicker(chatId) {
@@ -13563,38 +11072,11 @@ async function sendCodexCommandMenu(chatId) {
 }
 
 async function cancelCurrent(chatId) {
-  const jobs = listActiveJobsForChat(chatId);
-  if (jobs.length === 0) {
-    await sendMessage(chatId, "No active AIDOLON run to cancel.");
-    await maybeTriggerPendingRestart("idle");
-    return;
-  }
-
-  for (const item of jobs) {
-    const job = item.job;
-    if (!job) continue;
-    job.cancelRequested = true;
-    try {
-      if (job.abortController instanceof AbortController) {
-        job.abortController.abort();
-      }
-    } catch {
-      // best effort
-    }
-    if (job.process) {
-      terminateChildTree(job.process, { forceAfterMs: 2000 });
-    }
-  }
-
-  const label = jobs.length === 1 ? `job #${jobs[0].job?.id}` : `${jobs.length} job(s)`;
-  await sendMessage(chatId, `Cancellation requested for ${label}.`);
-  await maybeTriggerPendingRestart("cancellation");
+  return await orchQueueRuntime.cancelCurrent(chatId);
 }
 
 async function clearQueue(chatId) {
-  const removed = dropQueuedJobsForChat(chatId);
-  await sendMessage(chatId, `Cleared ${removed} queued prompt(s).`);
-  await maybeTriggerPendingRestart("queue cleared");
+  return await orchQueueRuntime.clearQueue(chatId);
 }
 
 function wipeRecordError(summary, targetPath, err) {
@@ -13807,53 +11289,7 @@ async function pruneRuntime(chatId) {
 }
 
 async function enqueueRawCodexCommand(chatId, args, source = "cmd", options = {}) {
-  const tokens = Array.isArray(args) ? [...args] : [];
-  if (tokens.length === 0) {
-    await sendMessage(chatId, "No AIDOLON command to run.");
-    return;
-  }
-
-  const requestedWorkerId = String(options?.workerId || "").trim();
-  const workerId = requestedWorkerId || getActiveWorkerForChat(chatId);
-  const lane = ensureWorkerLane(workerId) || ensureWorkerLane(ORCH_GENERAL_WORKER_ID);
-  if (!lane) {
-    await sendMessage(chatId, "No available worker to run this command.");
-    return;
-  }
-
-  if (MAX_QUEUE_SIZE > 0 && totalQueuedJobs() >= MAX_QUEUE_SIZE) {
-    await sendMessage(chatId, `Queue is full (${MAX_QUEUE_SIZE}). Use /queue or /clear.`);
-    return;
-  }
-
-  if (options?.setActiveWorker !== false) {
-    setActiveWorkerForChat(chatId, lane.id);
-  }
-  touchWorker(lane.id);
-  const laneWorkdir = refreshLaneWorkdir(lane, { logPrefix: "[enqueue]" });
-
-  const job = {
-    id: nextJobId++,
-    chatId,
-    source,
-    kind: "raw",
-    workerId: lane.id,
-    rawArgs: tokens,
-    resumeSessionId: "",
-    text: "",
-    workdir: laneWorkdir,
-    replyToMessageId: Number(options?.replyToMessageId || 0),
-    startedAt: 0,
-    cancelRequested: false,
-    timedOut: false,
-    process: null,
-    stdoutTail: "",
-    stderrTail: "",
-    outputFile: "",
-  };
-
-  lane.queue.push(job);
-  void processLane(lane.id);
+  return await orchLaneRuntime.enqueueRawCodexCommand(chatId, args, source, options);
 }
 
 async function runRawCodexJob(job) {
@@ -13975,6 +11411,89 @@ function resolveResumeSessionId(token) {
   return raw;
 }
 
+let parsedCommandRouter = null;
+
+function getParsedCommandRouter() {
+  if (parsedCommandRouter) return parsedCommandRouter;
+  parsedCommandRouter = createParsedCommandRouter({
+    // Workspace / help
+    sendHelp,
+    clearAllSessionsForChat,
+    setActiveWorkerForChat,
+    ORCH_GENERAL_WORKER_ID,
+    clearLastImageForChat,
+    sendCodexCommandMenu,
+    sendStatus,
+    sendWorkers,
+    sendQueue,
+    resolveWorkerIdFromUserInput,
+    touchWorker,
+    getCodexWorker,
+    parseArgString,
+    resolveWorkdirInput,
+    pathExists: (targetPath) => fs.existsSync(targetPath),
+    findWorkerByWorkdir,
+    listCodexWorkers,
+    ORCH_MAX_CODEX_WORKERS,
+    createRepoWorker,
+    retireWorker,
+
+    // Monitor / news / weather
+    handleWeatherCommand,
+    handleNewsCommand,
+    handleNewsReportCommand,
+    sendWorldMonitorStatus,
+
+    // Runtime operations
+    cancelCurrent,
+    clearQueue,
+    pruneRuntime,
+    wipeRuntime,
+    handleScreenshotCommand,
+    sendAttachments,
+    cancelPendingRestartRequest,
+    requestRestartWhenIdle,
+
+    // Codex CLI + sessions
+    sanitizeRawCodexArgs,
+    setPendingCommandForChat,
+    createPendingCommandSummary,
+    buildPendingCommandMarkup,
+    takePendingCommandByChat,
+    enqueueRawCodexCommand,
+    clearPendingCommandForChat,
+    clearActiveSessionForChat,
+    sendResumePicker,
+    resolveResumeSessionId,
+    setActiveSessionForChat,
+    shortSessionId,
+
+    // Vision + model + TTS
+    setChatPrefs,
+    sendModelPicker,
+    VISION_ENABLED,
+    getLastImageForChat,
+    captureScreenshotsWithFallback,
+    IMAGE_DIR,
+    setLastImageForChat,
+    pathBasename: path.basename,
+    platform: process.platform,
+    handleVoicePresetCommand,
+    handleTtsAbTestCommand,
+    TTS_ENABLED,
+    parseTtsCommandInput,
+    splitSpeakableTextIntoVoiceChunks,
+    enqueueTtsBatch,
+    enqueueTts,
+
+    // Shared helpers
+    getActiveSessionForChat,
+    enqueuePrompt,
+    sendMessage,
+  });
+  return parsedCommandRouter;
+}
+
 async function handleCommand(chatId, text) {
   const parsed = parseCommand(text) || parseNaturalCommand(text);
   if (!parsed) return false;
@@ -13992,478 +11511,11 @@ async function handleCommand(chatId, text) {
 }
 
 async function handleParsedCommand(chatId, parsed) {
-  switch (parsed.cmd) {
-    case "/help":
-      await sendHelp(chatId);
-      return true;
-    case "/start":
-      // Telegram's /start should behave like "new chat": clear any active resumed session.
-      clearAllSessionsForChat(chatId);
-      setActiveWorkerForChat(chatId, ORCH_GENERAL_WORKER_ID);
-      clearLastImageForChat(chatId);
-      await sendHelp(chatId);
-      return true;
-    case "/codex":
-    case "/commands":
-      await sendCodexCommandMenu(chatId);
-      return true;
-    case "/status":
-      await sendStatus(chatId);
-      return true;
-    case "/workers":
-      await sendWorkers(chatId);
-      return true;
-    case "/use": {
-      const arg = String(parsed.arg || "").trim();
-      if (!arg) {
-        await sendMessage(chatId, "Usage: /use <worker_id, name, or title>\nTip: use /workers to list workers.");
-        return true;
-      }
-      const wid = resolveWorkerIdFromUserInput(arg);
-      if (!wid) {
-        await sendMessage(chatId, `Unknown worker: ${arg}\nUse /workers to list workers.`);
-        return true;
-      }
-      setActiveWorkerForChat(chatId, wid);
-      touchWorker(wid);
-      const worker = getCodexWorker(wid);
-      const label = worker
-        ? `${String(worker.name || worker.title || wid).trim() || wid} (${wid})`
-        : wid;
-      await sendMessage(chatId, `Active workspace set to: ${label}`);
-      return true;
-    }
-    case "/spawn": {
-      const arg = String(parsed.arg || "").trim();
-      if (!arg) {
-        await sendMessage(chatId, "Usage: /spawn <local-path> [title]\nExample: /spawn C:/path/to/repo MyRepo");
-        return true;
-      }
-      const parts = parseArgString(arg);
-      const rawPath = String(parts[0] || "").trim();
-      const title = parts.length > 1 ? parts.slice(1).join(" ").trim() : "";
-      const workdir = resolveWorkdirInput(rawPath);
-      if (!workdir || !fs.existsSync(workdir)) {
-        await sendMessage(chatId, "That path does not exist. Please send an existing local path.");
-        return true;
-      }
-      const existing = findWorkerByWorkdir(workdir);
-      if (existing) {
-        setActiveWorkerForChat(chatId, existing);
-        touchWorker(existing);
-        const worker = getCodexWorker(existing);
-        const name = String(worker?.name || worker?.title || existing).trim() || existing;
-        const titleInfo = String(worker?.title || "").trim();
-        const details = titleInfo && titleInfo !== name ? `${name} (${existing}, ${titleInfo})` : `${name} (${existing})`;
-        await sendMessage(chatId, `Using existing workspace ${details}.`);
-        return true;
-      }
-      const count = listCodexWorkers().length;
-      if (count >= ORCH_MAX_CODEX_WORKERS) {
-        await sendMessage(chatId, `Worker limit reached (${ORCH_MAX_CODEX_WORKERS}). Retire one with /retire <worker_id, name, or title> first, or use an existing worker.`);
-        return true;
-      }
-      let wid = "";
-      try {
-        wid = createRepoWorker(workdir, title);
-      } catch (err) {
-        await sendMessage(chatId, `Failed to create workspace: ${String(err?.message || err)}`);
-        return true;
-      }
-      setActiveWorkerForChat(chatId, wid);
-      touchWorker(wid);
-      {
-        const worker = getCodexWorker(wid);
-        const name = String(worker?.name || worker?.title || wid).trim() || wid;
-        const titleInfo = String(worker?.title || "").trim();
-        const details = titleInfo && titleInfo !== name ? `${name} (${wid}, ${titleInfo})` : `${name} (${wid})`;
-        await sendMessage(chatId, `Created workspace ${details}.`);
-      }
-      return true;
-    }
-    case "/retire": {
-      const arg = String(parsed.arg || "").trim();
-      if (!arg) {
-        await sendMessage(chatId, "Usage: /retire <worker_id, name, or title>\nTip: use /workers to list workers.");
-        return true;
-      }
-      const wid = resolveWorkerIdFromUserInput(arg);
-      if (!wid) {
-        await sendMessage(chatId, `Unknown worker: ${arg}\nUse /workers to list workers.`);
-        return true;
-      }
-      try {
-        retireWorker(wid);
-      } catch (err) {
-        await sendMessage(chatId, `Failed to retire worker: ${String(err?.message || err)}`);
-        return true;
-      }
-      await sendMessage(chatId, `Retired worker: ${wid}`);
-      return true;
-    }
-    case "/queue":
-      await sendQueue(chatId);
-      return true;
-    case "/weather":
-      await handleWeatherCommand(chatId, parsed.arg || "");
-      return true;
-    case "/news":
-      await handleNewsCommand(chatId, parsed.arg || "");
-      return true;
-    case "/newsreport":
-      await handleNewsReportCommand(chatId, parsed.arg || "");
-      return true;
-    case "/newsstatus":
-      await sendWorldMonitorStatus(chatId);
-      return true;
-    case "/cancel":
-    case "/stop":
-      await cancelCurrent(chatId);
-      return true;
-    case "/clear":
-      await clearQueue(chatId);
-      return true;
-    case "/prune":
-      await pruneRuntime(chatId);
-      return true;
-    case "/wipe":
-      await wipeRuntime(chatId);
-      return true;
-    case "/screenshot":
-      try {
-        await handleScreenshotCommand(chatId);
-      } catch (err) {
-        await sendMessage(chatId, `Screenshot failed: ${String(err?.message || err)}`);
-      }
-      return true;
-    case "/sendfile": {
-      const arg = String(parsed.arg || "").trim();
-      if (!arg) {
-        await sendMessage(chatId, "Usage: /sendfile <relative-path> [caption]");
-        return true;
-      }
-      const parts = parseArgString(arg);
-      const relPath = String(parts[0] || "").trim();
-      const caption = parts.length > 1 ? parts.slice(1).join(" ").trim() : "";
-      if (!relPath) {
-        await sendMessage(chatId, "Usage: /sendfile <relative-path> [caption]");
-        return true;
-      }
-      await sendAttachments(chatId, [{ path: relPath, caption }]);
-      return true;
-    }
-    case "/cmd": {
-      if (!parsed.arg) {
-        await sendMessage(chatId, "Usage: /cmd <codex command and args>\nExample: /cmd exec review --uncommitted");
-        return true;
-      }
-      let args;
-      try {
-        args = sanitizeRawCodexArgs(parsed.arg);
-      } catch (err) {
-        await sendMessage(chatId, String(err?.message || err));
-        return true;
-      }
-      if (args.length === 0) {
-        await sendMessage(chatId, "No command parsed. Example: /cmd exec review --uncommitted");
-        return true;
-      }
-      const rawLine = args.join(" ");
-      const pendingId = setPendingCommandForChat(chatId, rawLine, args);
-      await sendMessage(chatId, createPendingCommandSummary(rawLine, pendingId), {
-        replyMarkup: buildPendingCommandMarkup(pendingId),
-      });
-      return true;
-    }
-    case "/confirm":
-    case "/run": {
-      const pending = takePendingCommandByChat(chatId);
-      if (!pending) {
-        await sendMessage(chatId, "No pending command for this chat.");
-        return true;
-      }
-      await enqueueRawCodexCommand(chatId, pending.args, "cmd-confirm");
-      return true;
-    }
-    case "/reject":
-    case "/deny":
-    case "/cancelcmd": {
-      const pending = clearPendingCommandForChat(chatId);
-      if (!pending) {
-        await sendMessage(chatId, "No pending command to cancel.");
-        return true;
-      }
-      await sendMessage(chatId, `Canceled pending command:\ncodex ${pending.rawLine}`);
-      return true;
-    }
-    case "/new":
-      clearActiveSessionForChat(chatId);
-      await sendMessage(chatId, "Active resumed session cleared. New messages start fresh sessions.");
-      return true;
-    case "/resume": {
-      if (!parsed.arg) {
-        await sendResumePicker(chatId);
-        return true;
-      }
-
-      const rawArg = String(parsed.arg || "").trim();
-      if (["clear", "off", "none", "new"].includes(rawArg.toLowerCase())) {
-        clearActiveSessionForChat(chatId);
-        await sendMessage(chatId, "Active resumed session cleared.");
-        return true;
-      }
-
-      const [sessionToken, ...rest] = rawArg.split(/\s+/);
-      const sessionId = resolveResumeSessionId(sessionToken);
-      if (!sessionId) {
-        await sendMessage(chatId, "No session found. Use /resume to list recent sessions.");
-        return true;
-      }
-
-      setActiveSessionForChat(chatId, sessionId);
-      const resumePrompt = rest.join(" ").trim();
-      if (!resumePrompt) {
-        await sendMessage(
-          chatId,
-          `Active session set to ${shortSessionId(sessionId)}.\nSend your next message to continue this session.`,
-        );
-        return true;
-      }
-
-      await enqueuePrompt(chatId, resumePrompt, "resume-command", {
-        resumeSessionId: sessionId,
-      });
-      return true;
-    }
-    case "/model": {
-      const arg = String(parsed.arg || "").trim().toLowerCase();
-      if (["clear", "reset", "defaults", "default", "off", "none"].includes(arg)) {
-        setChatPrefs(chatId, { model: "", reasoning: "" });
-        await sendMessage(chatId, "Model preferences cleared for this chat (back to defaults).");
-        return true;
-      }
-      await sendModelPicker(chatId);
-      return true;
-    }
-    case "/ask": {
-      if (!VISION_ENABLED) {
-        await sendMessage(chatId, "Vision is disabled on this bot (VISION_ENABLED=0).");
-        return true;
-      }
-      const q = String(parsed.arg || "").trim();
-      if (!q) {
-        await sendMessage(chatId, "Usage: /ask <question> (analyzes your last sent image)");
-        return true;
-      }
-      const img = getLastImageForChat(chatId);
-      if (!img) {
-        await sendMessage(chatId, "No image found for this chat. Send an image first (optionally with a caption).");
-        return true;
-      }
-      const activeSession = getActiveSessionForChat(chatId);
-      await enqueuePrompt(chatId, q, "ask-image", {
-        resumeSessionId: activeSession || "",
-        imagePaths: [img.path],
-      });
-      return true;
-    }
-    case "/see": {
-      if (!VISION_ENABLED) {
-        await sendMessage(chatId, "Vision is disabled on this bot (VISION_ENABLED=0).");
-        return true;
-      }
-      const q = String(parsed.arg || "").trim();
-      if (!q) {
-        await sendMessage(chatId, "Usage: /see <question> (takes a screenshot, then analyzes it)");
-        return true;
-      }
-      if (process.platform !== "win32") {
-        await sendMessage(chatId, "Screenshot vision is only configured for Windows in this bot.");
-        return true;
-      }
-
-      const prefix = `see-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      void (async () => {
-        try {
-          const paths = await captureScreenshotsWithFallback(IMAGE_DIR, prefix);
-          // Keep the primary screenshot as the "last image" context.
-          const primaryPath = String(paths[0] || "").trim();
-          if (primaryPath) {
-            setLastImageForChat(chatId, { path: primaryPath, mime: "image/png", name: path.basename(primaryPath) });
-          }
-          const activeSession = getActiveSessionForChat(chatId);
-          await enqueuePrompt(chatId, q, "see-screenshot", {
-            resumeSessionId: activeSession || "",
-            imagePaths: paths,
-          });
-        } catch (err) {
-          await sendMessage(chatId, `Screenshot vision failed: ${String(err?.message || err)}`);
-        }
-      })();
-      return true;
-    }
-    case "/imgclear": {
-      clearLastImageForChat(chatId);
-      await sendMessage(chatId, "Cleared last image context.");
-      return true;
-    }
-    case "/voice":
-      return await handleVoicePresetCommand(chatId, parsed.arg);
-    case "/abtest":
-      return await handleTtsAbTestCommand(chatId, parsed.arg || "");
-    case "/tts": {
-      if (!TTS_ENABLED) {
-        await sendMessage(chatId, "TTS is disabled on this bot (TTS_ENABLED=0).");
-        return true;
-      }
-      const ttsInput = parseTtsCommandInput(parsed.arg || "");
-      if (!ttsInput.ok) {
-        await sendMessage(chatId, ttsInput.error || "Usage: /tts <text>");
-        return true;
-      }
-      const q = String(ttsInput.text || "").trim();
-      const presetOverride = String(ttsInput.preset || "").trim();
-      // Never truncate user input for TTS; split into as many voice notes as needed.
-      const { chunks, overflowText } = splitSpeakableTextIntoVoiceChunks(q);
-      const all = chunks.length > 0 ? chunks : [q];
-      if (overflowText) all.push(overflowText);
-      if (all.length > 1) {
-        await enqueueTtsBatch(chatId, all, "tts-command", { ttsPreset: presetOverride });
-      } else {
-        await enqueueTts(chatId, all[0], "tts-command", { ttsPreset: presetOverride });
-      }
-      return true;
-    }
-    case "/compress": {
-      const activeSession = getActiveSessionForChat(chatId);
-      if (!activeSession) {
-        await sendMessage(chatId, "No active resumed session. Use /resume first.");
-        return true;
-      }
-      const hint = String(parsed.arg || "").trim();
-      const prompt = [
-        "Compress this conversation context for efficient continuation.",
-        "Keep important decisions, constraints, and next steps.",
-        hint ? `Focus: ${hint}` : "",
-      ]
-        .filter(Boolean)
-        .join("\n");
-      await enqueuePrompt(chatId, prompt, "compress", {
-        resumeSessionId: activeSession,
-      });
-      return true;
-    }
-    case "/restart": {
-      const tokens = parseArgString(parsed.arg || "")
-        .map((x) => String(x || "").trim().toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, ""))
-        .filter(Boolean);
-      const wantsCancel = tokens.some((t) => ["cancel", "off", "stop", "abort"].includes(t));
-      if (wantsCancel) {
-        const hadPending = cancelPendingRestartRequest();
-        await sendMessage(chatId, hadPending ? "Queued restart canceled." : "No queued restart is pending.");
-        return true;
-      }
-
-      const forceNow = tokens.some((t) => ["now", "force", "immediate"].includes(t));
-      await requestRestartWhenIdle(chatId, { forceNow });
-      return true;
-    }
-    default: {
-      const activeSession = getActiveSessionForChat(chatId);
-      if (activeSession) {
-        const rawSlashPrompt = `${parsed.cmd}${parsed.arg ? ` ${parsed.arg}` : ""}`;
-        await enqueuePrompt(chatId, rawSlashPrompt, "slash-forward", {
-          resumeSessionId: activeSession,
-        });
-        return true;
-      }
-      await sendMessage(chatId, `Unknown command: ${parsed.cmd}`);
-      return true;
-    }
-  }
+  return await getParsedCommandRouter()(chatId, parsed);
 }
 
 async function enqueuePrompt(chatId, inputText, source, options = {}) {
-  const text = normalizePrompt(inputText);
-  if (!text) {
-    await sendMessage(chatId, "Empty prompt ignored.");
-    return;
-  }
-
-  const requestedWorkerId = String(options?.workerId || "").trim();
-  const workerId = requestedWorkerId || getActiveWorkerForChat(chatId);
-  const lane = ensureWorkerLane(workerId) || ensureWorkerLane(ORCH_GENERAL_WORKER_ID);
-  if (!lane) {
-    await sendMessage(chatId, "No available worker to handle this prompt.");
-    return;
-  }
-
-  if (MAX_QUEUE_SIZE > 0 && totalQueuedJobs() >= MAX_QUEUE_SIZE) {
-    await sendMessage(chatId, `Queue is full (${MAX_QUEUE_SIZE}). Use /queue or /clear.`);
-    return;
-  }
-
-  if (options?.setActiveWorker !== false) {
-    setActiveWorkerForChat(chatId, lane.id);
-  }
-  touchWorker(lane.id);
-  const laneWorkdir = refreshLaneWorkdir(lane, { logPrefix: "[enqueue]" });
-
-  const resumeSessionId = Object.prototype.hasOwnProperty.call(options || {}, "resumeSessionId")
-    ? String(options.resumeSessionId || "").trim()
-    : getActiveSessionForChat(chatId, lane.id);
-  let taskId = Number(options?.taskId || 0);
-  if (!Number.isFinite(taskId) || taskId <= 0) {
-    taskId = createOrchTask(chatId, {
-      workerId: lane.id,
-      prompt: text,
-      source: String(source || "").trim().toLowerCase(),
-      originMessageId: Number(options?.originMessageId || options?.replyToMessageId || 0),
-      replyToMessageId: Number(options?.replyToMessageId || 0),
-      splitGroupId: String(options?.splitGroupId || "").trim(),
-    });
-  }
-
-  const job = {
-    id: nextJobId++,
-    chatId,
-    text,
-    source,
-    kind: "codex",
-    workerId: lane.id,
-    replyStyle: String(options.replyStyle || "").trim(),
-    resumeSessionId,
-    model: String(options.model || "").trim(),
-    reasoning: String(options.reasoning || "").trim(),
-    imagePaths: Array.isArray(options.imagePaths)
-      ? options.imagePaths.map((p) => String(p || "").trim()).filter(Boolean)
-      : [],
-    replyContext: options?.replyContext && typeof options.replyContext === "object"
-      ? { ...options.replyContext }
-      : null,
-    replyThreadContext: options?.replyThreadContext && typeof options.replyThreadContext === "object"
-      ? { ...options.replyThreadContext }
-      : null,
-    recentHistoryContext: options?.recentHistoryContext && typeof options.recentHistoryContext === "object"
-      ? { ...options.recentHistoryContext }
-      : null,
-    workdir: laneWorkdir,
-    taskId: Number.isFinite(taskId) && taskId > 0 ? Math.trunc(taskId) : 0,
-    splitGroupId: String(options?.splitGroupId || "").trim(),
-    replyToMessageId: Number(options?.replyToMessageId || 0),
-    startedAt: 0,
-    cancelRequested: false,
-    timedOut: false,
-    process: null,
-    stdoutTail: "",
-    stderrTail: "",
-    outputFile: path.join(OUT_DIR, `codex-job-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`),
-    forcedTextOnly: String(options.forcedTextOnly || "").trim(),
-    onSuccess: typeof options.onSuccess === "function" ? options.onSuccess : null,
-  };
-
-  lane.queue.push(job);
-  void processLane(lane.id);
+  return await orchLaneRuntime.enqueuePrompt(chatId, inputText, source, options);
 }
 
 function normalizeTtsText(text) {
@@ -15549,110 +12601,12 @@ function splitSpeakableTextIntoVoiceChunks(text) {
   return { chunks: kept, overflowText };
 }
 
-function enqueueTtsLaneJob(lane, job) {
-  if (!lane || !Array.isArray(lane.queue)) return;
-  const source = String(job?.source || "").trim().toLowerCase();
-  if (source !== "voice-reply" || lane.queue.length === 0) {
-    lane.queue.push(job);
-    return;
-  }
-
-  // Prioritize auto voice replies ahead of non-voice-reply TTS jobs to improve perceived responsiveness.
-  let insertAt = lane.queue.length;
-  for (let i = 0; i < lane.queue.length; i += 1) {
-    const queuedSource = String(lane.queue[i]?.source || "").trim().toLowerCase();
-    if (queuedSource !== "voice-reply") {
-      insertAt = i;
-      break;
-    }
-  }
-  lane.queue.splice(insertAt, 0, job);
-}
-
 async function enqueueTts(chatId, inputText, source, options = {}) {
-  const text = normalizeTtsText(inputText);
-  if (!text) {
-    await sendMessage(chatId, "Empty TTS text ignored.");
-    return false;
-  }
-
-  const lane = ensureTtsLane();
-  if (MAX_QUEUE_SIZE > 0 && totalQueuedJobs() >= MAX_QUEUE_SIZE) {
-    await sendMessage(chatId, `Queue is full (${MAX_QUEUE_SIZE}). Use /queue or /clear.`);
-    return false;
-  }
-
-  const workerId = String(options?.workerId || "").trim() || getActiveWorkerForChat(chatId);
-  const ttsPreset = resolveTtsPresetForChat(chatId, options?.ttsPreset || "");
-  const job = {
-    id: nextJobId++,
-    chatId,
-    text,
-    source,
-    kind: "tts",
-    ttsPreset,
-    workerId,
-    afterText: String(options.afterText || "").trim(),
-    skipResultText: options.skipResultText === true,
-    voiceCaption: String(options.voiceCaption || "").trim(),
-    attachments: Array.isArray(options.attachments) ? options.attachments : [],
-    replyToMessageId: Number(options?.replyToMessageId || 0),
-    taskId: Number(options?.routeTaskId || 0),
-    routeSessionId: String(options?.routeSessionId || "").trim(),
-    startedAt: 0,
-    cancelRequested: false,
-    timedOut: false,
-    process: null,
-    stdoutTail: "",
-    stderrTail: "",
-  };
-
-  enqueueTtsLaneJob(lane, job);
-  void processLane(lane.id);
-  return true;
+  return await orchLaneRuntime.enqueueTts(chatId, inputText, source, options);
 }
 
 async function enqueueTtsBatch(chatId, inputTexts, source, options = {}) {
-  const raw = Array.isArray(inputTexts) ? inputTexts : [];
-  const texts = raw.map((t) => normalizeTtsText(t)).filter(Boolean);
-  if (texts.length === 0) {
-    await sendMessage(chatId, "Empty TTS text ignored.");
-    return false;
-  }
-
-  const lane = ensureTtsLane();
-  if (MAX_QUEUE_SIZE > 0 && totalQueuedJobs() >= MAX_QUEUE_SIZE) {
-    await sendMessage(chatId, `Queue is full (${MAX_QUEUE_SIZE}). Use /queue or /clear.`);
-    return false;
-  }
-
-  const workerId = String(options?.workerId || "").trim() || getActiveWorkerForChat(chatId);
-  const ttsPreset = resolveTtsPresetForChat(chatId, options?.ttsPreset || "");
-  const job = {
-    id: nextJobId++,
-    chatId,
-    texts,
-    source,
-    kind: "tts-batch",
-    ttsPreset,
-    workerId,
-    afterText: String(options.afterText || "").trim(),
-    skipResultText: options.skipResultText === true,
-    attachments: Array.isArray(options.attachments) ? options.attachments : [],
-    replyToMessageId: Number(options?.replyToMessageId || 0),
-    taskId: Number(options?.routeTaskId || 0),
-    routeSessionId: String(options?.routeSessionId || "").trim(),
-    startedAt: 0,
-    cancelRequested: false,
-    timedOut: false,
-    process: null,
-    stdoutTail: "",
-    stderrTail: "",
-  };
-
-  enqueueTtsLaneJob(lane, job);
-  void processLane(lane.id);
-  return true;
+  return await orchLaneRuntime.enqueueTtsBatch(chatId, inputTexts, source, options);
 }
 
 function resolveTtsPythonBin() {
@@ -17684,175 +14638,6 @@ function isProgressNoiseLine(line) {
   return false;
 }
 
-function pickChatActionForJob(job) {
-  const kind = String(job?.kind || "").trim().toLowerCase();
-  const source = String(job?.source || "").trim().toLowerCase();
-  if (
-    kind === "tts" ||
-    kind === "tts-batch" ||
-    source === "voice-reply" ||
-    source === "tts-batch-chunk"
-  ) {
-    return TELEGRAM_CHAT_ACTION_VOICE;
-  }
-  return TELEGRAM_CHAT_ACTION_DEFAULT;
-}
-
-function startJobChatActionKeepalive(job, lane) {
-  if (!TELEGRAM_CHAT_ACTION_ENABLED) {
-    return () => {};
-  }
-
-  const chatId = String(job?.chatId || "").trim();
-  if (!chatId) {
-    return () => {};
-  }
-
-  const action = pickChatActionForJob(job);
-  const intervalMs = Math.max(1000, Math.trunc(Number(TELEGRAM_CHAT_ACTION_INTERVAL_SEC) || 4) * 1000);
-  let stopped = false;
-  let timer = null;
-  let loggedError = false;
-
-  const tick = async () => {
-    if (stopped || shuttingDown || lane?.currentJob !== job) return;
-
-    const ok = await sendChatAction(chatId, action, { logErrors: !loggedError });
-    if (!ok) loggedError = true;
-
-    if (stopped || shuttingDown || lane?.currentJob !== job) return;
-    timer = setTimeout(() => {
-      timer = null;
-      void tick();
-    }, intervalMs);
-  };
-
-  void tick();
-
-  return () => {
-    stopped = true;
-    if (timer) {
-      clearTimeout(timer);
-      timer = null;
-    }
-  };
-}
-
-function startJobProgressUpdates(job, lane) {
-  if (!PROGRESS_UPDATES_ENABLED) {
-    return () => {};
-  }
-  // TTS jobs are intentionally noisy (model load, encode, ffmpeg). Don't stream that into Telegram.
-  if (String(job?.kind || "") === "tts" || String(job?.kind || "") === "tts-batch") {
-    return () => {};
-  }
-  // Whisper transcription is also noisy and not useful as progress messages.
-  if (String(job?.kind || "") === "whisper") {
-    return () => {};
-  }
-  // For voice-note prompts that will be answered via voice notes, avoid sending text "progress" pings.
-  // Those pings are output-driven and can leak reply markers/content into the chat.
-  if (String(job?.source || "") === "voice" && TTS_REPLY_TO_VOICE && TTS_ENABLED) {
-    return () => {};
-  }
-  // Vision command paths can emit temporary progress chatter that is not useful in chat.
-  const source = String(job?.source || "").trim().toLowerCase();
-  if (source === "see-screenshot" || source === "ask-image" || source === "image-caption") {
-    return () => {};
-  }
-
-  let stopped = false;
-  let timer = null;
-
-  job.progressStdoutRemainder = "";
-  job.progressStderrRemainder = "";
-  job.progressPendingLine = "";
-  job.progressLastSentLine = "";
-  job.progressLastSentAt = 0;
-
-  const debounceMs = 250;
-
-  const flush = async () => {
-    if (stopped || shuttingDown || lane?.currentJob !== job) return;
-    const line = String(job.progressPendingLine || "").trim();
-    if (!line) return;
-    if (line === String(job.progressLastSentLine || "")) return;
-
-    job.progressPendingLine = "";
-    job.progressLastSentLine = line;
-    job.progressLastSentAt = Date.now();
-
-    try {
-      await sendMessage(job.chatId, line, {
-        silent: true,
-        replyToMessageId: job.replyToMessageId,
-        routeWorkerId: job.workerId,
-        routeTaskId: Number(job?.taskId || 0),
-        routeSessionId: String(job?.routeSessionId || getSessionForChatWorker(job.chatId, job.workerId) || "").trim(),
-      });
-    } catch (err) {
-      log(`sendMessage(progress) failed: ${redactError(err.message || err)}`);
-    }
-
-    if (job.progressPendingLine) {
-      schedule();
-    }
-  };
-
-  const schedule = () => {
-    if (stopped || shuttingDown || lane?.currentJob !== job) return;
-    if (timer) return;
-    if (!job.progressPendingLine) return;
-
-    const now = Date.now();
-    const gateAt = job.startedAt + Math.max(0, PROGRESS_FIRST_UPDATE_SEC) * 1000;
-    const throttleAt = Number(job.progressLastSentAt || 0) + Math.max(0, PROGRESS_UPDATE_INTERVAL_SEC) * 1000;
-    const earliestAt = Math.max(gateAt, throttleAt, now + debounceMs);
-    const waitMs = Math.max(0, earliestAt - now);
-
-    timer = setTimeout(() => {
-      timer = null;
-      void flush();
-    }, waitMs);
-  };
-
-  const ingest = (chunkText, streamName) => {
-    if (stopped || shuttingDown || lane?.currentJob !== job) return;
-    // Forwarding stderr into Telegram tends to produce spammy log lines. Keep it opt-in.
-    if (String(streamName || "") === "stderr" && !PROGRESS_INCLUDE_STDERR) return;
-    const chunk = String(chunkText || "");
-    if (!chunk) return;
-
-    const key = streamName === "stderr" ? "progressStderrRemainder" : "progressStdoutRemainder";
-    const prev = String(job[key] || "");
-    const combined = `${prev}${chunk}`.replace(/\r/g, "");
-    const parts = combined.split("\n");
-    let remainder = parts.pop() ?? "";
-    if (remainder.length > 10_000) remainder = remainder.slice(-10_000);
-    job[key] = remainder;
-
-    for (const rawLine of parts) {
-      const line = String(rawLine || "").trim();
-      if (!line) continue;
-      if (isProgressNoiseLine(line)) continue;
-      job.progressPendingLine = truncateLine(line, 3500);
-    }
-
-    schedule();
-  };
-
-  job.onProgressChunk = ingest;
-
-  return () => {
-    stopped = true;
-    if (timer) {
-      clearTimeout(timer);
-      timer = null;
-    }
-    job.onProgressChunk = null;
-  };
-}
-
 async function runCodexJob(job) {
   let spec;
   try {
@@ -17997,233 +14782,7 @@ async function runCodexJob(job) {
 }
 
 async function processLane(laneId) {
-  const lane = getLane(laneId);
-  if (!lane || shuttingDown) return;
-  if (lane.currentJob) return;
-
-  while (Array.isArray(lane.queue) && lane.queue.length > 0 && !shuttingDown) {
-    const job = lane.queue.shift();
-    lane.currentJob = job;
-    job.startedAt = Date.now();
-    markOrchTaskRunning(job);
-    // Allow cancellation to abort in-flight fetch() operations (Telegram uploads).
-    job.abortController = new AbortController();
-    const stopChatActionKeepalive = startJobChatActionKeepalive(job, lane);
-    const stopProgressUpdates = startJobProgressUpdates(job, lane);
-
-    let result;
-    try {
-        try {
-          result = job.kind === "raw"
-            ? await runRawCodexJob(job)
-            : job.kind === "tts"
-              ? await runTtsJob(job, lane)
-              : job.kind === "tts-batch"
-                ? await runTtsBatchJob(job, lane)
-                : job.kind === "whisper"
-                  ? await runWhisperJob(job, lane)
-                  : await runCodexJob(job);
-        } catch (err) {
-          const msg = String(err?.message || err || "").trim() || "Unknown error";
-          result = { ok: false, text: `Job #${job.id} failed unexpectedly: ${msg}` };
-        }
-    } finally {
-      stopProgressUpdates();
-    }
-
-    if (result && result.ok) {
-      const resolvedSessionId = String(result.sessionId || job.resumeSessionId || "").trim();
-      if (resolvedSessionId) {
-        const wid = String(job?.workerId || "").trim() || String(lane.id || "").trim() || ORCH_GENERAL_WORKER_ID;
-        setSessionForChatWorker(job.chatId, wid, resolvedSessionId);
-      }
-      if (typeof job?.onSuccess === "function") {
-        try {
-          await job.onSuccess(result, job);
-        } catch (err) {
-          log(`job.onSuccess failed for #${job.id}: ${redactError(err?.message || err)}`);
-        }
-      }
-    }
-    if (result && !result.ok && !job?.cancelRequested) {
-      try {
-        rememberOrchFailureLesson(job, result);
-      } catch (err) {
-        log(`rememberOrchFailureLesson failed for #${job.id}: ${redactError(err?.message || err)}`);
-      }
-    }
-
-    let emittedMessageIds = [];
-    let resolvedSessionIdForTask = "";
-    try {
-      const routeWorkerId = String(job?.workerId || "").trim() || String(lane.id || "").trim();
-      const routeTaskId = Number(job?.taskId || 0);
-      const replyToMessageId = Number(job?.replyToMessageId || 0);
-      const resolvedSessionId = String(
-        result?.sessionId ||
-          getSessionForChatWorker(job.chatId, routeWorkerId) ||
-          job?.resumeSessionId ||
-          "",
-      ).trim();
-      resolvedSessionIdForTask = resolvedSessionId;
-      const collectSentMessageIds = (value) => {
-        for (const item of Array.isArray(value) ? value : [value]) {
-          const id = Number(item?.message_id || 0);
-          if (!Number.isFinite(id) || id <= 0) continue;
-          emittedMessageIds.push(Math.trunc(id));
-        }
-      };
-
-      const attachParsed = extractAttachDirectives(String(result?.text || ""));
-      const attachments = Array.isArray(attachParsed.attachments) ? attachParsed.attachments : [];
-      const resultAfterText = String(result?.afterText || "").trim();
-      const resultAttachments = Array.isArray(result?.attachments) ? result.attachments : [];
-      const allAttachments = [...attachments, ...resultAttachments];
-      if (result && typeof result === "object") {
-        result.text = attachParsed.text;
-      }
-      const forcedTextOnly = String(job?.forcedTextOnly || "").trim();
-      const hasForcedTextOnly = Boolean(forcedTextOnly);
-      if (hasForcedTextOnly && result && typeof result === "object") {
-        result.text = injectForcedTextOnlySection(String(result.text || ""), forcedTextOnly);
-      }
-
-      const shouldVoiceReply = Boolean(
-        result?.ok &&
-          job?.kind !== "tts" &&
-          job?.kind !== "tts-batch" &&
-          (
-            (String(job?.source || "") === "voice" && TTS_REPLY_TO_VOICE) ||
-            (String(job?.source || "") === "worldmonitor-monitor" && WORLDMONITOR_ALERT_VOICE_ENABLED) ||
-            (String(job?.source || "") === "worldmonitor-check" && WORLDMONITOR_CHECK_VOICE_ENABLED)
-          ) &&
-          TTS_ENABLED &&
-          String(result?.text || "").trim(),
-      );
-
-      const isWorldMonitorAlertJob = String(job?.source || "") === "worldmonitor-monitor";
-      const isWorldMonitorCheckJob = String(job?.source || "") === "worldmonitor-check";
-      let voiceQueued = false;
-      let voiceReplyReadyText = "";
-      if (shouldVoiceReply) {
-        try {
-          let voiceInput = String(result.text || "");
-          if (isWorldMonitorCheckJob) {
-            voiceInput = makeWorldMonitorCheckVoiceSummary(voiceInput);
-          }
-          const parts = splitVoiceReplyParts(voiceInput);
-          const spokenRaw = makeSpeakableTextForTts(parts.spoken || voiceInput);
-          const spoken = (isWorldMonitorAlertJob || isWorldMonitorCheckJob)
-            ? makeWorldMonitorTextTtsFriendly(spokenRaw)
-            : spokenRaw;
-          const { chunks: spokenChunks, overflowText } = splitSpeakableTextIntoVoiceChunks(spoken);
-          const modelTextOnly = String(parts.textOnly || "").trim();
-          const preferredTextOnly = hasForcedTextOnly ? forcedTextOnly : modelTextOnly;
-          const extracted = preferredTextOnly ? "" : extractNonSpeakableInfo(String(result.text || ""));
-          let afterText = preferredTextOnly || (extracted ? `Text-only details:\n${extracted}` : "");
-          if (overflowText) {
-            const moved = `Moved from SPOKEN (too long for voice notes):\n${overflowText}`;
-            afterText = afterText ? `${afterText}\n\n${moved}` : moved;
-          }
-
-          const chunks = spokenChunks.length > 0 ? spokenChunks : (spoken ? [spoken] : []);
-          const queued = chunks.length > 1
-            ? await enqueueTtsBatch(job.chatId, chunks, "voice-reply", {
-              // Send text/attachments from the main job path so they do not wait for TTS.
-              afterText: "",
-              // Even if TTS_SEND_TEXT=1 globally, don't duplicate the spoken content for voice replies.
-              skipResultText: true,
-              attachments: [],
-              workerId: routeWorkerId,
-              replyToMessageId,
-              routeTaskId,
-              routeSessionId: resolvedSessionId,
-            })
-            : await enqueueTts(job.chatId, chunks[0] || spoken, "voice-reply", {
-              // Send text/attachments from the main job path so they do not wait for TTS.
-              afterText: "",
-              // Even if TTS_SEND_TEXT=1 globally, don't duplicate the spoken content for voice replies.
-              skipResultText: true,
-              attachments: [],
-              workerId: routeWorkerId,
-              replyToMessageId,
-              routeTaskId,
-              routeSessionId: resolvedSessionId,
-            });
-          voiceQueued = Boolean(queued);
-          if (voiceQueued) {
-            voiceReplyReadyText = afterText;
-          }
-        } catch (err) {
-          // If voice enqueue fails, fall back to sending text so the user still gets an answer.
-          log(`enqueueTts(voice-reply) failed: ${redactError(err?.message || err)}`);
-          voiceQueued = false;
-        }
-      }
-
-      const shouldSuppressResultTextForQueuedVoice = shouldVoiceReply
-        && voiceQueued
-        && !isWorldMonitorAlertJob
-        && !isWorldMonitorCheckJob;
-      const shouldSendForcedTextOnly = hasForcedTextOnly && !shouldVoiceReply;
-      if (!result || (result.skipSendMessage !== true && !shouldSuppressResultTextForQueuedVoice)) {
-        try {
-          const responseText = shouldSendForcedTextOnly
-            ? forcedTextOnly
-            : normalizeResponse(result?.text);
-          const sent = await sendMessage(job.chatId, responseText, {
-            replyToMessageId,
-            routeWorkerId,
-            routeTaskId,
-            routeSessionId: resolvedSessionId,
-          });
-          collectSentMessageIds(sent);
-        } catch (err) {
-          log(`sendMessage(result) failed: ${redactError(err.message || err)}`);
-        }
-      }
-
-      const combinedAfterText = [voiceReplyReadyText, resultAfterText].filter(Boolean).join("\n\n").trim();
-      if (combinedAfterText) {
-        try {
-          const sent = await sendMessage(job.chatId, combinedAfterText, {
-            replyToMessageId,
-            routeWorkerId,
-            routeTaskId,
-            routeSessionId: resolvedSessionId,
-          });
-          collectSentMessageIds(sent);
-        } catch (err) {
-          log(`sendMessage(afterText) failed: ${redactError(err?.message || err)}`);
-        }
-      }
-
-      // Send attachments from the main job path so they are not blocked on TTS generation.
-      if (allAttachments.length > 0) {
-        try {
-          const sent = await sendAttachments(job.chatId, allAttachments, {
-            replyToMessageId,
-            routeWorkerId,
-            routeTaskId,
-            routeSessionId: resolvedSessionId,
-          });
-          collectSentMessageIds(sent);
-        } catch (err) {
-          log(`sendAttachments(result) failed: ${redactError(err?.message || err)}`);
-        }
-      }
-    } catch (err) {
-      log(`processLane(post) failed: ${redactError(err?.message || err)}`);
-    } finally {
-      markOrchTaskCompleted(job, result, {
-        sessionId: resolvedSessionIdForTask,
-        outputMessageIds: [...new Set(emittedMessageIds)],
-      });
-      stopChatActionKeepalive();
-      lane.currentJob = null;
-      void maybeTriggerPendingRestart("job completion");
-    }
-  }
+  return await orchLaneRuntime.processLane(laneId);
 }
 
 function isRetryableTelegramNetworkError(err) {
@@ -19508,7 +16067,9 @@ async function shutdown(code = 0, reason = "") {
     // best effort
   }
 
-  persistState();
+  flushChatLogBufferSync();
+  persistState({ immediate: true });
+  flushStatePersistence();
   if (lockHeld) {
     releaseProcessLock(LOCK_PATH);
     lockHeld = false;
@@ -19524,6 +16085,10 @@ process.on("SIGHUP", () => {
     return;
   }
   void shutdown(0, "signal:SIGHUP");
+});
+process.on("beforeExit", () => {
+  flushChatLogBufferSync();
+  flushStatePersistence();
 });
 
 process.on("uncaughtException", (err) => {
@@ -19600,8 +16165,9 @@ process.on("unhandledRejection", (err) => {
       `Chat actions: enabled=${TELEGRAM_CHAT_ACTION_ENABLED} default=${TELEGRAM_CHAT_ACTION_DEFAULT} voice=${TELEGRAM_CHAT_ACTION_VOICE} interval=${TELEGRAM_CHAT_ACTION_INTERVAL_SEC}s`,
     );
     log(
-      `Chat logging: terminal=${CHAT_LOG_TO_TERMINAL} file=${CHAT_LOG_TO_FILE} max_chars=${CHAT_LOG_MAX_CHARS} file_path=${CHAT_LOG_PATH}`,
+      `Chat logging: terminal=${CHAT_LOG_TO_TERMINAL} file=${CHAT_LOG_TO_FILE} max_chars=${CHAT_LOG_MAX_CHARS} flush_interval_ms=${CHAT_LOG_FLUSH_INTERVAL_MS} buffer_max_lines=${CHAT_LOG_BUFFER_MAX_LINES} file_path=${CHAT_LOG_PATH}`,
     );
+    log(`State persistence: debounce=${STATE_WRITE_DEBOUNCE_MS}ms max_delay=${STATE_WRITE_MAX_DELAY_MS}ms`);
     log(`Signal policy: exit_on_sighup=${BOT_EXIT_ON_SIGHUP}`);
     if (WORLDMONITOR_MONITOR_ENABLED) {
       const configuredWorkdir = String(WORLDMONITOR_WORKDIR || "").trim();

@@ -110,6 +110,14 @@ Model selection:
 
 Natural language shortcuts are also mapped to commands (for example `c` -> `/commands`).
 
+## Code structure
+
+- `bot.js` keeps runtime flow and command handlers.
+- `lib/core_utils.js` holds shared parsing, text, timeout, and filesystem helpers.
+- `lib/natural_commands.js` holds natural-language command alias maps.
+- `lib/state_persistence.js` provides debounced state writes.
+- `lib/worldmonitor/constants.js` holds static WorldMonitor constants and pattern tables.
+
 ## Workspaces and routing
 
 Each worker is a separate Codex lane with its own working directory.
@@ -241,6 +249,8 @@ High-impact bot settings:
 - `ALLOW_GROUP_CHAT`, `TELEGRAM_ALLOWED_CHAT_IDS`
 - `BOT_REQUIRE_TTY`
 - `TELEGRAM_SET_COMMANDS`, `TELEGRAM_COMMAND_SCOPE`
+- `STATE_WRITE_DEBOUNCE_MS`, `STATE_WRITE_MAX_DELAY_MS`
+- `CHAT_LOG_FLUSH_INTERVAL_MS`, `CHAT_LOG_BUFFER_MAX_LINES`
 
 Codex execution:
 - `CODEX_WORKDIR`
