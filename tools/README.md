@@ -6,8 +6,6 @@ This folder contains a minimal desktop automation bridge for real browser UX tes
 
 - `ui_automation.ps1` (PowerShell)
 - `ui.cmd` (wrapper that calls PowerShell script)
-- `ui_demo_control.ps1` (demo server control)
-- `ui_demo.cmd` (wrapper for demo server control)
 
 ## Parameters
 
@@ -70,13 +68,3 @@ Drag reliability guidance:
 - For sliders and draggable controls, prefer `drag` over `move -DragLeft`.
 - Anchor near visible labels with `click_text` when possible instead of blind coordinates.
 - After dragging, verify value/position changed; if not, retry once with a clearly different offset.
-
-## Demo server control
-
-Use this helper to avoid running the demo server in a foreground terminal:
-
-- `ui_demo.cmd -Action start` - starts `ui_demo_server.js` in background
-- `ui_demo.cmd -Action status` - reports PID and health endpoint status
-- `ui_demo.cmd -Action open` - opens the demo URL in default browser
-- `ui_demo.cmd -Action stop` - stops the background demo server process
-- `ui_demo.cmd -Action restart` - restart server in background

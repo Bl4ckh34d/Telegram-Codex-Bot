@@ -204,10 +204,6 @@ Move behavior notes:
 - `key` now normalizes common Enter aliases (for example `Enter` and `Return`).
 - `type` uses randomized per-character delays by default for short strings, and auto-switches to direct send for longer content.
 
-Optional helper for the local demo page:
-
-- `tools/ui_demo_control.ps1` (or `tools/ui_demo.cmd`) to `start|status|open|stop|restart` the demo server in the background.
-
 Recommended loop for frontend UX checks:
 
 1. Focus the target app window.

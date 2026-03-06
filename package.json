@@ -4,7 +4,6 @@
   "private": true,
   "description": "Minimal Telegram -> AIDOLON CLI bridge",
   "scripts": {
-    "start": "node bot.js",
-    "ui-demo": "node tools/ui_demo_server.js"
+    "start": "node bot.js"
   }
 }
