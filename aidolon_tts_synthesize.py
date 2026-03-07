@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import sys
 import time
+import unicodedata
 import wave
 
 
@@ -55,10 +56,11 @@ def _fallback_clean_tts_text(text: str) -> str:
     candidate = (text or "").strip()
     if not candidate:
         return candidate
+    candidate = unicodedata.normalize("NFKC", candidate)
 
     # Remove markdown code fences and inline backticks.
     candidate = re.sub(r"```.*?```", " ", candidate, flags=re.DOTALL)
-    candidate = re.sub(r"`([^`]+?)`", r"\1", candidate)
+    candidate = re.sub(r"(?<![A-Za-z0-9])`([^`\n]+?)`(?![A-Za-z0-9])", r"\1", candidate)
 
     # Links: keep label text.
     candidate = re.sub(r"!?\[([^\]]+?)\]\([^\)]+\)", r"\1", candidate)
@@ -74,6 +76,29 @@ def _fallback_clean_tts_text(text: str) -> str:
             prev = candidate
             candidate = re.sub(pat, r"\1", candidate)
 
+    # Normalize punctuation variants that TTS may pronounce inconsistently.
+    candidate = re.sub(r"\\+([`´‘’‚‛ʼʻʹʽʾʿ′＇ꞌ'])", r"\1", candidate)
+    candidate = re.sub(r"[\u200B-\u200D\u2060\uFEFF]", "", candidate)
+    candidate = re.sub(r"[`´‘’‚‛ʼʻʹʽʾʿ′＇ꞌ]", "'", candidate)
+    candidate = re.sub(r'[“”„‟«»]', '"', candidate)
+    candidate = re.sub(r"[‐‑‒–—―]", "-", candidate)
+
+    # Expand common contractions for smoother synthesis while avoiding possessive "'s" terms.
+    contraction_rules = (
+        (r"\b([A-Za-z]+)\s*'\s*m\b", r"\1 am"),
+        (r"\b([A-Za-z]+)\s*'\s*re\b", r"\1 are"),
+        (r"\b([A-Za-z]+)\s*'\s*ve\b", r"\1 have"),
+        (r"\b([A-Za-z]+)\s*'\s*ll\b", r"\1 will"),
+        (r"\b([A-Za-z]+)\s*'\s*d\b", r"\1 would"),
+        (r"\b([A-Za-z]+)\s*n\s*'\s*t\b", r"\1 not"),
+        (
+            r"\b(?:it|he|she|that|there|here|what|who|where|when|how)\s*'\s*s\b",
+            lambda m: re.sub(r"\s*'\s*s$", " is", m.group(0), flags=re.IGNORECASE),
+        ),
+    )
+    for pattern, replacement in contraction_rules:
+        candidate = re.sub(pattern, replacement, candidate, flags=re.IGNORECASE)
+
     # Collapse whitespace.
     candidate = re.sub(r"\s+", " ", candidate).strip()
     return candidate
@@ -81,6 +106,42 @@ def _fallback_clean_tts_text(text: str) -> str:
 
 def _clean_tts_text(text: str) -> str:
     return _fallback_clean_tts_text(text)
+
+
+def _is_tokenizer_input_type_error(exc: Exception) -> bool:
+    msg = str(exc or "")
+    if not msg:
+        return False
+    lowered = msg.lower()
+    if "textencodeinput must be union[textinputsequence, tuple[inputsequence, inputsequence]]" in lowered:
+        return True
+    if "callback failed during tokenizer batch encoding" in lowered:
+        return True
+    return (
+        "exception calling callback for <future" in lowered
+        and ("tokenization_utils_fast.py" in lowered or "_batch_encode_plus" in lowered or "lmdeploy/pipeline.py" in lowered)
+    )
+
+
+def _reload_tts_runtime(model: str, ref_path: Path, tts_factory):
+    tts = tts_factory(model)
+    ctx = tts.encode_audio(str(ref_path))
+    return tts, ctx
+
+
+def _generate_with_recovery(tts, ctx, speak: str, *, model: str, ref_path: Path, tts_factory):
+    try:
+        return tts.generate(speak, ctx), tts, ctx
+    except Exception as exc:
+        if not _is_tokenizer_input_type_error(exc):
+            raise
+        print(
+            "TTS: tokenizer input type error detected; reloading runtime and retrying once.",
+            file=sys.stderr,
+        )
+        tts_retry, ctx_retry = _reload_tts_runtime(model, ref_path, tts_factory)
+        audio_retry = tts_retry.generate(speak, ctx_retry)
+        return audio_retry, tts_retry, ctx_retry
 
 
 def parse_args() -> argparse.Namespace:
@@ -249,40 +310,48 @@ def main() -> int:
     started = time.perf_counter()
 
     if args.batch_jsonl:
-        # One pipeline call for the whole batch is more robust than calling generate() repeatedly.
+        # Use per-item generate() to keep tokenizer input types simple and stable.
         try:
-            formatted_prompts = [tts.codec.format_prompt(t, ctx, None) for t in texts]
-            responses = tts.pipe(formatted_prompts, gen_config=tts.gen_config, do_preprocess=False)
-            if not isinstance(responses, list):
-                raise TypeError(f"Unexpected pipeline response type: {type(responses)}")
-            if len(responses) != len(texts):
-                raise RuntimeError(f"Unexpected pipeline response count: got {len(responses)}, expected {len(texts)}")
+            for idx, (speak, out_wav) in enumerate(zip(texts, out_wavs)):
+                try:
+                    audio, tts, ctx = _generate_with_recovery(
+                        tts,
+                        ctx,
+                        speak,
+                        model=model,
+                        ref_path=ref_path,
+                        tts_factory=MiraTTS,
+                    )
+                except Exception as exc:
+                    print(f"TTS: synthesis failed (item {idx}): {exc}", file=sys.stderr)
+                    return 7
+
+                try:
+                    _write_wav(out_wav, audio, sample_rate)
+                except Exception as exc:
+                    print(f"TTS: wav write failed (item {idx}): {exc}", file=sys.stderr)
+                    return 7
+
+                if not out_wav.is_file():
+                    print(f"TTS: output WAV missing after synthesis (item {idx}).", file=sys.stderr)
+                    return 8
         except Exception as exc:
             print(f"TTS: synthesis failed (batch): {exc}", file=sys.stderr)
             return 7
 
-        for idx, (resp, out_wav) in enumerate(zip(responses, out_wavs)):
-            try:
-                audio = tts.codec.decode(resp.text, ctx)
-            except Exception as exc:
-                print(f"TTS: decode failed (item {idx}): {exc}", file=sys.stderr)
-                return 7
-
-            try:
-                _write_wav(out_wav, audio, sample_rate)
-            except Exception as exc:
-                print(f"TTS: wav write failed (item {idx}): {exc}", file=sys.stderr)
-                return 7
-
-            if not out_wav.is_file():
-                print(f"TTS: output WAV missing after synthesis (item {idx}).", file=sys.stderr)
-                return 8
-
+        for out_wav in out_wavs:
             print(str(out_wav), file=sys.stdout)
     else:
         for idx, (speak, out_wav) in enumerate(zip(texts, out_wavs)):
             try:
-                audio = tts.generate(speak, ctx)
+                audio, tts, ctx = _generate_with_recovery(
+                    tts,
+                    ctx,
+                    speak,
+                    model=model,
+                    ref_path=ref_path,
+                    tts_factory=MiraTTS,
+                )
             except Exception as exc:
                 print(f"TTS: synthesis failed: {exc}", file=sys.stderr)
                 return 7

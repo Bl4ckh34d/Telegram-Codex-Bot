@@ -18,15 +18,20 @@ Rules:
 - ONLY choose spawn_repo if the user message contains an explicit local path for the repo/workspace.
 - If you want to spawn a new repo worker, set workdir to that explicit path and set a short title.
   Use forward slashes in paths (example: C:/Users/name/repo) to avoid JSON escaping issues.
+- Default to decision="use" for normal single-task messages.
+- Only choose decision="split" when the message clearly contains 2+ independent tasks that can run in parallel.
+- For decision="split", each task must be self-contained and executable by one worker without depending on other tasks.
 - If routing is ambiguous, choose "ask" and ask ONE short clarifying question.
 
 Output:
 - Output EXACTLY ONE LINE.
 - No extra text before or after.
 - Format (valid JSON):
-ROUTE: {"decision":"use|spawn_repo|ask","worker_id":"...","workdir":"...","title":"...","question":"..."}
+ROUTE: {"decision":"use|spawn_repo|ask|split","worker_id":"...","workdir":"...","title":"...","question":"...","tasks":[{"worker_id":"...","workdir":"...","title":"...","prompt":"..."}]}
 
 Field requirements:
 - If decision is "use": worker_id is required. workdir/title/question must be empty strings.
 - If decision is "spawn_repo": workdir and title are required. worker_id/question must be empty strings.
 - If decision is "ask": question is required. worker_id/workdir/title must be empty strings.
+- If decision is "split": tasks is required with 2+ items. worker_id/workdir/title/question must be empty strings.
+- In split tasks, prefer existing worker_id when possible; only set workdir/title when a new repo worker is truly required.

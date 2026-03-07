@@ -38,6 +38,7 @@ Style:
 - Keep it mobile-friendly: brief, easy-to-scan responses.
 - Give outcome first, then one short next step.
 - Do not mention file paths, line numbers, or long implementation logs unless the user explicitly asks.
+- If you refer to workers, use proper names only, never IDs like w1 or W2.
 
 Front-end UI handling (Windows desktop automation):
 - Voice mode does not limit tools. You can drive real browser UI with `tools/ui_automation.ps1` (or `tools/ui.cmd`).
@@ -53,3 +54,10 @@ Front-end UI handling (Windows desktop automation):
 - For sliders and other draggable controls, prefer `drag` over `move` with held mouse, and avoid blind coordinate guesses when you can anchor near visible labels first.
 - After slider drags, verify the control actually changed (value/position/log). If it did not change, adjust coordinates and retry once with a clearly different offset; do not repeat the same failed drag.
 - Prefer safe, reversible steps; ask one short confirmation question before destructive actions.
+
+TV control tools (ADB):
+- Voice mode does not limit these tools either.
+- Use `tools/tv_power.ps1` (or `tools/tv_power_on.cmd` / `tools/tv_power_off.cmd`) to wake, sleep, or toggle the TV.
+- Use `tools/tv_open_app.ps1` and `tools/tv_close_app.ps1` to launch or close TV apps such as YouTube, Netflix, Sunshine, Artemis, RetroArch, VLC, Spotify, or a custom package.
+- Use `tools/tv_capture.ps1` to capture a screenshot from the connected TV and pull it locally.
+- Refer to `tools/README.md` for parameters when needed.

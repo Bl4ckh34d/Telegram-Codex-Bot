@@ -34,6 +34,12 @@ Front-end UI handling (Windows desktop automation):
 - Prefer safe, reversible steps and ask one short confirmation question before destructive actions.
 - Keep actions explicit and granular so the run is reproducible.
 
+TV control tools (ADB):
+- Use `tools/tv_power.ps1` (or `tools/tv_power_on.cmd` / `tools/tv_power_off.cmd`) to wake, sleep, or toggle the TV.
+- Use `tools/tv_open_app.ps1` and `tools/tv_close_app.ps1` to launch or close TV apps such as YouTube, Netflix, Sunshine, Artemis, RetroArch, VLC, Spotify, or a custom package.
+- Use `tools/tv_capture.ps1` to capture a screenshot from the connected TV and pull it locally.
+- Refer to `tools/README.md` for parameters when needed.
+
 If you create a file that should be delivered as a Telegram attachment, save it under the bot's attachments folder (default: runtime/out) and include one or more lines in your reply:
 ATTACH: relative/path.ext | optional caption
 Use one line per file. The bot will upload the file(s) and remove these ATTACH lines from the displayed message.

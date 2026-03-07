@@ -19,6 +19,14 @@ const TTS_DIR = path.join(RUNTIME_DIR, "tts");
 const STATE_PATH = path.join(RUNTIME_DIR, "state.json");
 const LOCK_PATH = path.join(RUNTIME_DIR, "bot.lock");
 const CHAT_LOG_PATH = path.join(RUNTIME_DIR, "chat.log");
+const WORKFLOW_CATALOG_PATH = (() => {
+  const configured = String(process.env.ORCH_WORKFLOW_CATALOG_PATH || "").trim();
+  if (configured) {
+    return path.isAbsolute(configured) ? configured : path.resolve(ROOT, configured);
+  }
+  const baseDir = String(process.env.APPDATA || "").trim() || path.join(os.homedir(), ".aidolon");
+  return path.join(baseDir, "workflow-catalog.json");
+})();
 const WORLDMONITOR_NATIVE_STORE_PATH = path.join(RUNTIME_DIR, "worldmonitor-native-store.json");
 const WORLDMONITOR_NATIVE_SIGNALS_PATH = path.join(RUNTIME_DIR, "worldmonitor-native-signals.json");
 const RESTART_REASON_PATH = path.join(RUNTIME_DIR, "restart.reason");
@@ -54,6 +62,7 @@ const {
   appendTail,
   oneLine,
   detectTtsBackendFatalError,
+  stripTtsBackendNoise,
   previewForLog,
 } = require("./lib/core_utils");
 const {
@@ -162,9 +171,18 @@ function enqueueChatLogLine(line) {
   scheduleChatLogFlush(CHAT_LOG_FLUSH_INTERVAL_MS);
 }
 
+const CHAT_WORKER_STRONG_COLORS = Object.freeze([
+  "\x1b[32m", // green
+  "\x1b[36m", // cyan
+  "\x1b[34m", // blue
+  "\x1b[35m", // magenta
+  "\x1b[33m", // yellow
+]);
+
 function logChat(direction, chatId, text, meta = {}) {
   const source = String(meta.source || "").trim() || "message";
   const user = String(meta.user || "").trim() || "-";
+  const workerId = String(meta.routeWorkerId || meta.workerId || "").trim();
   const preview = previewForLog(text, CHAT_LOG_MAX_CHARS);
 
   if (CHAT_LOG_TO_TERMINAL) {
@@ -173,13 +191,19 @@ function logChat(direction, chatId, text, meta = {}) {
     const isOut = dir === "out";
 
     const who = isIn && user && user !== "-" ? ` ${user}` : "";
+    const workerTag = isOut && workerId ? ` [${workerId}]` : "";
     const src = isIn && source && !["plain", "message"].includes(source) ? ` (${source})` : "";
     const label = isIn ? "YOU" : isOut ? "BOT" : dir.toUpperCase() || "CHAT";
-    const line = `${label}${who}${src}: ${preview}`;
+    const line = `${label}${workerTag}${who}${src}: ${preview}`;
 
     const noColor = Object.prototype.hasOwnProperty.call(process.env, "NO_COLOR");
     const useColors = !noColor && TERMINAL_COLORS && CHAT_LOG_USE_COLORS && Boolean(process.stdout.isTTY);
-    const color = isIn ? "\x1b[36m" : isOut ? "\x1b[32m" : "\x1b[33m"; // cyan / green / yellow
+    const workerColor = getWorkerTerminalColors(workerId).strong;
+    const color = isIn
+      ? "\x1b[36m"
+      : isOut
+        ? (workerColor || "\x1b[32m")
+        : "\x1b[33m"; // cyan / worker palette (or green) / yellow
     const reset = "\x1b[0m";
     log(useColors ? `${color}${line}${reset}` : line);
   }
@@ -191,6 +215,7 @@ function logChat(direction, chatId, text, meta = {}) {
         `direction=${direction}`,
         `chat=${chatId}`,
         `user=${JSON.stringify(user)}`,
+        `worker=${JSON.stringify(workerId || "-")}`,
         `source=${JSON.stringify(source)}`,
         `text=${JSON.stringify(String(text || ""))}`,
       ].join(" ");
@@ -493,8 +518,146 @@ function nowIso(input = null) {
   return `${year}-${month}-${day}T${hour}:${minute}:${second}.${ms}${sign}${offsetHour}:${offsetMinute}`;
 }
 
+const ANSI = Object.freeze({
+  reset: "\x1b[0m",
+  dim: "\x1b[2m",
+  red: "\x1b[31m",
+  yellow: "\x1b[33m",
+  blue: "\x1b[34m",
+  magenta: "\x1b[35m",
+  cyan: "\x1b[36m",
+  brightRed: "\x1b[91m",
+  brightGreen: "\x1b[92m",
+  brightYellow: "\x1b[93m",
+  brightBlue: "\x1b[94m",
+  brightMagenta: "\x1b[95m",
+  brightCyan: "\x1b[96m",
+});
+
+const SOURCE_FALLBACK_COLORS = Object.freeze([
+  ANSI.cyan,
+  ANSI.brightCyan,
+  ANSI.blue,
+  ANSI.brightBlue,
+  ANSI.magenta,
+  ANSI.brightMagenta,
+  ANSI.brightGreen,
+  ANSI.yellow,
+]);
+
+function hasAnsi(text) {
+  return /\x1b\[[0-9;]*m/.test(String(text || ""));
+}
+
+function useTerminalColorsForLogs() {
+  const noColor = Object.prototype.hasOwnProperty.call(process.env, "NO_COLOR");
+  return !noColor && TERMINAL_COLORS && Boolean(process.stdout.isTTY);
+}
+
+function useWorkerStreamColors() {
+  return useTerminalColorsForLogs() && CHAT_LOG_USE_COLORS;
+}
+
+function paint(text, color) {
+  return `${color}${text}${ANSI.reset}`;
+}
+
+function hashText(text) {
+  const s = String(text || "");
+  let h = 0;
+  for (let i = 0; i < s.length; i += 1) {
+    h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  }
+  return h;
+}
+
+function toBrightAnsiColor(color) {
+  const c = String(color || "");
+  const m = c.match(/\x1b\[(3[0-7]|9[0-7])m/);
+  if (!m) return c;
+  const code = Number(m[1]);
+  if (code >= 90 && code <= 97) return c;
+  return c.replace(/\x1b\[3([0-7])m/, "\x1b[9$1m");
+}
+
+function getWorkerTerminalColors(workerId) {
+  const wid = String(workerId || "").trim();
+  if (!wid) return { strong: "", light: "" };
+  const strong = CHAT_WORKER_STRONG_COLORS[hashText(wid) % CHAT_WORKER_STRONG_COLORS.length] || "";
+  if (!strong) return { strong: "", light: "" };
+  return { strong, light: `${ANSI.dim}${toBrightAnsiColor(strong)}` };
+}
+
+function writeWorkerStreamChunk(chunk, { workerId = "", stream = "stdout" } = {}) {
+  const text = String(chunk || "");
+  if (!text) return;
+  const out = String(stream || "").toLowerCase() === "stderr" ? process.stderr : process.stdout;
+  if (!useWorkerStreamColors() || hasAnsi(text)) {
+    out.write(text);
+    return;
+  }
+  const color = getWorkerTerminalColors(workerId).light;
+  if (!color) {
+    out.write(text);
+    return;
+  }
+  out.write(`${color}${text}${ANSI.reset}`);
+}
+
+function detectSeverityTag(source, rest) {
+  const src = String(source || "").trim().toLowerCase();
+  const body = String(rest || "").trim().toLowerCase();
+  if (!body) return "neutral";
+  if (src === "fatal") return "error";
+  if (/\b(fatal|error|failed|exception|traceback|timeout|rejected|crash|denied)\b/i.test(body)) return "error";
+  if (/\b(warn|warning|fallback|retry|blocked|unavailable|degrad|stale)\b/i.test(body)) return "warn";
+  if (/\b(ready|started|completed|success|succeeded|connected|healthy|ok)\b/i.test(body)) return "ok";
+  return "neutral";
+}
+
+function getSourceColor(source) {
+  const s = String(source || "").trim().toLowerCase();
+  if (!s) return ANSI.cyan;
+  if (["fatal"].includes(s)) return ANSI.brightRed;
+  if (["error"].includes(s)) return ANSI.red;
+  if (["warning", "warn"].includes(s)) return ANSI.yellow;
+  if (["bot-text", "telegram-send", "telegram-document", "worldmonitor"].includes(s)) return ANSI.brightGreen;
+  if (["bot-voice", "telegram-voice", "tts"].includes(s)) return ANSI.brightMagenta;
+  if (["telegram-photo", "whisper"].includes(s)) return ANSI.brightBlue;
+  if (["startup", "shutdown", "restart"].includes(s)) return ANSI.brightYellow;
+  if (["orch", "enqueue", "run"].includes(s)) return ANSI.cyan;
+  const idx = hashText(s) % SOURCE_FALLBACK_COLORS.length;
+  return SOURCE_FALLBACK_COLORS[idx];
+}
+
+function formatLogMessageForTerminal(rawMessage) {
+  const msg = String(rawMessage || "");
+  if (!useTerminalColorsForLogs() || !msg || hasAnsi(msg)) return msg;
+  const m = msg.match(/^\[([^\]]+)\]\s*(.*)$/);
+  if (!m) {
+    const sev = detectSeverityTag("", msg);
+    if (sev === "error") return paint(msg, ANSI.red);
+    if (sev === "warn") return paint(msg, ANSI.yellow);
+    return msg;
+  }
+  const source = m[1];
+  const rest = m[2];
+  const sourceColor = getSourceColor(source);
+  const sev = detectSeverityTag(source, rest);
+  let restOut = rest;
+  if (sev === "error") restOut = paint(rest, ANSI.red);
+  else if (sev === "warn") restOut = paint(rest, ANSI.yellow);
+  else if (sev === "ok") restOut = paint(rest, ANSI.brightGreen);
+  return `${paint(`[${source}]`, sourceColor)}${rest ? ` ${restOut}` : ""}`;
+}
+
 function log(msg) {
-  console.log(`[${nowIso()}] ${msg}`);
+  const ts = `[${nowIso()}]`;
+  if (useTerminalColorsForLogs()) {
+    console.log(`${paint(ts, ANSI.dim)} ${formatLogMessageForTerminal(msg)}`);
+    return;
+  }
+  console.log(`${ts} ${msg}`);
 }
 
 function normalizeDnsResultOrder(rawValue) {
@@ -570,16 +733,18 @@ const CODEX_BIN = String(process.env.CODEX_BIN || "codex").trim();
 const CODEX_USE_WSL = String(process.env.CODEX_USE_WSL || "auto").trim().toLowerCase();
 const CODEX_WSL_BIN = String(process.env.CODEX_WSL_BIN || "").trim();
 const CODEX_WORKDIR = String(process.env.CODEX_WORKDIR || ROOT).trim();
-const CODEX_MODEL = String(process.env.CODEX_MODEL || "gpt-5.3-codex").trim();
+const CODEX_MODEL = String(process.env.CODEX_MODEL || "gpt-5.4-codex").trim();
 const CODEX_MODEL_CHOICES = parseList(process.env.CODEX_MODEL_CHOICES || "");
 const CODEX_REASONING_EFFORT = String(process.env.CODEX_REASONING_EFFORT || "xhigh").trim();
 const CODEX_REASONING_EFFORT_CHOICES = parseList(process.env.CODEX_REASONING_EFFORT_CHOICES || "");
 const CODEX_DEFAULT_MODEL_CHOICES = Object.freeze([
+  "gpt-5.4-codex",
   "gpt-5.3-codex",
   "gpt-5.2-codex",
   "gpt-5.1-codex",
 ]);
 const CODEX_REASONING_EFFORTS_BY_MODEL = Object.freeze({
+  "gpt-5.4-codex": ["low", "medium", "high", "xhigh"],
   "gpt-5.3-codex": ["low", "medium", "high", "xhigh"],
   "gpt-5.2-codex": ["low", "medium", "high"],
   "gpt-5.1-codex": ["low", "medium", "high"],
@@ -708,6 +873,7 @@ const TTS_STARSHIP_BEEP_END = resolveMaybeRelativePath(
   process.env.TTS_STARSHIP_BEEP_END || path.join("resources", "tts", "a11-comms-end.wav"),
 );
 const TTS_POSTPROCESS_DEBUG = toBool(process.env.TTS_POSTPROCESS_DEBUG, false);
+const TTS_WORKER_PRESET_MAP_RAW = String(process.env.TTS_WORKER_PRESET_MAP || "").trim();
 
 let ATTACH_ENABLED = toBool(process.env.ATTACH_ENABLED, true);
 // Security: only allow attaching files from within this folder.
@@ -1116,12 +1282,16 @@ const state = readJson(STATE_PATH, {
   chatSessions: {},
   lastImages: {},
   chatPrefs: {},
+  chatAutomationPrefs: {},
   orchLessons: [],
   redditDigest: {},
   worldMonitorMonitor: {},
   weatherDaily: {},
   weatherLocationsByChat: {},
   orch: {},
+});
+const workflowCatalogState = readJson(WORKFLOW_CATALOG_PATH, {
+  chatAutomationPrefs: {},
 });
 let lastUpdateId = Number(state.lastUpdateId || 0);
 const lastImages = state && typeof state.lastImages === "object" && state.lastImages
@@ -1130,6 +1300,10 @@ const lastImages = state && typeof state.lastImages === "object" && state.lastIm
 const chatPrefs = state && typeof state.chatPrefs === "object" && state.chatPrefs
   ? { ...state.chatPrefs }
   : {};
+const chatAutomationPrefs = mergeChatAutomationPrefsByUpdatedAt(
+  normalizeChatAutomationPrefs(state?.chatAutomationPrefs),
+  normalizeChatAutomationPrefs(workflowCatalogState?.chatAutomationPrefs),
+);
 const redditDigest = state && typeof state.redditDigest === "object" && state.redditDigest
   ? { ...state.redditDigest }
   : {};
@@ -1526,6 +1700,9 @@ let orchNextWorkerNum = Number(orch.nextWorkerNum || 1);
 let orchNextTaskNum = Number(orch.nextTaskNum || 1);
 
 const lanes = new Map();
+let statePersister = null;
+let pendingStatePersist = false;
+let pendingStatePersistImmediate = false;
 const orchWorkerRuntime = createOrchWorkerRuntime({
   fs,
   path,
@@ -1618,8 +1795,34 @@ const ttsKeepalive = {
   stdoutBuf: "",
   stderrTail: "",
   stderrScanCarry: "",
+  stderrNoiseCarry: "",
   restartTimer: null,
   restartAttempts: 0,
+  startCount: 0,
+  readyCount: 0,
+  closeCount: 0,
+  errorCount: 0,
+  requestCount: 0,
+  requestFailureCount: 0,
+  timeoutCount: 0,
+  fallbackSingleCount: 0,
+  fallbackBatchCount: 0,
+  restartScheduledCount: 0,
+  restartFailureCount: 0,
+  lastStartAt: 0,
+  lastReadyAt: 0,
+  lastCloseAt: 0,
+  lastCloseReason: "",
+  lastErrorAt: 0,
+  lastError: "",
+  stopCount: 0,
+  lastStopAt: 0,
+  lastStopReason: "",
+  lastRestartAt: 0,
+  lastRestartDelayMs: 0,
+  lastRestartReason: "",
+  lastFallbackAt: 0,
+  lastFallbackReason: "",
 };
 const whisperKeepalive = {
   proc: null,
@@ -1696,7 +1899,7 @@ function normalizeOrchState(stateObj, { legacyChatSessions = {} } = {}) {
       kind: "general",
       name: "Astra",
       title: "General",
-      workdir: CODEX_WORKDIR,
+      workdir: ROOT,
       createdAt: now,
       lastUsedAt: now,
     };
@@ -1707,10 +1910,17 @@ function normalizeOrchState(stateObj, { legacyChatSessions = {} } = {}) {
       kind: "general",
       name: normalizeWorkerDisplayName(general.name || "Astra") || "Astra",
       title: String(general.title || "General").trim() || "General",
-      workdir: String(general.workdir || CODEX_WORKDIR).trim() || CODEX_WORKDIR,
+      workdir: ROOT,
       createdAt: Number(general.createdAt || now) || now,
       lastUsedAt: Number(general.lastUsedAt || now) || now,
     };
+  }
+  for (const [workerId, rawWorker] of Object.entries(workers)) {
+    const wid = String(workerId || "").trim();
+    const worker = rawWorker && typeof rawWorker === "object" ? rawWorker : null;
+    if (!wid || !worker) continue;
+    if (String(worker.kind || "").trim().toLowerCase() === "repo") continue;
+    worker.workdir = ROOT;
   }
 
   // Migrate legacy per-chat session ids onto the general worker (first run after upgrade).
@@ -1749,6 +1959,7 @@ function buildStateSnapshot() {
     lastUpdateId,
     lastImages,
     chatPrefs,
+    chatAutomationPrefs,
     orchLessons,
     redditDigest,
     worldMonitorMonitor,
@@ -1768,9 +1979,29 @@ function buildStateSnapshot() {
   };
 }
 
-const statePersister = createStatePersister({
+function buildWorkflowCatalogSnapshot() {
+  return {
+    version: 1,
+    updatedAt: Date.now(),
+    chatAutomationPrefs,
+  };
+}
+
+function flushPendingStatePersistence() {
+  if (!statePersister || !pendingStatePersist) return;
+  statePersister.markDirty({ immediate: pendingStatePersistImmediate });
+  pendingStatePersist = false;
+  pendingStatePersistImmediate = false;
+}
+
+statePersister = createStatePersister({
   writeNow: () => {
     writeJsonAtomic(STATE_PATH, buildStateSnapshot());
+    try {
+      writeJsonAtomic(WORKFLOW_CATALOG_PATH, buildWorkflowCatalogSnapshot());
+    } catch (err) {
+      console.error(`[state] Failed to write workflow catalog: ${err?.message || err}`);
+    }
   },
   delayMs: STATE_WRITE_DEBOUNCE_MS,
   maxDelayMs: STATE_WRITE_MAX_DELAY_MS,
@@ -1778,12 +2009,20 @@ const statePersister = createStatePersister({
     // best effort
   },
 });
+flushPendingStatePersistence();
 
 function persistState({ immediate = false } = {}) {
+  if (!statePersister) {
+    pendingStatePersist = true;
+    pendingStatePersistImmediate = pendingStatePersistImmediate || immediate;
+    return;
+  }
   statePersister.markDirty({ immediate });
 }
 
 function flushStatePersistence() {
+  flushPendingStatePersistence();
+  if (!statePersister) return;
   statePersister.flush();
 }
 
@@ -1818,15 +2057,296 @@ const orchTaskRuntime = createOrchTaskRuntime({
 
 function getChatPrefs(chatId) {
   const key = String(chatId || "").trim();
-  if (!key) return { model: "", reasoning: "", ttsPreset: "" };
+  if (!key) return {
+    model: "",
+    reasoning: "",
+    ttsPreset: "",
+    ttsMode: "",
+  };
   const entry = chatPrefs[key];
-  if (!entry || typeof entry !== "object") return { model: "", reasoning: "", ttsPreset: "" };
+  if (!entry || typeof entry !== "object") return {
+    model: "",
+    reasoning: "",
+    ttsPreset: "",
+    ttsMode: "",
+  };
   const ttsPreset = normalizeTtsPresetName(entry.ttsPreset, { allowDefault: true });
+  const ttsMode = normalizeTtsVoiceMode(entry.ttsMode, { allowDefault: true });
   return {
     model: String(entry.model || "").trim(),
     reasoning: String(entry.reasoning || "").trim(),
     ttsPreset: ttsPreset === "default" ? "" : ttsPreset,
+    ttsMode: ttsMode === "default" ? "" : ttsMode,
   };
+}
+
+function normalizeChatAutomationPrefEntry(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const approveArtemisPrompts = raw.approveArtemisPrompts === true;
+  const openFirefoxFullscreenOnTvForWatch = raw.openFirefoxFullscreenOnTvForWatch === true;
+  const ensureSunshineBeforeTvPcConnect = raw.ensureSunshineBeforeTvPcConnect === true;
+  const useStrictTvPcConnectionOrder = raw.useStrictTvPcConnectionOrder === true;
+  const selectTvPresentInArtemisAfterConnect = raw.selectTvPresentInArtemisAfterConnect === true;
+  const askWhatToWatchAfterSiteEntry = raw.askWhatToWatchAfterSiteEntry === true;
+  const playAndFullscreenAfterSelection = raw.playAndFullscreenAfterSelection === true;
+  const sunshineStartCommand = String(raw.sunshineStartCommand || "").trim();
+  const watchSites = Array.isArray(raw.watchSites)
+    ? raw.watchSites
+      .map((site) => String(site || "").trim())
+      .filter((site) => site.length > 0)
+    : [];
+  const tvShowSearchSite = String(raw.tvShowSearchSite || "").trim();
+  const movieSearchSite = String(raw.movieSearchSite || "").trim();
+  const askSeasonEpisodeForShows = raw.askSeasonEpisodeForShows === true;
+  if (
+    !approveArtemisPrompts
+    && !openFirefoxFullscreenOnTvForWatch
+    && !ensureSunshineBeforeTvPcConnect
+    && !useStrictTvPcConnectionOrder
+    && !selectTvPresentInArtemisAfterConnect
+    && !askWhatToWatchAfterSiteEntry
+    && !playAndFullscreenAfterSelection
+    && !sunshineStartCommand
+    && watchSites.length === 0
+    && !tvShowSearchSite
+    && !movieSearchSite
+    && !askSeasonEpisodeForShows
+  ) return null;
+  return {
+    approveArtemisPrompts,
+    openFirefoxFullscreenOnTvForWatch,
+    ensureSunshineBeforeTvPcConnect,
+    useStrictTvPcConnectionOrder,
+    selectTvPresentInArtemisAfterConnect,
+    askWhatToWatchAfterSiteEntry,
+    playAndFullscreenAfterSelection,
+    sunshineStartCommand,
+    watchSites,
+    tvShowSearchSite,
+    movieSearchSite,
+    askSeasonEpisodeForShows,
+    updatedAt: Number(raw.updatedAt || 0) || 0,
+  };
+}
+
+function normalizeChatAutomationPrefs(raw) {
+  if (!raw || typeof raw !== "object") return {};
+  const out = {};
+  for (const [chatIdRaw, entryRaw] of Object.entries(raw)) {
+    const key = String(chatIdRaw || "").trim();
+    if (!key) continue;
+    const entry = normalizeChatAutomationPrefEntry(entryRaw);
+    if (!entry) continue;
+    out[key] = entry;
+  }
+  return out;
+}
+
+function mergeChatAutomationPrefsByUpdatedAt(...sources) {
+  const out = {};
+  for (const source of sources) {
+    if (!source || typeof source !== "object") continue;
+    for (const [chatIdRaw, rawEntry] of Object.entries(source)) {
+      const chatId = String(chatIdRaw || "").trim();
+      if (!chatId) continue;
+      const entry = normalizeChatAutomationPrefEntry(rawEntry);
+      if (!entry) continue;
+      const prev = normalizeChatAutomationPrefEntry(out[chatId]);
+      const entryUpdatedAt = Number(entry.updatedAt || 0) || 0;
+      const prevUpdatedAt = Number(prev?.updatedAt || 0) || 0;
+      if (!prev || entryUpdatedAt >= prevUpdatedAt) {
+        out[chatId] = entry;
+      }
+    }
+  }
+  return out;
+}
+
+function getChatAutomationPrefs(chatId) {
+  const key = String(chatId || "").trim();
+  if (!key) return null;
+  const entry = normalizeChatAutomationPrefEntry(chatAutomationPrefs[key]);
+  return entry || null;
+}
+
+function rememberChatAutomationPrefsFromText(chatId, text) {
+  const key = String(chatId || "").trim();
+  const raw = String(text || "").trim();
+  if (!key || !raw) return false;
+  const lower = raw.toLowerCase();
+
+  const patch = {};
+  if (
+    (/\bpermission\b/.test(lower) || /\bpairing\b/.test(lower))
+    && (/\bapprove\b/.test(lower) || /\ballow\b/.test(lower) || /\bokay\b/.test(lower) || /\byes\b/.test(lower))
+  ) {
+    patch.approveArtemisPrompts = true;
+  }
+  const hasWatchTvComputer = /\bwatch\b/.test(lower) && /\btv\b/.test(lower) && /\bcomputer\b/.test(lower);
+  const hasFirefoxFullscreen = /\bfirefox\b/.test(lower) && (/\bfull\s*screen\b/.test(lower) || /\bfullscreen\b/.test(lower));
+  const hasSecondMonitor = /\bsecond monitor\b/.test(lower)
+    || /\btv as .*monitor\b/.test(lower)
+    || /\btv monitor\b/.test(lower)
+    || /\bthat monitor\b/.test(lower);
+  if (hasWatchTvComputer && hasFirefoxFullscreen && hasSecondMonitor) {
+    patch.openFirefoxFullscreenOnTvForWatch = true;
+  }
+  const hasSunshineStartOrRestart = /\bsunshine\b/.test(lower)
+    && (/\bstart(?:ing)?\b/.test(lower) || /\brestart(?:ing)?\b/.test(lower));
+  const hasTvPcFlowIntent = (/\btv\b/.test(lower) && (/\bpc\b/.test(lower) || /\bcomputer\b/.test(lower)))
+    && (/\bconnect(?:s|ion|ing)?\b/.test(lower) || /\bflow\b/.test(lower) || /\broutine\b/.test(lower));
+  if (hasSunshineStartOrRestart && hasTvPcFlowIntent) {
+    patch.ensureSunshineBeforeTvPcConnect = true;
+  }
+  const hasTurnOnTv = /\bturn on tv\b/.test(lower)
+    || /\bpower on tv\b/.test(lower)
+    || /\bwake tv\b/.test(lower);
+  const hasOpenArtemis = /\bopen artemis\b/.test(lower);
+  const hasConnectSunshineArtemis = (/\bsunshine\b/.test(lower) && /\bartemis\b/.test(lower))
+    && /\bconnect(?:s|ion|ing)?\b/.test(lower);
+  if ((hasSunshineStartOrRestart || /start sunshine/.test(lower))
+    && hasTurnOnTv
+    && hasOpenArtemis
+    && (hasTvPcFlowIntent || hasConnectSunshineArtemis)) {
+    patch.useStrictTvPcConnectionOrder = true;
+    patch.ensureSunshineBeforeTvPcConnect = true;
+  }
+  if (/\bselect\b/.test(lower) && /\bartemis\b/.test(lower) && /\btv\b/.test(lower) && /\bonce connected\b/.test(lower)) {
+    patch.selectTvPresentInArtemisAfterConnect = true;
+  }
+  const hasFirefoxOpenIntent = /\bfirefox\b/.test(lower)
+    && (/\bopen\b/.test(lower) || /\bopened\b/.test(lower) || /\bnew window\b/.test(lower));
+  const hasSto = /\bs\.to\b/.test(lower);
+  const hasSflix = /\bsflix\.(?:to|ps)\b/.test(lower);
+  if (hasFirefoxOpenIntent && hasSto && hasSflix) {
+    patch.watchSites = ["https://s.to", "https://sflix.ps"];
+    patch.openFirefoxFullscreenOnTvForWatch = true;
+  }
+  const hasSearchFlow = /\bsearch\b/.test(lower) || /\bsearch bar\b/.test(lower) || /\bwrite\b/.test(lower);
+  const hasSelectFlow = /\bselect\b/.test(lower) || /\bchoose\b/.test(lower);
+  const hasTvShowFlow = (/\btv show\b/.test(lower) || /\bshow\b/.test(lower) || /\bseries\b/.test(lower))
+    && hasSto
+    && hasSearchFlow
+    && hasSelectFlow;
+  const hasMovieFlow = /\bmovie\b/.test(lower)
+    && hasSflix
+    && hasSearchFlow;
+  if (hasTvShowFlow) {
+    patch.tvShowSearchSite = "https://s.to";
+    patch.askSeasonEpisodeForShows = true;
+  }
+  if (hasMovieFlow) {
+    patch.movieSearchSite = "https://sflix.ps";
+  }
+  if ((/\bask me\b/.test(lower) || /\bask\b/.test(lower)) && /\bwhat\b/.test(lower) && /\bwatch\b/.test(lower)) {
+    patch.askWhatToWatchAfterSiteEntry = true;
+  }
+  if ((/\bclick play\b/.test(lower) || /\bplay back\b/.test(lower) || /\bplay\b/.test(lower))
+    && /\bfull\s*screen\b/.test(lower)) {
+    patch.playAndFullscreenAfterSelection = true;
+  }
+  const sunshinePathMatch = raw.match(/([a-z]:\\[^\r\n"'<>|?*]+?\.(?:cmd|bat|ps1))/i);
+  if (sunshinePathMatch) {
+    const candidatePath = String(sunshinePathMatch[1] || "").trim();
+    if (candidatePath && /sunshine/i.test(candidatePath)) {
+      patch.sunshineStartCommand = candidatePath;
+      patch.ensureSunshineBeforeTvPcConnect = true;
+    }
+  }
+
+  if (Object.keys(patch).length === 0) return false;
+
+  const prev = getChatAutomationPrefs(key) || {
+    approveArtemisPrompts: false,
+    openFirefoxFullscreenOnTvForWatch: false,
+    ensureSunshineBeforeTvPcConnect: false,
+    useStrictTvPcConnectionOrder: false,
+    selectTvPresentInArtemisAfterConnect: false,
+    askWhatToWatchAfterSiteEntry: false,
+    playAndFullscreenAfterSelection: false,
+    sunshineStartCommand: "",
+    watchSites: [],
+    tvShowSearchSite: "",
+    movieSearchSite: "",
+    askSeasonEpisodeForShows: false,
+    updatedAt: 0,
+  };
+  const patchWatchSites = Array.isArray(patch.watchSites)
+    ? patch.watchSites.map((site) => String(site || "").trim()).filter((site) => site.length > 0)
+    : [];
+  const prevWatchSites = Array.isArray(prev.watchSites)
+    ? prev.watchSites.map((site) => String(site || "").trim()).filter((site) => site.length > 0)
+    : [];
+  const next = {
+    approveArtemisPrompts: prev.approveArtemisPrompts || patch.approveArtemisPrompts === true,
+    openFirefoxFullscreenOnTvForWatch:
+      prev.openFirefoxFullscreenOnTvForWatch || patch.openFirefoxFullscreenOnTvForWatch === true,
+    ensureSunshineBeforeTvPcConnect:
+      prev.ensureSunshineBeforeTvPcConnect || patch.ensureSunshineBeforeTvPcConnect === true,
+    useStrictTvPcConnectionOrder:
+      prev.useStrictTvPcConnectionOrder || patch.useStrictTvPcConnectionOrder === true,
+    selectTvPresentInArtemisAfterConnect:
+      prev.selectTvPresentInArtemisAfterConnect || patch.selectTvPresentInArtemisAfterConnect === true,
+    askWhatToWatchAfterSiteEntry:
+      prev.askWhatToWatchAfterSiteEntry || patch.askWhatToWatchAfterSiteEntry === true,
+    playAndFullscreenAfterSelection:
+      prev.playAndFullscreenAfterSelection || patch.playAndFullscreenAfterSelection === true,
+    sunshineStartCommand: String(patch.sunshineStartCommand || prev.sunshineStartCommand || "").trim(),
+    watchSites: patchWatchSites.length > 0 ? patchWatchSites : prevWatchSites,
+    tvShowSearchSite: String(patch.tvShowSearchSite || prev.tvShowSearchSite || "").trim(),
+    movieSearchSite: String(patch.movieSearchSite || prev.movieSearchSite || "").trim(),
+    askSeasonEpisodeForShows: prev.askSeasonEpisodeForShows || patch.askSeasonEpisodeForShows === true,
+    updatedAt: Date.now(),
+  };
+  const nextWatchSitesKey = JSON.stringify(next.watchSites || []);
+  const prevWatchSitesKey = JSON.stringify(prevWatchSites);
+
+  if (
+    next.approveArtemisPrompts === prev.approveArtemisPrompts
+    && next.openFirefoxFullscreenOnTvForWatch === prev.openFirefoxFullscreenOnTvForWatch
+    && next.ensureSunshineBeforeTvPcConnect === prev.ensureSunshineBeforeTvPcConnect
+    && next.useStrictTvPcConnectionOrder === (prev.useStrictTvPcConnectionOrder === true)
+    && next.selectTvPresentInArtemisAfterConnect === (prev.selectTvPresentInArtemisAfterConnect === true)
+    && next.askWhatToWatchAfterSiteEntry === (prev.askWhatToWatchAfterSiteEntry === true)
+    && next.playAndFullscreenAfterSelection === (prev.playAndFullscreenAfterSelection === true)
+    && next.sunshineStartCommand === String(prev.sunshineStartCommand || "").trim()
+    && nextWatchSitesKey === prevWatchSitesKey
+    && next.tvShowSearchSite === String(prev.tvShowSearchSite || "").trim()
+    && next.movieSearchSite === String(prev.movieSearchSite || "").trim()
+    && next.askSeasonEpisodeForShows === (prev.askSeasonEpisodeForShows === true)
+  ) {
+    return false;
+  }
+
+  chatAutomationPrefs[key] = next;
+  persistState({ immediate: true });
+  return true;
+}
+
+function buildChatAutomationPromptContext(chatId) {
+  const prefs = getChatAutomationPrefs(chatId);
+  if (!prefs) return "";
+  const lines = [];
+  if (prefs.tvShowSearchSite) {
+    lines.push(
+      `- TV show flow: use computer tools to open ${prefs.tvShowSearchSite}, search for the show name, and select the matching show.`,
+    );
+  }
+  if (prefs.askSeasonEpisodeForShows) {
+    lines.push("- After selecting a TV show, ask the user which season and episode to play.");
+  }
+  if (prefs.movieSearchSite) {
+    lines.push(
+      `- Movie flow: use computer tools to open ${prefs.movieSearchSite} and search/select the requested movie.`,
+    );
+  }
+  if (prefs.askWhatToWatchAfterSiteEntry) {
+    lines.push("- After entering the site main page, ask the user what they want to watch before searching.");
+  }
+  if (prefs.playAndFullscreenAfterSelection) {
+    lines.push("- After navigation to the selected title/episode, click play in preview and set fullscreen in the player.");
+  }
+  return lines.join("\n");
 }
 
 function setChatPrefs(chatId, patch) {
@@ -1835,15 +2355,20 @@ function setChatPrefs(chatId, patch) {
   const prev = getChatPrefs(key);
   const hasPatch = patch && typeof patch === "object";
   const hasPreset = hasPatch && Object.prototype.hasOwnProperty.call(patch, "ttsPreset");
+  const hasMode = hasPatch && Object.prototype.hasOwnProperty.call(patch, "ttsMode");
   const normalizedPreset = hasPreset
     ? normalizeTtsPresetName(patch.ttsPreset, { allowDefault: true })
     : normalizeTtsPresetName(prev.ttsPreset, { allowDefault: true });
+  const normalizedMode = hasMode
+    ? normalizeTtsVoiceMode(patch.ttsMode, { allowDefault: true })
+    : normalizeTtsVoiceMode(prev.ttsMode, { allowDefault: true });
   const next = {
     model: String(patch?.model ?? prev.model ?? "").trim(),
     reasoning: String(patch?.reasoning ?? prev.reasoning ?? "").trim(),
     ttsPreset: normalizedPreset === "default" ? "" : normalizedPreset,
+    ttsMode: normalizedMode === "default" ? "" : normalizedMode,
   };
-  if (!next.model && !next.reasoning && !next.ttsPreset) {
+  if (!next.model && !next.reasoning && !next.ttsPreset && !next.ttsMode) {
     if (Object.prototype.hasOwnProperty.call(chatPrefs, key)) {
       delete chatPrefs[key];
       persistState();
@@ -2251,6 +2776,29 @@ function resolveWorkerIdFromUserInput(input) {
   return orchWorkerRuntime.resolveWorkerIdFromUserInput(input);
 }
 
+function summarizeWorkerCapabilities(worker) {
+  if (!worker || typeof worker !== "object") return "";
+  const kind = String(worker.kind || "").trim().toLowerCase();
+  const workdir = String(worker.workdir || "").trim().replace(/\\/g, "/");
+  const scope = kind !== "repo"
+    ? "general requests, web research, local PC/system tasks, and TV control"
+    : workdir
+      ? `repo work in ${workdir}`
+      : "workspace-specific coding tasks";
+  return `best_for=${scope}; tools=files, shell, git, web lookup, Windows UI automation, TV ADB control via tv_power/tv_open_app/tv_close_app/tv_capture; channels=text/voice`;
+}
+
+function listWorkerCapabilities() {
+  return listCodexWorkers().map((worker) => ({
+    workerId: String(worker.id || "").trim(),
+    summary: summarizeWorkerCapabilities(worker),
+  }));
+}
+
+function getWorkerCapabilitySummary(workerId) {
+  return summarizeWorkerCapabilities(getCodexWorker(workerId));
+}
+
 function ensureTtsLane() {
   return orchLaneRegistryRuntime.ensureTtsLane();
 }
@@ -2328,6 +2876,7 @@ const orchLaneRuntime = createOrchLaneRuntime({
   log,
   redactError,
   getActiveWorkerForChat,
+  listCodexWorkers,
   setActiveWorkerForChat,
   ensureWorkerLane,
   ensureTtsLane,
@@ -2406,6 +2955,7 @@ const orchRouterRuntime = createOrchRouterRuntime({
   redactError,
   normalizeReplySnippet,
   recordReplyRoute,
+  getWorkerCapabilitySummary,
 });
 
 function totalQueuedJobs() {
@@ -2773,6 +3323,12 @@ function defaultPromptPreamble() {
     "- For sliders and other draggable controls, prefer drag over move-with-held-mouse and avoid blind coordinate guesses when label anchoring is available.",
     "- After slider drags, verify that value/position/log changed; if not, retry once with a clearly different offset instead of repeating the same drag.",
     "- Ask one short confirmation question before destructive actions.",
+    "",
+    "TV control tools (ADB):",
+    "- Use tools/tv_power.ps1 (or tools/tv_power_on.cmd / tools/tv_power_off.cmd) to wake, sleep, or toggle the TV.",
+    "- Use tools/tv_open_app.ps1 and tools/tv_close_app.ps1 to launch or close TV apps such as YouTube, Netflix, Sunshine, Artemis, RetroArch, VLC, Spotify, or a custom package.",
+    "- Use tools/tv_capture.ps1 to capture a screenshot from the connected TV and pull it locally.",
+    "- Refer to tools/README.md for parameters when needed.",
   ].join("\n");
 }
 
@@ -2786,6 +3342,7 @@ function defaultVoicePromptPreamble() {
     "Do not output code blocks, markdown, commands, stack traces, JSON, or file paths.",
     "Do not include URLs in SPOKEN. URLs are allowed in TEXT_ONLY when useful.",
     "Avoid weird symbols and formatting; use plain words and short sentences.",
+    "If you refer to workers, use their proper names only, not IDs like w1 or W2.",
     "",
     "Front-end UI handling (Windows desktop automation):",
     "- Voice mode does not reduce capabilities. You can use tools/ui_automation.ps1 (or tools/ui.cmd).",
@@ -2800,6 +3357,13 @@ function defaultVoicePromptPreamble() {
     "- For sliders and other draggable controls, prefer drag over move-with-held-mouse and avoid blind coordinate guesses when label anchoring is available.",
     "- After slider drags, verify that value/position/log changed; if not, retry once with a clearly different offset instead of repeating the same drag.",
     "- Ask one short confirmation question before destructive actions.",
+    "",
+    "TV control tools (ADB):",
+    "- Voice mode does not limit these tools either.",
+    "- Use tools/tv_power.ps1 (or tools/tv_power_on.cmd / tools/tv_power_off.cmd) to wake, sleep, or toggle the TV.",
+    "- Use tools/tv_open_app.ps1 and tools/tv_close_app.ps1 to launch or close TV apps such as YouTube, Netflix, Sunshine, Artemis, RetroArch, VLC, Spotify, or a custom package.",
+    "- Use tools/tv_capture.ps1 to capture a screenshot from the connected TV and pull it locally.",
+    "- Refer to tools/README.md for parameters when needed.",
     "",
     "Output format:",
     "SPOKEN:",
@@ -2951,6 +3515,11 @@ function formatCodexPrompt(userText, options = {}) {
     if (lessonContext) {
       lines.push("", "Process memory (learned from previous mistakes):");
       lines.push(lessonContext);
+    }
+    const automationContext = buildChatAutomationPromptContext(chatId);
+    if (automationContext) {
+      lines.push("", "User workflow memory:");
+      lines.push(automationContext);
     }
   }
 
@@ -3294,7 +3863,7 @@ function sanitizeRawCodexArgs(rawLine) {
 
 function buildRawCodexSpec(job) {
   const rawArgs = Array.isArray(job?.rawArgs) ? [...job.rawArgs] : [];
-  const workdir = String(job?.workdir || CODEX_WORKDIR || ROOT).trim() || ROOT;
+  const workdir = String(job?.workdir || ROOT).trim() || ROOT;
   if (codexMode.mode === "wsl") {
     const shellCmd = [codexMode.codexPath || "codex", ...rawArgs].map(shQuote).join(" ");
     return {
@@ -3338,7 +3907,7 @@ function buildCodexExecSpec(job) {
       text: trimContextBlock(String(job.recentHistoryContext.text || ""), ORCH_RECENT_CONTEXT_MAX_CHARS, "[...older recent history truncated]"),
     }
     : null;
-  const workdir = String(job?.workdir || CODEX_WORKDIR || ROOT).trim() || ROOT;
+  const workdir = String(job?.workdir || ROOT).trim() || ROOT;
   const codexWorkdir = codexMode.mode === "wsl" ? toWslPath(workdir) : workdir;
   const promptText = formatCodexPrompt(job.text, {
     hasImages: rawImagePaths.length > 0,
@@ -4002,6 +4571,7 @@ function getTelegramCommandList() {
     { command: "help", description: "show help" },
     { command: "status", description: "show worker status" },
     { command: "workers", description: "list workspaces/workers" },
+    { command: "capabilities", description: "show worker capability map" },
     { command: "use", description: "switch active workspace" },
     { command: "spawn", description: "create a repo workspace" },
     { command: "retire", description: "remove a workspace" },
@@ -4172,7 +4742,7 @@ async function sendMessage(chatId, text, options = {}) {
             previousSentMessageId = Math.trunc(messageId);
           }
         }
-        logChat("out", chatId, formatted.text, { source: "telegram-send" });
+        logChat("out", chatId, formatted.text, { source: "telegram-send", routeWorkerId });
         break;
       } catch (err) {
         if (attempt >= 3) throw err;
@@ -4229,7 +4799,7 @@ async function sendPhoto(chatId, filePath, options = {}) {
           routeSessionId,
         });
       }
-      logChat("out", chatId, caption || "[photo]", { source: "telegram-photo" });
+      logChat("out", chatId, caption || "[photo]", { source: "telegram-photo", routeWorkerId });
       return msg;
     } catch (err) {
       // If we hit our own abort timeout, don't retry multiple times; it'll just stall the bot.
@@ -4292,7 +4862,7 @@ async function sendVoice(chatId, filePath, options = {}) {
           routeSessionId,
         });
       }
-      logChat("out", chatId, caption || "[voice]", { source: "telegram-voice" });
+      logChat("out", chatId, caption || "[voice]", { source: "telegram-voice", routeWorkerId });
       return msg;
     } catch (err) {
       // If we hit our own abort timeout, don't retry multiple times; it'll just stall the bot.
@@ -4352,7 +4922,7 @@ async function sendDocument(chatId, filePath, options = {}) {
           routeSessionId,
         });
       }
-      logChat("out", chatId, caption || `[document] ${fileName}`, { source: "telegram-document" });
+      logChat("out", chatId, caption || `[document] ${fileName}`, { source: "telegram-document", routeWorkerId });
       return msg;
     } catch (err) {
       if (attempt >= 3) throw err;
@@ -4780,6 +5350,7 @@ async function sendHelp(chatId) {
     fmtBold("Core"),
     "- /status - worker + queue status",
     "- /workers - list workspaces/workers",
+    "- /capabilities - show the worker capability map",
     "- /use <worker_id, name, or title> - switch active workspace",
     "- /queue - show queued prompts",
     "- /weather [city] - today/tomorrow forecast (voice when TTS is enabled)",
@@ -4812,7 +5383,7 @@ async function sendHelp(chatId) {
     "- /see <question> - take a screenshot and analyze it",
     "- /ask <question> - analyze your last sent image",
     "- /imgclear - clear the last image context",
-    "- /voice [name|list|default] - pick/set TTS voice preset (live, no restart)",
+    "- /voice [name|single|worker|list|default] - set TTS mode/preset (live, no restart)",
     "- /tts <text> - send a TTS voice message (requires TTS_ENABLED=1)",
     "- /abtest [text] - send one sample per voice preset for A/B listening",
     "- /sendfile <path> [caption] - send a file attachment (from ATTACH_ROOT)",
@@ -5103,11 +5674,11 @@ async function maybeHandleNaturalNewsRequest(chatId, text, { replyToMessageId = 
 function looksLikeSafeCommandMetaText(text) {
   const lower = String(text || "").trim().toLowerCase();
   if (!lower) return false;
-  if (!/\b(help|status|workers?|workspaces?|queue|queued)\b/.test(lower)) return false;
+  if (!/\b(help|status|workers?|workspaces?|queue|queued|restart|reboot|reload)\b/.test(lower)) return false;
 
   const commandMentions = [
-    /\b\/(?:help|status|workers|queue)\b/,
-    /\bslash\s+(?:help|status|workers?|queue)\b/,
+    /\b\/(?:help|status|workers|queue|restart)\b/,
+    /\bslash\s+(?:help|status|workers?|queue|restart)\b/,
     /\b(?:command|commands|request|feature|function|functions|handler|trigger|workflow|mode)\b/,
   ];
   if (commandMentions.some((re) => re.test(lower))) return true;
@@ -5127,7 +5698,7 @@ function parseNaturalSafeCommandIntent(text) {
   }
 
   const lower = raw.toLowerCase();
-  if (!/\b(help|status|workers?|workspaces?|queue|queued)\b/.test(lower)) {
+  if (!/\b(help|status|workers?|workspaces?|queue|queued|restart|reboot|reload)\b/.test(lower)) {
     return { matched: false, cmd: "", confidence: 0 };
   }
   if (looksLikeSafeCommandMetaText(lower)) {
@@ -5212,6 +5783,16 @@ function parseNaturalSafeCommandIntent(text) {
     consider("/queue", 0.86);
   }
 
+  if (/^(?:restart|reboot|reload)(?:\s+the)?\s+(?:bot|aidolon|system)?(?:\s+now)?$/.test(candidate)) {
+    consider("/restart", 0.97);
+  }
+  if (/^(?:please\s+)?(?:restart|reboot|reload)(?:\s+bot|\s+aidolon|\s+the\s+bot|\s+the\s+system)?(?:\s+now)?$/.test(candidate)) {
+    consider("/restart", 0.94);
+  }
+  if (/^(?:show|run|do)\s+(?:a\s+)?(?:bot\s+)?restart$/.test(candidate)) {
+    consider("/restart", 0.89);
+  }
+
   if (!bestCmd) {
     return { matched: false, cmd: "", confidence: 0 };
   }
@@ -5223,6 +5804,7 @@ function parseNaturalSafeCommandIntent(text) {
     /\bstatus\b/.test(candidate) ? "status" : "",
     /\b(workers?|workspaces?)\b/.test(candidate) ? "workers" : "",
     /\b(queue|queued)\b/.test(candidate) ? "queue" : "",
+    /\b(restart|reboot|reload)\b/.test(candidate) ? "restart" : "",
   ].filter(Boolean);
 
   let confidence = bestConfidence;
@@ -10572,18 +11154,18 @@ async function sendStatus(chatId) {
   const activeWorker = activeWorkerId ? getCodexWorker(activeWorkerId) : null;
   const activeWorkerName = String(activeWorker?.name || activeWorker?.title || "").trim();
   const activeWorkerLabel = activeWorkerId
-    ? activeWorkerName
-      ? `${activeWorkerId} (${activeWorkerName})`
-      : activeWorkerId
+    ? activeWorkerName || activeWorkerId
     : "(none)";
   const activeSession = getActiveSessionForChat(chatId, activeWorkerId);
   const prefs = getChatPrefs(chatId);
   const effectiveModel = String(prefs.model || CODEX_MODEL || "").trim() || "(default)";
   const effectiveReasoning = String(prefs.reasoning || CODEX_REASONING_EFFORT || "").trim() || "(default)";
+  const chatVoiceMode = resolveTtsVoiceModeForPrefs(prefs);
   const chatVoicePreset = normalizeTtsPresetName(prefs.ttsPreset, { allowDefault: true });
-  const effectiveVoicePreset = resolveTtsPresetForChat(chatId);
+  const effectiveVoicePreset = resolveTtsPresetForChat(chatId, "", activeWorkerId);
   const defaultVoicePreset = getDefaultTtsPresetName();
   const codexWorkers = listCodexWorkers();
+  const capabilityCount = codexWorkers.length;
   const ttsLane = getLane(ORCH_TTS_LANE_ID);
   const whisperLane = getLane(ORCH_WHISPER_LANE_ID);
   const restartCounts = laneWorkloadCounts();
@@ -10620,6 +11202,21 @@ async function sendStatus(chatId) {
     : TTS_BATCH_PIPELINED_MAX_CHUNKS > 0
       ? `adaptive (pipeline<=${TTS_BATCH_PIPELINED_MAX_CHUNKS})`
       : "pipelined";
+  const ttsKeepaliveLastClose = ttsKeepalive.lastCloseAt
+    ? `${formatRelativeAge(ttsKeepalive.lastCloseAt)} (${oneLine(ttsKeepalive.lastCloseReason || "").slice(0, 180) || "unknown"})`
+    : "never";
+  const ttsKeepaliveLastError = ttsKeepalive.lastErrorAt
+    ? `${formatRelativeAge(ttsKeepalive.lastErrorAt)} (${oneLine(ttsKeepalive.lastError || "").slice(0, 180) || "unknown"})`
+    : "never";
+  const ttsKeepaliveLastFallback = ttsKeepalive.lastFallbackAt
+    ? `${formatRelativeAge(ttsKeepalive.lastFallbackAt)} (${oneLine(ttsKeepalive.lastFallbackReason || "").slice(0, 140) || "unknown"})`
+    : "never";
+  const ttsKeepaliveLastRestart = ttsKeepalive.lastRestartAt
+    ? `${formatRelativeAge(ttsKeepalive.lastRestartAt)} (delay=${Math.max(0, Math.round(Number(ttsKeepalive.lastRestartDelayMs || 0)))}ms, reason=${oneLine(ttsKeepalive.lastRestartReason || "").slice(0, 120) || "unknown"})`
+    : "never";
+  const ttsKeepaliveLastStop = ttsKeepalive.lastStopAt
+    ? `${formatRelativeAge(ttsKeepalive.lastStopAt)} (${oneLine(ttsKeepalive.lastStopReason || "").slice(0, 180) || "unknown"})`
+    : "never";
   const worldMonitorWorkerId = String(worldMonitorMonitor.workerId || "").trim()
     || (WORLDMONITOR_MONITOR_ENABLED ? ensureWorldMonitorWorker() : "");
   const worldMonitorWorker = worldMonitorWorkerId ? getCodexWorker(worldMonitorWorkerId) : null;
@@ -10649,10 +11246,12 @@ async function sendStatus(chatId) {
     `- active_session: ${activeSession ? shortSessionId(activeSession) : "(none)"}`,
     `- model: ${effectiveModel}${prefs.model ? " (chat override)" : ""}`,
     `- reasoning: ${effectiveReasoning}${prefs.reasoning ? " (chat override)" : ""}`,
+    `- voice_mode: ${chatVoiceMode}`,
     `- voice_preset: ${effectiveVoicePreset}${chatVoicePreset ? " (chat override)" : ` (default=${defaultVoicePreset})`}`,
     "",
     fmtBold("Orchestrator"),
     `- workers: ${codexWorkers.length}/${ORCH_MAX_CODEX_WORKERS}`,
+    `- capabilities: ${capabilityCount} worker summaries`,
     `- queue: ${queued}/${queueCap}`,
     `- exec_mode: ${codexMode.mode}`,
     `- chat_actions: ${TELEGRAM_CHAT_ACTION_ENABLED ? `enabled (default=${TELEGRAM_CHAT_ACTION_DEFAULT}, voice=${TELEGRAM_CHAT_ACTION_VOICE}, interval=${TELEGRAM_CHAT_ACTION_INTERVAL_SEC}s)` : "disabled"}`,
@@ -10662,6 +11261,12 @@ async function sendStatus(chatId) {
     `- whisper: ${WHISPER_ENABLED ? "enabled" : "disabled"}`,
     `- whisper_keepalive: ${whisperKeepaliveState} (prewarm=${WHISPER_PREWARM_ON_STARTUP}, auto_restart=${WHISPER_KEEPALIVE_AUTO_RESTART})`,
     `- tts_keepalive: ${ttsKeepaliveState} (prewarm=${TTS_PREWARM_ON_STARTUP}, auto_restart=${TTS_KEEPALIVE_AUTO_RESTART})`,
+    `- tts_keepalive_diag: starts=${ttsKeepalive.startCount} ready=${ttsKeepalive.readyCount} closes=${ttsKeepalive.closeCount} stops=${ttsKeepalive.stopCount} errors=${ttsKeepalive.errorCount} restarts=${ttsKeepalive.restartScheduledCount}/${ttsKeepalive.restartFailureCount} req_fail=${ttsKeepalive.requestFailureCount}/${ttsKeepalive.requestCount} timeouts=${ttsKeepalive.timeoutCount} fallback(single=${ttsKeepalive.fallbackSingleCount},batch=${ttsKeepalive.fallbackBatchCount})`,
+    `- tts_keepalive_last_close: ${ttsKeepaliveLastClose}`,
+    `- tts_keepalive_last_stop: ${ttsKeepaliveLastStop}`,
+    `- tts_keepalive_last_error: ${ttsKeepaliveLastError}`,
+    `- tts_keepalive_last_restart: ${ttsKeepaliveLastRestart}`,
+    `- tts_keepalive_last_fallback: ${ttsKeepaliveLastFallback}`,
     `- tts_batch_mode: ${ttsBatchMode}`,
     `- tts_lane: ${ttsLane?.currentJob ? "busy" : "idle"} (queued=${ttsLane?.queue?.length || 0})`,
     `- whisper_lane: ${whisperLane?.currentJob ? "busy" : "idle"} (queued=${whisperLane?.queue?.length || 0})`,
@@ -10696,7 +11301,7 @@ async function sendStatus(chatId) {
     `- full_access: ${CODEX_DANGEROUS_FULL_ACCESS}`,
     `- sandbox: ${CODEX_SANDBOX}`,
     `- approval: ${CODEX_APPROVAL_POLICY}`,
-    `- general_workdir: ${String(getCodexWorker(ORCH_GENERAL_WORKER_ID)?.workdir || CODEX_WORKDIR)}`,
+    `- general_workdir: ${String(getCodexWorker(ORCH_GENERAL_WORKER_ID)?.workdir || ROOT)}`,
     `- time: ${nowIso()}`,
   ];
 
@@ -10730,11 +11335,9 @@ async function sendStatus(chatId) {
 
       const sessionId = getSessionForChatWorker(chatId, w.id);
       const sessionShort = sessionId ? shortSessionId(sessionId) : "(none)";
-      const wid = w.id === activeWorkerId ? fmtBold(w.id) : w.id;
       const workerName = String(w.name || "").trim() || "(unnamed)";
       if (index > 0) lines.push("");
-      lines.push(`- worker: ${wid}${activeTag}`);
-      lines.push(`- name: ${workerName}`);
+      lines.push(`- worker: ${workerName}${activeTag}`);
       lines.push(`- title: ${w.title}`);
       lines.push(`- kind: ${w.kind}`);
       lines.push(`- state: ${state}`);
@@ -10751,7 +11354,7 @@ async function sendWorkers(chatId) {
   const workers = listCodexWorkers();
   const activeWorker = activeWorkerId ? getCodexWorker(activeWorkerId) : null;
   const activeLabel = activeWorker
-    ? `${activeWorkerId} (${String(activeWorker.name || activeWorker.title || activeWorkerId).trim()})`
+    ? String(activeWorker.name || activeWorker.title || activeWorkerId).trim()
     : activeWorkerId || "(none)";
 
   const lines = [
@@ -10771,11 +11374,10 @@ async function sendWorkers(chatId) {
     const busy = Boolean(lane?.currentJob);
     const queued = lane?.queue?.length || 0;
     const marker = "-";
-    const wid = w.id === activeWorkerId ? fmtBold(w.id) : w.id;
     const displayName = String(w.name || "").trim() || String(w.title || "").trim() || w.id;
     const repoTag = w.title && w.title !== displayName ? ` | repo=${w.title}` : "";
     lines.push(
-      `${marker} ${wid}: ${displayName} (${w.kind}) | busy=${busy} | queued=${queued}${repoTag} | workdir=${String(w.workdir || "").replace(/\\/g, "/")}`,
+      `${marker} ${displayName} (${w.kind}) | busy=${busy} | queued=${queued}${repoTag} | workdir=${String(w.workdir || "").replace(/\\/g, "/")}`,
     );
   }
 
@@ -10787,6 +11389,35 @@ async function sendWorkers(chatId) {
     "/retire <worker_id, name, or title> - remove a workspace",
     "/newsstatus - worldmonitor monitor state",
   );
+
+  await sendMessage(chatId, lines.join("\n"));
+}
+
+async function sendCapabilities(chatId) {
+  const workers = listCodexWorkers();
+  const activeWorkerId = getActiveWorkerForChat(chatId);
+  const rows = listWorkerCapabilities();
+  const rowByWorker = new Map(rows.map((row) => [String(row.workerId || "").trim(), row]));
+
+  const lines = [
+    `${fmtBold("Capability Map")} (${rows.length} workers)`,
+  ];
+
+  if (workers.length === 0) {
+    lines.push("- no workers");
+    await sendMessage(chatId, lines.join("\n"));
+    return;
+  }
+
+  for (const worker of workers) {
+    const wid = String(worker.id || "").trim();
+    if (!wid) continue;
+    const marker = wid === activeWorkerId ? " (active)" : "";
+    const display = String(worker.name || worker.title || wid).trim() || wid;
+    const row = rowByWorker.get(wid) || null;
+    const summary = String(row?.summary || getWorkerCapabilitySummary(wid) || "").trim() || "(missing capability summary)";
+    lines.push("", `- worker: ${display}${marker}`, `- summary: ${summary}`);
+  }
 
   await sendMessage(chatId, lines.join("\n"));
 }
@@ -10943,24 +11574,34 @@ async function refreshModelPickerMessage(chatId, messageId) {
 
 function buildVoicePresetPickerPayload(chatId) {
   const prefs = getChatPrefs(chatId);
+  const ttsMode = resolveTtsVoiceModeForPrefs(prefs);
   const chatPreset = normalizeTtsPresetName(prefs.ttsPreset, { allowDefault: true });
-  const effective = resolveTtsPresetForChat(chatId);
+  const activeWorkerId = getActiveWorkerForChat(chatId);
+  const effective = resolveTtsPresetForChat(chatId, "", activeWorkerId);
   const defaultPreset = getDefaultTtsPresetName();
   const effectiveDesc = getTtsPresetDescription(effective);
   const defaultDesc = getTtsPresetDescription(defaultPreset);
   const chatLabel = chatPreset && chatPreset !== "default" ? chatPreset : "(none)";
   const chatDesc = chatPreset && chatPreset !== "default" ? getTtsPresetDescription(chatPreset) : "";
+  const modeLabel = ttsMode === TTS_VOICE_MODE_SINGLE ? "single (one voice for all)" : "worker (each worker + orchestrator)";
 
   const lines = [
     fmtBold("Voice preset (this chat)"),
+    `- mode: ${modeLabel}`,
     `- effective: ${effective}${effectiveDesc ? ` (${effectiveDesc})` : ""}`,
     `- chat_override: ${chatLabel}${chatDesc ? ` (${chatDesc})` : ""}`,
     `- bot_default: ${defaultPreset}${defaultDesc ? ` (${defaultDesc})` : ""}`,
     "",
-    "Tap a preset to apply immediately (no restart).",
+    "Tap mode first, then pick a preset (preset tap switches to single mode).",
   ];
 
   const keyboard = [];
+  const modeWorkerId = registerPrefButton(chatId, "tts-mode", TTS_VOICE_MODE_WORKER);
+  const modeSingleId = registerPrefButton(chatId, "tts-mode", TTS_VOICE_MODE_SINGLE);
+  keyboard.push([
+    { text: ttsMode === TTS_VOICE_MODE_WORKER ? "* Worker voices" : "Worker voices", callback_data: `pref:${modeWorkerId}` },
+    { text: ttsMode === TTS_VOICE_MODE_SINGLE ? "* Single voice" : "Single voice", callback_data: `pref:${modeSingleId}` },
+  ]);
   const presetChoices = getAvailableTtsPresetNames();
   for (let i = 0; i < presetChoices.length; i += 2) {
     const row = [];
@@ -10972,7 +11613,7 @@ function buildVoicePresetPickerPayload(chatId) {
   }
 
   const resetId = registerPrefButton(chatId, "tts-preset-reset", "default");
-  keyboard.push([{ text: "Use bot default", callback_data: `pref:${resetId}` }]);
+  keyboard.push([{ text: "Clear shared preset", callback_data: `pref:${resetId}` }]);
 
   return {
     text: lines.join("\n"),
@@ -11212,6 +11853,7 @@ function wipeChatState(chatId) {
   let changed = false;
   if (dropChatKey(lastImages)) changed = true;
   if (dropChatKey(chatPrefs)) changed = true;
+  if (dropChatKey(chatAutomationPrefs)) changed = true;
   if (dropChatKey(redditDigest)) changed = true;
   if (dropChatKey(weatherLocationsByChat)) changed = true;
   if (dropChatKey(orchActiveWorkerByChat)) changed = true;
@@ -11358,13 +12000,13 @@ async function runRawCodexJob(job) {
     child.stdout.on("data", (buf) => {
       const chunk = String(buf || "");
       job.stdoutTail = appendTail(job.stdoutTail, chunk, 50000);
-      if (CODEX_STREAM_OUTPUT_TO_TERMINAL) process.stdout.write(chunk);
+      if (CODEX_STREAM_OUTPUT_TO_TERMINAL) writeWorkerStreamChunk(chunk, { workerId: job?.workerId, stream: "stdout" });
       if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
     });
     child.stderr.on("data", (buf) => {
       const chunk = String(buf || "");
       job.stderrTail = appendTail(job.stderrTail, chunk, 50000);
-      if (CODEX_STREAM_OUTPUT_TO_TERMINAL) process.stderr.write(chunk);
+      if (CODEX_STREAM_OUTPUT_TO_TERMINAL) writeWorkerStreamChunk(chunk, { workerId: job?.workerId, stream: "stderr" });
       if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
     });
 
@@ -11436,6 +12078,7 @@ function getParsedCommandRouter() {
     sendCodexCommandMenu,
     sendStatus,
     sendWorkers,
+    sendCapabilities,
     sendQueue,
     resolveWorkerIdFromUserInput,
     touchWorker,
@@ -11595,6 +12238,22 @@ const TTS_PRESET_OUTPUT_GAINS = Object.freeze({
   "alien-terminal": 3.1,
   anonymous: 6.5,
 });
+const TTS_WORKER_PRESET_AUTO_ORDER = Object.freeze([
+  "hologram-ai",
+  "starship-comms",
+  "cyber-oracle",
+  "alien-terminal",
+  "anonymous",
+  "off",
+]);
+const TTS_WORKER_PRESET_DEFAULT_MAP = Object.freeze({
+  nova: "cyber-oracle",
+});
+const TTS_WORKER_PRESET_MAP = parseWorkerTtsPresetMap(TTS_WORKER_PRESET_MAP_RAW);
+const TTS_VOICE_MODE_SINGLE = "single";
+const TTS_VOICE_MODE_WORKER = "worker";
+const TTS_ORCHESTRATOR_ROLE_PRESET = "starship-comms";
+const TTS_GENERAL_WORKER_ROLE_KEYS = Object.freeze(["general", "astra", "orchestrator"]);
 
 function normalizeTtsPresetName(name, { allowDefault = false } = {}) {
   const raw = String(name || "").trim().toLowerCase();
@@ -11633,12 +12292,178 @@ function getDefaultTtsPresetName() {
   return normalized || "anonymous";
 }
 
-function resolveTtsPresetForChat(chatId, overridePreset = "") {
+function normalizeTtsVoiceMode(mode, { allowDefault = false } = {}) {
+  const raw = String(mode || "").trim().toLowerCase();
+  if (!raw) return "";
+  const key = raw.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "").replace(/[_\s]+/g, "-");
+  if (allowDefault && ["default", "auto", "bot"].includes(key)) return "default";
+  if (["single", "shared", "global", "same", "one"].includes(key)) return TTS_VOICE_MODE_SINGLE;
+  if (["worker", "workers", "role", "roles", "per-worker", "perrole"].includes(key)) return TTS_VOICE_MODE_WORKER;
+  return "";
+}
+
+function resolveTtsVoiceModeForPrefs(prefs = {}) {
+  const explicit = normalizeTtsVoiceMode(prefs?.ttsMode, { allowDefault: true });
+  if (explicit && explicit !== "default") return explicit;
+  const chatPreset = normalizeTtsPresetName(prefs?.ttsPreset, { allowDefault: true });
+  if (chatPreset && chatPreset !== "default") return TTS_VOICE_MODE_SINGLE;
+  return TTS_VOICE_MODE_WORKER;
+}
+
+function pickAvailableTtsPreset(preferredPreset, fallbackPreset = "") {
+  const preferred = normalizeTtsPresetName(preferredPreset);
+  const fallback = normalizeTtsPresetName(fallbackPreset);
+  const available = getAvailableTtsPresetNames();
+  if (preferred && available.includes(preferred)) return preferred;
+  if (fallback && available.includes(fallback)) return fallback;
+  return getDefaultTtsPresetName();
+}
+
+function normalizeWorkerPresetMapKey(value) {
+  return oneLine(String(value || "")).replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function parseWorkerTtsPresetMap(rawValue) {
+  const src = String(rawValue || "").trim();
+  const out = new Map();
+  if (!src) return out;
+
+  const addPair = (rawKey, rawPreset) => {
+    const key = normalizeWorkerPresetMapKey(rawKey);
+    if (!key) return;
+    const preset = normalizeTtsPresetName(rawPreset, { allowDefault: true });
+    if (!preset || preset === "default") return;
+    out.set(key, preset);
+  };
+
+  if (src.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(src);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        for (const [k, v] of Object.entries(parsed)) addPair(k, v);
+      }
+    } catch {
+      // fall through to plain text parsing
+    }
+  }
+
+  if (out.size > 0) return out;
+
+  for (const part of src.split(/[,\n;]+/)) {
+    const token = String(part || "").trim();
+    if (!token) continue;
+    const idx = token.indexOf(":");
+    if (idx <= 0) continue;
+    addPair(token.slice(0, idx), token.slice(idx + 1));
+  }
+  return out;
+}
+
+function getWorkerPresetKeyCandidates(workerId) {
+  const out = [];
+  const push = (value) => {
+    const key = normalizeWorkerPresetMapKey(value);
+    if (!key || out.includes(key)) return;
+    out.push(key);
+  };
+  const wid = String(workerId || "").trim();
+  if (!wid) return out;
+  push(wid);
+  const worker = getCodexWorker(wid);
+  if (!worker) return out;
+  push(worker.name);
+  push(worker.title);
+  return out;
+}
+
+function resolveMappedWorkerTtsPreset(workerId) {
+  const keys = getWorkerPresetKeyCandidates(workerId);
+  if (TTS_WORKER_PRESET_MAP instanceof Map && TTS_WORKER_PRESET_MAP.size > 0) {
+    for (const key of keys) {
+      const preset = normalizeTtsPresetName(TTS_WORKER_PRESET_MAP.get(key));
+      if (preset) return preset;
+    }
+  }
+  for (const key of keys) {
+    const preset = normalizeTtsPresetName(TTS_WORKER_PRESET_DEFAULT_MAP[key]);
+    if (preset) return preset;
+  }
+  return "";
+}
+
+function resolveAutoWorkerTtsPreset(workerId) {
+  const wid = String(workerId || "").trim();
+  if (!wid) return "";
+  const workers = listCodexWorkers();
+  if (!Array.isArray(workers) || workers.length < 2) return "";
+
+  const allChoices = TTS_WORKER_PRESET_AUTO_ORDER
+    .filter((name, idx, arr) => arr.indexOf(name) === idx)
+    .filter((name) => getAvailableTtsPresetNames().includes(name));
+  if (allChoices.length === 0) return "";
+  // Keep the orchestrator role voice reserved so worker auto-assignment is less likely to collide.
+  const choices = allChoices.filter((name) => name !== TTS_ORCHESTRATOR_ROLE_PRESET);
+  const effectiveChoices = choices.length > 0 ? choices : allChoices;
+
+  const orderedWorkerIds = workers
+    .slice()
+    .filter((w) => String(w?.id || "").trim() !== ORCH_GENERAL_WORKER_ID)
+    .sort((a, b) => {
+      const aCreated = Number(a?.createdAt || 0) || 0;
+      const bCreated = Number(b?.createdAt || 0) || 0;
+      if (aCreated !== bCreated) return aCreated - bCreated;
+      return String(a?.id || "").localeCompare(String(b?.id || ""));
+    })
+    .map((w) => String(w?.id || "").trim())
+    .filter(Boolean);
+
+  const index = orderedWorkerIds.indexOf(wid);
+  if (index < 0) return "";
+  return effectiveChoices[index % effectiveChoices.length] || "";
+}
+
+function resolveRoleBasedTtsPreset(workerId) {
+  const wid = String(workerId || "").trim();
+  const worker = wid ? getCodexWorker(wid) : null;
+  const workerNameKey = normalizeWorkerPresetMapKey(worker?.name || "");
+  const workerTitleKey = normalizeWorkerPresetMapKey(worker?.title || "");
+  const isGeneralRole = !wid
+    || wid === ORCH_GENERAL_WORKER_ID
+    || TTS_GENERAL_WORKER_ROLE_KEYS.includes(workerNameKey)
+    || TTS_GENERAL_WORKER_ROLE_KEYS.includes(workerTitleKey);
+  if (isGeneralRole) {
+    return pickAvailableTtsPreset(TTS_ORCHESTRATOR_ROLE_PRESET, getDefaultTtsPresetName());
+  }
+
+  const mappedWorkerPreset = resolveMappedWorkerTtsPreset(wid);
+  if (mappedWorkerPreset) return mappedWorkerPreset;
+  const autoWorkerPreset = resolveAutoWorkerTtsPreset(wid);
+  if (autoWorkerPreset) return autoWorkerPreset;
+  return getDefaultTtsPresetName();
+}
+
+function resolveTtsPresetForChat(chatId, overridePreset = "", workerId = "", options = {}) {
   const override = normalizeTtsPresetName(overridePreset, { allowDefault: true });
   if (override && override !== "default") return override;
+  const forceWorkerMode = options?.forceWorkerMode === true;
+  if (forceWorkerMode) {
+    return resolveRoleBasedTtsPreset(workerId);
+  }
   const prefs = getChatPrefs(chatId);
+  const ttsMode = resolveTtsVoiceModeForPrefs(prefs);
   const chatPreset = normalizeTtsPresetName(prefs.ttsPreset, { allowDefault: true });
+  if (ttsMode === TTS_VOICE_MODE_WORKER) {
+    return resolveRoleBasedTtsPreset(workerId);
+  }
+  if (ttsMode === TTS_VOICE_MODE_SINGLE) {
+    if (chatPreset && chatPreset !== "default") return chatPreset;
+    return getDefaultTtsPresetName();
+  }
   if (chatPreset && chatPreset !== "default") return chatPreset;
+  const mappedWorkerPreset = resolveMappedWorkerTtsPreset(workerId);
+  if (mappedWorkerPreset) return mappedWorkerPreset;
+  const autoWorkerPreset = resolveAutoWorkerTtsPreset(workerId);
+  if (autoWorkerPreset) return autoWorkerPreset;
   return getDefaultTtsPresetName();
 }
 
@@ -11735,9 +12560,23 @@ function parseTtsAbTestCommandInput(argText) {
 function resolveVoicePresetCommandAction(rawArg) {
   const raw = String(rawArg || "").trim();
   const arg = raw.toLowerCase();
+  const normalizedMode = normalizeTtsVoiceMode(raw, { allowDefault: true });
 
   if (!raw || ["list", "ls", "show", "status"].includes(arg)) {
     return { action: "status" };
+  }
+  if (normalizedMode === TTS_VOICE_MODE_SINGLE) {
+    return { action: "mode-single" };
+  }
+  if (normalizedMode === TTS_VOICE_MODE_WORKER) {
+    return { action: "mode-worker" };
+  }
+  const modeArg = raw.match(/^mode\s*[:=]?\s*(.+)$/i);
+  if (modeArg) {
+    const parsedMode = normalizeTtsVoiceMode(modeArg[1], { allowDefault: true });
+    if (parsedMode === TTS_VOICE_MODE_SINGLE) return { action: "mode-single" };
+    if (parsedMode === TTS_VOICE_MODE_WORKER) return { action: "mode-worker" };
+    return { action: "error", text: "Unknown voice mode. Use 'single' or 'worker'." };
   }
   if (["default", "reset", "clear", "auto", "bot"].includes(arg)) {
     return { action: "reset" };
@@ -11773,12 +12612,26 @@ async function handleVoicePresetCommand(chatId, rawArg) {
     return true;
   }
   if (decision.action === "reset") {
-    setChatPrefs(chatId, { ttsPreset: "" });
-    await sendMessage(chatId, `Voice preset reset to bot default: ${resolveTtsPresetForChat(chatId)}.`);
+    setChatPrefs(chatId, { ttsPreset: "", ttsMode: TTS_VOICE_MODE_WORKER });
+    const activeWorkerId = getActiveWorkerForChat(chatId);
+    await sendMessage(chatId, `Voice mode set to worker voices. Effective preset: ${resolveTtsPresetForChat(chatId, "", activeWorkerId)}.`);
     return true;
   }
-  setChatPrefs(chatId, { ttsPreset: decision.preset });
-  const effective = resolveTtsPresetForChat(chatId);
+  if (decision.action === "mode-single") {
+    setChatPrefs(chatId, { ttsMode: TTS_VOICE_MODE_SINGLE });
+    const activeWorkerId = getActiveWorkerForChat(chatId);
+    await sendMessage(chatId, `Voice mode set to single voice. Effective preset: ${resolveTtsPresetForChat(chatId, "", activeWorkerId)}.`);
+    return true;
+  }
+  if (decision.action === "mode-worker") {
+    setChatPrefs(chatId, { ttsMode: TTS_VOICE_MODE_WORKER });
+    const activeWorkerId = getActiveWorkerForChat(chatId);
+    await sendMessage(chatId, `Voice mode set to worker voices. Effective preset: ${resolveTtsPresetForChat(chatId, "", activeWorkerId)}.`);
+    return true;
+  }
+  setChatPrefs(chatId, { ttsPreset: decision.preset, ttsMode: TTS_VOICE_MODE_SINGLE });
+  const activeWorkerId = getActiveWorkerForChat(chatId);
+  const effective = resolveTtsPresetForChat(chatId, "", activeWorkerId);
   await sendMessage(chatId, `Voice preset set to ${effective}. Use /tts [preset:<name>] <text> for one-off comparisons.`);
   return true;
 }
@@ -12018,6 +12871,25 @@ function integerToOrdinalWords(value) {
 function applyCommonTtsPronunciationFixes(text) {
   let out = String(text || "");
   if (!out) return "";
+  out = out.normalize("NFKC");
+
+  // Normalize apostrophe variants (including escaped forms) before expansion.
+  out = out.replace(/\\+([`´‘’‚‛ʼʻʹʽʾʿ′＇ꞌ'])/g, "$1");
+  out = out.replace(/[`´‘’‚‛ʼʻʹʽʾʿ′＇ꞌ]/g, "'");
+
+  // Expand common contractions for smoother TTS while preserving possessives.
+  const contractionRules = [
+    [/\b([A-Za-z]+)\s*'\s*m\b/gi, "$1 am"],
+    [/\b([A-Za-z]+)\s*'\s*re\b/gi, "$1 are"],
+    [/\b([A-Za-z]+)\s*'\s*ve\b/gi, "$1 have"],
+    [/\b([A-Za-z]+)\s*'\s*ll\b/gi, "$1 will"],
+    [/\b([A-Za-z]+)\s*'\s*d\b/gi, "$1 would"],
+    [/\b([A-Za-z]+)\s*n\s*'\s*t\b/gi, "$1 not"],
+    [/\b(?:it|he|she|that|there|here|what|who|where|when|how)\s*'\s*s\b/gi, (m) => m.replace(/\s*'\s*s$/i, " is")],
+  ];
+  for (const [pattern, replacement] of contractionRules) {
+    out = out.replace(pattern, replacement);
+  }
 
   const replaceDegreesUnit = (input, unitPattern, unitLabel) => {
     let result = String(input || "");
@@ -12225,21 +13097,37 @@ function extractAttachDirectives(text) {
   const kept = [];
   const lines = src.split(/\r?\n/);
   for (const line of lines) {
-    const m = /^\s*ATTACH(?:_FILE)?\s*:\s*(.+?)\s*$/i.exec(String(line || ""));
+    const m = /^\s*(ATTACH(?:_FILE|_IMAGE)?)\s*:\s*(.+?)\s*$/i.exec(String(line || ""));
     if (!m) {
       kept.push(line);
       continue;
     }
-    const rest = String(m[1] || "").trim();
+    const directive = String(m[1] || "ATTACH").toUpperCase();
+    const rest = String(m[2] || "").trim();
     if (!rest) continue;
     const parts = rest.split("|");
     const p = _stripOptionalQuotes(String(parts[0] || "").trim());
     const caption = parts.length > 1 ? parts.slice(1).join("|").trim() : "";
     if (!p) continue;
-    attachments.push({ path: p, caption });
+    const forceMode = directive === "ATTACH_FILE"
+      ? "document"
+      : directive === "ATTACH_IMAGE"
+        ? "photo"
+        : "";
+    attachments.push({ path: p, caption, forceMode });
   }
 
   return { text: kept.join("\n").trim(), attachments };
+}
+
+function isPhotoAttachmentPath(filePath) {
+  const ext = path.extname(String(filePath || "")).toLowerCase();
+  return ext === ".png"
+    || ext === ".jpg"
+    || ext === ".jpeg"
+    || ext === ".webp"
+    || ext === ".gif"
+    || ext === ".bmp";
 }
 
 async function sendAttachments(chatId, attachments, options = {}) {
@@ -12267,16 +13155,27 @@ async function sendAttachments(chatId, attachments, options = {}) {
 
     const caption = String(item?.caption || "").trim();
     const fileName = path.basename(resolved);
+    const forceMode = String(item?.forceMode || "").trim().toLowerCase();
     try {
-      const msg = await sendDocument(chatId, resolved, {
-        caption,
-        fileName,
-        timeoutMs: ATTACH_UPLOAD_TIMEOUT_MS,
-        replyToMessageId,
-        routeWorkerId,
-        routeTaskId,
-        routeSessionId,
-      });
+      const preferPhoto = forceMode === "photo" || (forceMode !== "document" && isPhotoAttachmentPath(fileName));
+      const msg = preferPhoto
+        ? await sendPhoto(chatId, resolved, {
+          caption,
+          timeoutMs: ATTACH_UPLOAD_TIMEOUT_MS,
+          replyToMessageId,
+          routeWorkerId,
+          routeTaskId,
+          routeSessionId,
+        })
+        : await sendDocument(chatId, resolved, {
+          caption,
+          fileName,
+          timeoutMs: ATTACH_UPLOAD_TIMEOUT_MS,
+          replyToMessageId,
+          routeWorkerId,
+          routeTaskId,
+          routeSessionId,
+        });
       if (msg && typeof msg === "object") sent.push(msg);
     } catch (err) {
       await sendMessage(chatId, `Failed to send attachment ${fileName}: ${String(err?.message || err)}`);
@@ -12509,6 +13408,28 @@ function splitIntoSentencesBestEffort(text) {
   const src = String(text || "").trim();
   if (!src) return [];
 
+  const mergeOrderedListMarkers = (segments) => {
+    const inSegs = Array.isArray(segments) ? segments : [];
+    if (inSegs.length === 0) return [];
+    const out = [];
+    for (const raw of inSegs) {
+      const part = String(raw || "").trim();
+      if (!part) continue;
+      const isStandaloneMarker = /^\d{1,3}[.)]$/.test(part);
+      if (isStandaloneMarker && out.length > 0) {
+        // Keep ordered list markers (e.g., "1.") attached to the next text chunk.
+        out.push(`${part} `);
+        continue;
+      }
+      if (out.length > 0 && /\d{1,3}[.)]\s*$/.test(out[out.length - 1])) {
+        out[out.length - 1] = `${out[out.length - 1]}${part}`.trim();
+      } else {
+        out.push(part);
+      }
+    }
+    return out;
+  };
+
   // Prefer Intl.Segmenter when available (better multilingual handling).
   try {
     if (typeof Intl !== "undefined" && typeof Intl.Segmenter === "function") {
@@ -12518,7 +13439,7 @@ function splitIntoSentencesBestEffort(text) {
         const part = String(item?.segment || "").trim();
         if (part) out.push(part);
       }
-      if (out.length > 0) return out;
+      if (out.length > 0) return mergeOrderedListMarkers(out);
     }
   } catch {
     // fall through
@@ -12541,6 +13462,8 @@ function splitIntoSentencesBestEffort(text) {
   }
   const tail = buf.trim();
   if (tail) out.push(tail);
+  const merged = mergeOrderedListMarkers(out);
+  if (merged.length > 0) return merged;
   return out.length > 0 ? out : [src];
 }
 
@@ -13060,6 +13983,23 @@ function clearTtsKeepaliveRestartTimer() {
   }
 }
 
+function noteTtsKeepaliveError(errLike) {
+  const msg = oneLine(String(errLike || "").trim());
+  ttsKeepalive.errorCount = Math.max(0, Number(ttsKeepalive.errorCount || 0)) + 1;
+  ttsKeepalive.lastErrorAt = Date.now();
+  ttsKeepalive.lastError = msg;
+}
+
+function noteTtsKeepaliveFallback(mode, reason) {
+  if (String(mode || "").toLowerCase() === "batch") {
+    ttsKeepalive.fallbackBatchCount = Math.max(0, Number(ttsKeepalive.fallbackBatchCount || 0)) + 1;
+  } else {
+    ttsKeepalive.fallbackSingleCount = Math.max(0, Number(ttsKeepalive.fallbackSingleCount || 0)) + 1;
+  }
+  ttsKeepalive.lastFallbackAt = Date.now();
+  ttsKeepalive.lastFallbackReason = oneLine(String(reason || "").trim());
+}
+
 function scheduleTtsKeepaliveRestart(reason = "") {
   if (!TTS_KEEPALIVE || !TTS_KEEPALIVE_AUTO_RESTART) return;
   if (shuttingDown) return;
@@ -13074,6 +14014,10 @@ function scheduleTtsKeepaliveRestart(reason = "") {
     0.15,
   );
   const why = oneLine(String(reason || "").trim());
+  ttsKeepalive.restartScheduledCount = Math.max(0, Number(ttsKeepalive.restartScheduledCount || 0)) + 1;
+  ttsKeepalive.lastRestartAt = Date.now();
+  ttsKeepalive.lastRestartDelayMs = delayMs;
+  ttsKeepalive.lastRestartReason = why;
   log(`Scheduling TTS keepalive restart in ${delayMs}ms${why ? ` (${why})` : ""}.`);
 
   ttsKeepalive.restartTimer = setTimeout(async () => {
@@ -13087,6 +14031,8 @@ function scheduleTtsKeepaliveRestart(reason = "") {
         scheduleTtsKeepaliveRestart("not ready");
       }
     } catch (err) {
+      ttsKeepalive.restartFailureCount = Math.max(0, Number(ttsKeepalive.restartFailureCount || 0)) + 1;
+      noteTtsKeepaliveError(err?.message || err);
       log(`TTS keepalive auto-restart failed: ${redactError(err?.message || err)}`);
       scheduleTtsKeepaliveRestart("retry");
     }
@@ -13119,17 +14065,23 @@ function resolveTtsKeepaliveStart() {
   if (resolve) resolve(ttsKeepalive.proc);
 }
 
-function stopTtsKeepalive(reason = "", { allowAutoRestart = true } = {}) {
+function stopTtsKeepalive(reason = "", { allowAutoRestart = true, preserveStopReason = false } = {}) {
   const proc = ttsKeepalive.proc;
   ttsKeepalive.proc = null;
   ttsKeepalive.ready = false;
   ttsKeepalive.stdoutBuf = "";
   ttsKeepalive.stderrScanCarry = "";
+  ttsKeepalive.stderrNoiseCarry = "";
   if (!allowAutoRestart) {
     clearTtsKeepaliveRestartTimer();
     ttsKeepalive.restartAttempts = 0;
   }
   const why = String(reason || "").trim();
+  ttsKeepalive.stopCount = Math.max(0, Number(ttsKeepalive.stopCount || 0)) + 1;
+  if (!preserveStopReason || !String(ttsKeepalive.lastStopReason || "").trim()) {
+    ttsKeepalive.lastStopAt = Date.now();
+    ttsKeepalive.lastStopReason = why;
+  }
   rejectTtsKeepalivePending(why || "TTS keepalive stopped.");
   if (ttsKeepalive.startReject) {
     failTtsKeepaliveStart(new Error(why || "TTS keepalive stopped before becoming ready."));
@@ -13162,6 +14114,8 @@ function handleTtsKeepaliveLine(rawLine) {
   const type = String(msg.type || "").trim().toLowerCase();
   if (type === "ready") {
     ttsKeepalive.ready = true;
+    ttsKeepalive.readyCount = Math.max(0, Number(ttsKeepalive.readyCount || 0)) + 1;
+    ttsKeepalive.lastReadyAt = Date.now();
     resolveTtsKeepaliveStart();
     return;
   }
@@ -13188,6 +14142,8 @@ function handleTtsKeepaliveLine(rawLine) {
     return;
   }
   const err = String(msg.error || "TTS keepalive synthesis failed").trim() || "TTS keepalive synthesis failed";
+  ttsKeepalive.requestFailureCount = Math.max(0, Number(ttsKeepalive.requestFailureCount || 0)) + 1;
+  noteTtsKeepaliveError(err);
   pending.reject(new Error(err));
 }
 
@@ -13215,6 +14171,8 @@ async function ensureTtsKeepaliveRunning(pyBin) {
 
   let proc;
   try {
+    ttsKeepalive.startCount = Math.max(0, Number(ttsKeepalive.startCount || 0)) + 1;
+    ttsKeepalive.lastStartAt = Date.now();
     proc = spawn(pyBin, [
       AIDOLON_TTS_SERVER_SCRIPT_PATH,
       "--model",
@@ -13230,6 +14188,7 @@ async function ensureTtsKeepaliveRunning(pyBin) {
       stdio: ["pipe", "pipe", "pipe"],
     });
   } catch (err) {
+    noteTtsKeepaliveError(err?.message || err);
     failTtsKeepaliveStart(new Error(`Failed to start TTS keepalive process: ${err?.message || err}`));
     scheduleTtsKeepaliveRestart("spawn failed");
     return await startupPromise;
@@ -13240,11 +14199,13 @@ async function ensureTtsKeepaliveRunning(pyBin) {
   ttsKeepalive.stdoutBuf = "";
   ttsKeepalive.stderrTail = "";
   ttsKeepalive.stderrScanCarry = "";
+  ttsKeepalive.stderrNoiseCarry = "";
 
   if (proc.stdin && typeof proc.stdin.on === "function") {
     proc.stdin.on("error", (err) => {
       if (ttsKeepalive.proc !== proc) return;
       const msg = `TTS keepalive stdin error: ${err?.message || err}`;
+      noteTtsKeepaliveError(msg);
       rejectTtsKeepalivePending(msg);
       stopTtsKeepalive(msg);
     });
@@ -13265,24 +14226,31 @@ async function ensureTtsKeepaliveRunning(pyBin) {
 
   proc.stderr.on("data", (buf) => {
     const chunk = String(buf || "");
-    ttsKeepalive.stderrTail = appendTail(ttsKeepalive.stderrTail, chunk, 50000);
-    const fatal = detectTtsBackendFatalError(chunk, ttsKeepalive.stderrScanCarry);
+    const noise = stripTtsBackendNoise(chunk, ttsKeepalive.stderrNoiseCarry);
+    ttsKeepalive.stderrNoiseCarry = noise.carry;
+    const filteredChunk = noise.text;
+    if (!filteredChunk) return;
+    ttsKeepalive.stderrTail = appendTail(ttsKeepalive.stderrTail, filteredChunk, 50000);
+    const fatal = detectTtsBackendFatalError(filteredChunk, ttsKeepalive.stderrScanCarry);
     ttsKeepalive.stderrScanCarry = fatal.carry;
     if (fatal.message) {
       const msg = `TTS keepalive backend fatal error: ${fatal.message}`;
+      noteTtsKeepaliveError(msg);
       log(msg);
-      stopTtsKeepalive(msg);
+      // Keepalive server has its own in-process recovery for tokenizer failures.
+      // Force-killing here causes restart thrash under load and defeats that recovery path.
       return;
     }
-    if (TTS_STREAM_OUTPUT_TO_TERMINAL) process.stderr.write(chunk);
+    if (TTS_STREAM_OUTPUT_TO_TERMINAL) process.stderr.write(filteredChunk);
   });
 
   proc.on("error", (err) => {
     const msg = `TTS keepalive process error: ${err?.message || err}`;
+    noteTtsKeepaliveError(msg);
     if (ttsKeepalive.startReject) {
       failTtsKeepaliveStart(new Error(msg));
     }
-    stopTtsKeepalive(msg);
+    stopTtsKeepalive(msg, { preserveStopReason: true });
   });
 
   proc.on("close", (code, signal) => {
@@ -13290,6 +14258,10 @@ async function ensureTtsKeepaliveRunning(pyBin) {
     const sigText = signal ? ` (${signal})` : "";
     const tail = oneLine(ttsKeepalive.stderrTail || "");
     const msg = `TTS keepalive closed (${codeText}${sigText})${tail ? `: ${tail}` : ""}`;
+    ttsKeepalive.closeCount = Math.max(0, Number(ttsKeepalive.closeCount || 0)) + 1;
+    ttsKeepalive.lastCloseAt = Date.now();
+    ttsKeepalive.lastCloseReason = msg;
+    if (Number(code) !== 0) noteTtsKeepaliveError(msg);
     if (ttsKeepalive.startReject) {
       failTtsKeepaliveStart(new Error(msg));
     }
@@ -13344,13 +14316,17 @@ async function requestTtsKeepalive(payload, { abortSignal, timeoutMs = 0, job } 
     const ms = Number(timeoutMs);
     if (Number.isFinite(ms) && ms > 0) {
       pending.timer = setTimeout(() => {
+        ttsKeepalive.timeoutCount = Math.max(0, Number(ttsKeepalive.timeoutCount || 0)) + 1;
         stopTtsKeepalive(`TTS timed out after ${Math.round(ms / 1000)}s.`);
       }, ms);
     }
 
     ttsKeepalive.pending = pending;
+    ttsKeepalive.requestCount = Math.max(0, Number(ttsKeepalive.requestCount || 0)) + 1;
     writeChildStdin(proc, line, (err) => {
       const msg = `Failed to write TTS keepalive request: ${err?.message || err}`;
+      ttsKeepalive.requestFailureCount = Math.max(0, Number(ttsKeepalive.requestFailureCount || 0)) + 1;
+      noteTtsKeepaliveError(msg);
       rejectTtsKeepalivePending(msg);
       if (ttsKeepalive.proc === proc) {
         stopTtsKeepalive(msg);
@@ -13405,6 +14381,18 @@ async function runTtsJob(job, lane) {
     }
     return err;
   };
+  const shouldForceTtsKeepaliveRestart = (errMsg) => {
+    const msg = String(errMsg || "").toLowerCase();
+    if (!msg) return false;
+    return /tts backend fatal error/.test(msg);
+  };
+  const forceTtsKeepaliveRestartIfFatal = (errMsg, reason) => {
+    if (!TTS_KEEPALIVE) return;
+    if (!shouldForceTtsKeepaliveRestart(errMsg)) return;
+    stopTtsKeepalive(
+      reason || "TTS backend fatal error during synthesis; forcing keepalive restart before next voice reply.",
+    );
+  };
   try {
   const runtime = job?.ttsRuntime && job.ttsRuntime.ok
     ? job.ttsRuntime
@@ -13435,6 +14423,7 @@ async function runTtsJob(job, lane) {
 
   let wavPath = "";
   let oggPath = "";
+  let keepaliveFatalRetryUsedSingle = false;
 
   const runSynthOnce = async (outWavPath) => {
     const timeoutMs = minPositive([TTS_TIMEOUT_MS, hardTimeoutRemainingMs(job, TTS_HARD_TIMEOUT_MS)]);
@@ -13452,7 +14441,7 @@ async function runTtsJob(job, lane) {
         }
         return { ok: true };
       } catch (err) {
-        const msg = String(err?.message || err || "").trim();
+        let msg = String(err?.message || err || "").trim();
         if (job.cancelRequested || /tts canceled/i.test(msg)) {
           return { ok: false, text: "TTS canceled." };
         }
@@ -13462,10 +14451,40 @@ async function runTtsJob(job, lane) {
           job.timedOutStage = "synth";
           return { ok: false, text: msg };
         }
+        if (!keepaliveFatalRetryUsedSingle && shouldForceTtsKeepaliveRestart(msg)) {
+          keepaliveFatalRetryUsedSingle = true;
+          stopTtsKeepalive("TTS keepalive fatal synthesis error; restarting and retrying once.");
+          await sleep(250);
+          try {
+            await runTtsSynthKeepaliveSingle({
+              text,
+              outWavPath,
+              timeoutMs,
+              abortSignal,
+              job,
+            });
+            if (!fs.existsSync(outWavPath)) {
+              return { ok: false, text: "TTS synthesis finished, but WAV output file is missing." };
+            }
+            return { ok: true };
+          } catch (retryErr) {
+            msg = String(retryErr?.message || retryErr || "").trim();
+            if (job.cancelRequested || /tts canceled/i.test(msg)) {
+              return { ok: false, text: "TTS canceled." };
+            }
+            if (/timed out/i.test(msg)) {
+              job.timedOut = true;
+              job.timedOutMs = timeoutMs || Number(job.timedOutMs || 0);
+              job.timedOutStage = "synth";
+              return { ok: false, text: msg };
+            }
+          }
+        }
         if (!canUseLegacySynth) {
           return { ok: false, text: msg || "TTS keepalive synthesis failed." };
         }
         log(`TTS keepalive synth failed; falling back to one-shot process: ${oneLine(msg || "unknown error")}`);
+        noteTtsKeepaliveFallback("single", msg || "unknown error");
       }
     }
 
@@ -13511,6 +14530,7 @@ async function runTtsJob(job, lane) {
 
       let timeoutForceFinish = null;
       let stderrScanCarry = "";
+      let stderrNoiseCarry = "";
       const timeout = timeoutMs > 0
         ? setTimeout(() => {
           job.timedOut = true;
@@ -13535,8 +14555,12 @@ async function runTtsJob(job, lane) {
       });
       child.stderr.on("data", (buf) => {
         const chunk = String(buf || "");
-        job.stderrTail = appendTail(job.stderrTail, chunk, 50000);
-        const fatal = detectTtsBackendFatalError(chunk, stderrScanCarry);
+        const noise = stripTtsBackendNoise(chunk, stderrNoiseCarry);
+        stderrNoiseCarry = noise.carry;
+        const filteredChunk = noise.text;
+        if (!filteredChunk) return;
+        job.stderrTail = appendTail(job.stderrTail, filteredChunk, 50000);
+        const fatal = detectTtsBackendFatalError(filteredChunk, stderrScanCarry);
         stderrScanCarry = fatal.carry;
         if (fatal.message && !job.cancelRequested) {
           const msg = `TTS backend fatal error: ${fatal.message}`;
@@ -13546,7 +14570,7 @@ async function runTtsJob(job, lane) {
           finish({ ok: false, text: msg });
           return;
         }
-        if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
+        if (typeof job.onProgressChunk === "function") job.onProgressChunk(filteredChunk, "stderr");
       });
       child.on("error", (err) => {
         clearTimeout(timeout);
@@ -13630,10 +14654,12 @@ async function runTtsJob(job, lane) {
       continue;
     }
 
+    forceTtsKeepaliveRestartIfFatal(synthOk.text);
     return { ok: false, text: formatFailureText(synthOk.text), afterText, attachments };
   }
 
   if (!wavPath) {
+    forceTtsKeepaliveRestartIfFatal(synthOk.text);
     return { ok: false, text: formatFailureText(synthOk.text), afterText, attachments };
   }
 
@@ -13877,6 +14903,9 @@ async function runTtsJob(job, lane) {
   }
 
   if (uploadErr) {
+    if (TTS_KEEPALIVE) {
+      stopTtsKeepalive("TTS voice delivery failure; forcing keepalive restart before next voice reply.");
+    }
     if (job.cancelRequested) {
       return { ok: false, text: "TTS canceled." };
     }
@@ -14002,6 +15031,14 @@ async function runTtsBatchJobPipelined(job, lane) {
         continue;
       }
 
+      if (
+        TTS_KEEPALIVE &&
+        /tts backend fatal error/i.test(
+          String(chunkResult?.text || ""),
+        )
+      ) {
+        stopTtsKeepalive("TTS batch chunk backend fatal error; forcing keepalive restart before next voice reply.");
+      }
       fallbackCount += 1;
       const errText = oneLine(String(chunkResult?.text || "TTS chunk failed").trim());
       const cappedErr = errText.length > 200 ? `${errText.slice(0, 197)}...` : errText;
@@ -14134,6 +15171,7 @@ async function runTtsBatchJob(job, lane) {
   let base = "";
   let wavBase = "";
   let wavPaths = [];
+  let keepaliveFatalRetryUsedBatch = false;
 
   const cleanupWavs = () => {
     for (const p of wavPaths) {
@@ -14158,7 +15196,7 @@ async function runTtsBatchJob(job, lane) {
         });
         return { ok: true };
       } catch (err) {
-        const msg = String(err?.message || err || "").trim();
+        let msg = String(err?.message || err || "").trim();
         if (job.cancelRequested || /tts canceled/i.test(msg)) {
           return { ok: false, text: "TTS canceled." };
         }
@@ -14168,10 +15206,37 @@ async function runTtsBatchJob(job, lane) {
           job.timedOutStage = "synth";
           return { ok: false, text: msg };
         }
+        if (!keepaliveFatalRetryUsedBatch && shouldForceTtsKeepaliveRestart(msg)) {
+          keepaliveFatalRetryUsedBatch = true;
+          stopTtsKeepalive("TTS keepalive fatal batch synthesis error; restarting and retrying once.");
+          await sleep(250);
+          try {
+            await runTtsSynthKeepaliveBatch({
+              texts,
+              outWavBase,
+              timeoutMs,
+              abortSignal,
+              job,
+            });
+            return { ok: true };
+          } catch (retryErr) {
+            msg = String(retryErr?.message || retryErr || "").trim();
+            if (job.cancelRequested || /tts canceled/i.test(msg)) {
+              return { ok: false, text: "TTS canceled." };
+            }
+            if (/timed out/i.test(msg)) {
+              job.timedOut = true;
+              job.timedOutMs = timeoutMs || Number(job.timedOutMs || 0);
+              job.timedOutStage = "synth";
+              return { ok: false, text: msg };
+            }
+          }
+        }
         if (!canUseLegacySynth) {
           return { ok: false, text: msg || "TTS keepalive synthesis failed." };
         }
         log(`TTS keepalive batch synth failed; falling back to one-shot process: ${oneLine(msg || "unknown error")}`);
+        noteTtsKeepaliveFallback("batch", msg || "unknown error");
       }
     }
 
@@ -14219,6 +15284,7 @@ async function runTtsBatchJob(job, lane) {
 
       let timeoutForceFinish = null;
       let stderrScanCarry = "";
+      let stderrNoiseCarry = "";
       const timeout = timeoutMs > 0
         ? setTimeout(() => {
           job.timedOut = true;
@@ -14244,8 +15310,12 @@ async function runTtsBatchJob(job, lane) {
       });
       child.stderr.on("data", (buf) => {
         const chunk = String(buf || "");
-        job.stderrTail = appendTail(job.stderrTail, chunk, 50000);
-        const fatal = detectTtsBackendFatalError(chunk, stderrScanCarry);
+        const noise = stripTtsBackendNoise(chunk, stderrNoiseCarry);
+        stderrNoiseCarry = noise.carry;
+        const filteredChunk = noise.text;
+        if (!filteredChunk) return;
+        job.stderrTail = appendTail(job.stderrTail, filteredChunk, 50000);
+        const fatal = detectTtsBackendFatalError(filteredChunk, stderrScanCarry);
         stderrScanCarry = fatal.carry;
         if (fatal.message && !job.cancelRequested) {
           const msg = `TTS backend fatal error: ${fatal.message}`;
@@ -14255,8 +15325,8 @@ async function runTtsBatchJob(job, lane) {
           finish({ ok: false, text: msg });
           return;
         }
-        if (TTS_STREAM_OUTPUT_TO_TERMINAL) process.stderr.write(chunk);
-        if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
+        if (TTS_STREAM_OUTPUT_TO_TERMINAL) process.stderr.write(filteredChunk);
+        if (typeof job.onProgressChunk === "function") job.onProgressChunk(filteredChunk, "stderr");
       });
       child.on("error", (err) => {
         clearTimeout(timeout);
@@ -14579,6 +15649,9 @@ async function runTtsBatchJob(job, lane) {
     }
 
     if (uploadErr) {
+      if (TTS_KEEPALIVE) {
+        stopTtsKeepalive("TTS voice delivery failure; forcing keepalive restart before next voice reply.");
+      }
       cleanupWavs();
       if (job.cancelRequested) {
         return { ok: false, text: "TTS canceled." };
@@ -14716,14 +15789,14 @@ async function runCodexJob(job) {
     child.stdout.on("data", (buf) => {
       const chunk = String(buf || "");
       job.stdoutTail = appendTail(job.stdoutTail, chunk);
-      if (CODEX_STREAM_OUTPUT_TO_TERMINAL) process.stdout.write(chunk);
+      if (CODEX_STREAM_OUTPUT_TO_TERMINAL) writeWorkerStreamChunk(chunk, { workerId: job?.workerId, stream: "stdout" });
       if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
     });
 
     child.stderr.on("data", (buf) => {
       const chunk = String(buf || "");
       job.stderrTail = appendTail(job.stderrTail, chunk);
-      if (CODEX_STREAM_OUTPUT_TO_TERMINAL) process.stderr.write(chunk);
+      if (CODEX_STREAM_OUTPUT_TO_TERMINAL) writeWorkerStreamChunk(chunk, { workerId: job?.workerId, stream: "stderr" });
       if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
     });
 
@@ -15384,6 +16457,7 @@ async function runWhisperJob(job) {
     if (!transcript) {
       return { ok: false, text: "No speech detected in voice message." };
     }
+    rememberChatAutomationPrefsFromText(chatId, transcript);
 
     const user = String(job?.user || "").trim();
     logChat("in", chatId, transcript, { source: "voice-transcript", user: user || "unknown" });
@@ -15746,14 +16820,32 @@ async function handleCallbackQuery(cb) {
         await refreshVoicePresetPickerMessage(chatId, pickerMessageId);
         return;
       }
-      setChatPrefs(chatId, { ttsPreset: selected === "default" ? "" : selected });
-      await answerCallbackQuery(id, `Voice preset: ${resolveTtsPresetForChat(chatId)}`);
+      setChatPrefs(chatId, {
+        ttsPreset: selected === "default" ? "" : selected,
+        ttsMode: TTS_VOICE_MODE_SINGLE,
+      });
+      const activeWorkerId = getActiveWorkerForChat(chatId);
+      await answerCallbackQuery(id, `Voice preset: ${resolveTtsPresetForChat(chatId, "", activeWorkerId)}`);
+      await refreshVoicePresetPickerMessage(chatId, pickerMessageId);
+      return;
+    }
+    if (entry.kind === "tts-mode") {
+      const selectedMode = normalizeTtsVoiceMode(entry.value, { allowDefault: true });
+      if (!selectedMode || selectedMode === "default") {
+        await answerCallbackQuery(id, "Invalid mode");
+        await refreshVoicePresetPickerMessage(chatId, pickerMessageId);
+        return;
+      }
+      setChatPrefs(chatId, { ttsMode: selectedMode });
+      const activeWorkerId = getActiveWorkerForChat(chatId);
+      await answerCallbackQuery(id, `Mode: ${selectedMode}; voice: ${resolveTtsPresetForChat(chatId, "", activeWorkerId)}`);
       await refreshVoicePresetPickerMessage(chatId, pickerMessageId);
       return;
     }
     if (entry.kind === "tts-preset-reset") {
       setChatPrefs(chatId, { ttsPreset: "" });
-      await answerCallbackQuery(id, `Voice preset: ${resolveTtsPresetForChat(chatId)}`);
+      const activeWorkerId = getActiveWorkerForChat(chatId);
+      await answerCallbackQuery(id, `Voice preset: ${resolveTtsPresetForChat(chatId, "", activeWorkerId)}`);
       await refreshVoicePresetPickerMessage(chatId, pickerMessageId);
       return;
     }
@@ -15897,6 +16989,7 @@ async function handleIncomingMessage(msg) {
   }
 
   logChat("in", chatId, text, { source: text.startsWith("/") ? "command" : "plain", user });
+  rememberChatAutomationPrefsFromText(chatId, text);
 
   const replyToMessageId = Number(msg?.message_id || 0);
   if (text.startsWith("/")) {

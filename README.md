@@ -95,7 +95,7 @@ Vision and media:
 - `/tts <text>` - send TTS voice message
 - `/tts [preset:<name>] <text>` - send one voice message with a one-off preset
 - `/abtest [text]` - send one sample per voice preset for A/B listening
-- `/voice [name|list|default]` - pick/set live TTS voice preset (no restart)
+- `/voice [name|single|worker|list|default]` - set live TTS voice mode/preset (no restart)
 
 Files:
 - `/sendfile <relative-path> [caption]` - send file from `ATTACH_ROOT`
@@ -137,6 +137,14 @@ The orchestrator keeps a small persistent memory of repeated failure patterns an
 - The top lessons are included automatically in new prompts to reduce repeat mistakes.
 - `/status` shows whether lesson memory is enabled and how many lessons are stored.
 
+## Workflow catalog persistence
+
+Chat workflow automation preferences are mirrored to a dedicated catalog outside the volatile runtime folder so they survive routine cleanup and restart cycles.
+
+- Default location: `%APPDATA%/workflow-catalog.json` on Windows (fallback: `~/.aidolon/workflow-catalog.json`).
+- Override location: set `ORCH_WORKFLOW_CATALOG_PATH`.
+- This catalog is local-only and not part of Git operations unless you explicitly point it inside your repo.
+
 ## Voice flow
 
 Voice notes:
@@ -148,6 +156,9 @@ Voice replies:
 - Enable `TTS_ENABLED=1`.
 - If you want automatic voice replies for incoming voice notes, set `TTS_REPLY_TO_VOICE=1`.
 - Use `/voice` to switch styles while running; no bot restart needed.
+- `/voice worker` enables role-based voices (each worker keeps a stable voice, orchestrator/general uses `starship-comms`).
+- `/voice <preset>` or preset buttons switch to single-voice mode (all workers share that one voice).
+- Optional override: set `TTS_WORKER_PRESET_MAP` (for example `astra:hologram-ai,orion:starship-comms,nova:cyber-oracle`).
 - Sci-fi presets are intentionally stylized:
   - `hologram-ai`: brighter hologram shimmer with stronger gain staging.
   - `starship-comms`: radio-band comms with NASA-style start/end beeps and short interference bursts.
@@ -180,6 +191,10 @@ Minimal browser-control toolset for real UI testing:
 
 - `tools/ui_automation.ps1` (PowerShell entrypoint)
 - `tools/ui.cmd` (wrapper)
+- `tools/tv_capture.ps1` and `tools/tv_capture.cmd` (Android TV screenshot capture/pull/cleanup)
+- `tools/tv_open_app.ps1` and `tools/tv_open_app.cmd` (Android TV app launcher with presets + custom package)
+- `tools/tv_close_app.ps1` and `tools/tv_close_app.cmd` (Android TV app closer with presets + custom package)
+- `tools/tv_power.ps1` plus `tools/tv_power_on.cmd` and `tools/tv_power_off.cmd` (TV wake/sleep over ADB)
 
 Supported actions:
 
@@ -195,14 +210,26 @@ Supported actions:
 - `scroll` - wheel scroll at current or provided cursor point
 - `wait` - explicit timing/waits
 - `screenshot` - capture active desktop view (single or all screens)
+- `batch` - run a JSON list of actions in sequence
+- `host` - long-lived JSONL automation host
+- `telemetry` - runtime metrics snapshot (totals, failures, adaptive profile, recent events)
 
 Move behavior notes:
 - Pointer actions glide from the current cursor position to the target (no teleport jumps).
 - `move` supports left-button drag mode (`-DragLeft`) to drag sliders.
 - `drag` supports explicit start/end points and drag duration.
 - `click`, `double_click`, `right_click`, and `click_text` support `-HighlightBeforeClick`.
+- `click_text` supports optional region-targeted OCR (`-RegionX -RegionY -RegionWidth -RegionHeight`) for tighter matching.
+- `click_text` supports short-lived OCR caching (`-OcrCacheTtlMs`) to speed repeated host/batch scans.
 - `key` now normalizes common Enter aliases (for example `Enter` and `Return`).
 - `type` uses randomized per-character delays by default for short strings, and auto-switches to direct send for longer content.
+- Pointer actions and drag now include hard cursor-position verification in the result payload.
+- Screenshot capture now verifies files were created before returning success.
+- Focus is safer by default: ambiguous title/regex matches now fail unless `-AllowAmbiguousFocus` is set.
+- Runtime safety gate is available with `AIDOLON_UI_SAFETY_MODE=strict` (use `AIDOLON_UI_ALLOW_MUTATIONS=1` or `-AllowUnsafe` to override).
+- `batch` and `host` requests accept optional integer `priority` so higher-priority queued actions execute first.
+- `host` supports telemetry control messages (`telemetry`, optional reset) in addition to normal actions.
+- Phase 3 adds telemetry and adaptive tuning: repeated cursor misses auto-increase move/drag smoothness, and repeated OCR misses raise OCR cache TTL (and can widen `click_text` scans when safe).
 
 Recommended loop for frontend UX checks:
 
@@ -273,6 +300,7 @@ Media and voice:
 - `VISION_ENABLED`
 - `TTS_ENABLED`, `TTS_REPLY_TO_VOICE`
 - `TTS_MODEL`, `TTS_REFERENCE_AUDIO`, `TTS_FFMPEG_BIN`
+- `TTS_WORKER_PRESET_MAP`
 - `TTS_STARSHIP_BEEP_START`, `TTS_STARSHIP_BEEP_END`
 
 WorldMonitor core:
