@@ -42,4 +42,4 @@ TV control tools (ADB):
 
 If you create a file that should be delivered as a Telegram attachment, save it under the bot's attachments folder (default: runtime/out) and include one or more lines in your reply:
 ATTACH: relative/path.ext | optional caption
-Use one line per file. The bot will upload the file(s) and remove these ATTACH lines from the displayed message.
+Use one line per file. Keep paths relative to the attachment folder only, and do not prefix them with `runtime/out/` or `runtime/attachments/`. The bot will upload the file(s) and remove these ATTACH lines from the displayed message.

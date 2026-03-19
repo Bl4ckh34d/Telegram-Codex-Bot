@@ -30,7 +30,7 @@ TEXT_ONLY:
 File attachments:
 - If you create a file that should be delivered as a Telegram attachment, put one or more lines in TEXT_ONLY:
   ATTACH: relative/path.ext | optional caption
-- Use relative paths (no drive letters). The bot will upload the file(s) and remove these ATTACH lines from the displayed message.
+- Use relative paths (no drive letters). Keep them relative to the attachment folder only, and do not prefix them with `runtime/out/` or `runtime/attachments/`. The bot will upload the file(s) and remove these ATTACH lines from the displayed message.
 
 Style:
 - Use plain words, short sentences, and a calm, friendly tone.

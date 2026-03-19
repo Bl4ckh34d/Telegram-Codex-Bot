@@ -13,6 +13,7 @@ const ROOT = __dirname;
 const ENV_PATH = path.join(ROOT, ".env");
 const RUNTIME_DIR = path.join(ROOT, "runtime");
 const OUT_DIR = path.join(RUNTIME_DIR, "out");
+const ATTACH_STAGING_DIR = path.join(RUNTIME_DIR, "attachments");
 const VOICE_DIR = path.join(RUNTIME_DIR, "voice");
 const IMAGE_DIR = path.join(RUNTIME_DIR, "images");
 const TTS_DIR = path.join(RUNTIME_DIR, "tts");
@@ -680,6 +681,7 @@ const requiredStartupDirsReady = [
 if (!requiredStartupDirsReady) {
   process.exit(1);
 }
+ensureDirSafe(ATTACH_STAGING_DIR, { label: "attachment staging", required: false });
 
 const TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || "").trim();
 const PRIMARY_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || "").trim();
@@ -5395,7 +5397,7 @@ async function sendHelp(chatId) {
     "- /voice [name|single|worker|list|default] - set TTS mode/preset (live, no restart)",
     "- /tts <text> - send a TTS voice message (requires TTS_ENABLED=1)",
     "- /abtest [text] - send one sample per voice preset for A/B listening",
-    "- /sendfile <path> [caption] - send a file attachment (from ATTACH_ROOT)",
+    `- /sendfile <path> [caption] - send a file attachment (from ${ATTACH_ROOTS_HINT})`,
     "",
     fmtBold("Other"),
     "- /codex or /commands - show AIDOLON command menu",
@@ -13025,6 +13027,41 @@ function _isPathInside(rootDir, candidatePath) {
   return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
+function _formatAttachRootsHint() {
+  const roots = [ATTACH_ROOT, ATTACH_STAGING_DIR]
+    .map((p) => String(p || "").trim())
+    .filter(Boolean)
+    .map((p) => {
+      try {
+        return path.resolve(p);
+      } catch {
+        return p;
+      }
+    });
+  const labels = [];
+  const seen = new Set();
+  for (const rootDir of roots) {
+    let label = rootDir;
+    try {
+      const rel = path.relative(ROOT, rootDir);
+      if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) {
+        label = rel;
+      }
+    } catch {
+      // best effort
+    }
+    label = String(label || "").replace(/\\/g, "/");
+    if (!label || seen.has(label)) continue;
+    seen.add(label);
+    labels.push(label);
+  }
+  if (labels.length <= 0) return "the attachment root";
+  if (labels.length === 1) return labels[0];
+  return `${labels.slice(0, -1).join(", ")} or ${labels[labels.length - 1]}`;
+}
+
+const ATTACH_ROOTS_HINT = _formatAttachRootsHint();
+
 function resolveAttachPath(inputPath, options = {}) {
   const raw = String(inputPath || "").trim();
   if (!raw) throw new Error("empty path");
@@ -13035,7 +13072,7 @@ function resolveAttachPath(inputPath, options = {}) {
     ? path.join(worker.workdir, "runtime", "out")
     : "";
 
-  const allowedRoots = [ATTACH_ROOT, workerOutDir]
+  const allowedRoots = [ATTACH_ROOT, ATTACH_STAGING_DIR, workerOutDir]
     .map((p) => String(p || "").trim())
     .filter(Boolean)
     .map((p) => {
@@ -13046,7 +13083,7 @@ function resolveAttachPath(inputPath, options = {}) {
       }
     });
 
-  const baseDirs = [ATTACH_ROOT, ROOT, worker?.workdir || "", workerOutDir]
+  const baseDirs = [ATTACH_ROOT, ATTACH_STAGING_DIR, ROOT, worker?.workdir || "", workerOutDir]
     .map((p) => String(p || "").trim())
     .filter(Boolean);
 
@@ -13153,8 +13190,8 @@ async function sendAttachments(chatId, attachments, options = {}) {
       resolved = resolveAttachPath(rawPath, { workerId: routeWorkerId });
     } catch (err) {
       const msg = String(err?.message || err);
-      const hint = msg === "file does not exist"
-        ? " (Tip: ATTACH paths are relative to ATTACH_ROOT; don't include runtime/out/ twice.)"
+      const hint = (msg === "file does not exist" || msg === "path is outside allowed attachment roots")
+        ? ` (Tip: use a path relative to ${ATTACH_ROOTS_HINT}; don't prefix the root twice.)`
         : "";
       await sendMessage(chatId, `Attachment skipped: ${rawPath} (${msg})${hint}`);
       continue;
