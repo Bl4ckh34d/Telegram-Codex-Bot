@@ -9670,7 +9670,7 @@ function worldMonitorSelectMixedAlerts(alerts, limit = 16) {
 
 function buildWorldMonitorComprehensivePrompt(packet) {
   return [
-    "You are producing a concise but thorough strategic WorldMonitor brief for a user living in Taiwan.",
+    "You are producing a very concise strategic WorldMonitor brief for a user living in Taiwan.",
     "Use only the telemetry packet.",
     "The packet can include multi-signal context (news, market/crypto moves, seismic, infrastructure stress).",
     "Use mixed news levels (critical/high/medium/low) to infer trend direction, not only crisis spikes.",
@@ -9678,31 +9678,28 @@ function buildWorldMonitorComprehensivePrompt(packet) {
     "Output format exactly:",
     "HEADLINE:",
     "- One sentence, <= 20 words.",
-    "EVIDENCE_CHAIN:",
-    "- 3 to 5 bullets in the form: [level] concrete headline/signal (source) -> what it indicates -> why it changes risk.",
-    "GLOBAL:",
-    "- 3 to 4 bullets in the form: signal -> why it matters now.",
-    "TAIWAN:",
-    "- 3 to 4 bullets focused on Taiwan-China security, diplomacy, economic spillover, and info-domain risk.",
-    "RISK:",
-    "- Global level: <critical|high|medium|low> (score X/100, trend up|flat|down).",
-    "- Taiwan posture: <escalating|elevated|stable|easing> with a short reason.",
-    "- Key triggers: 1-2 short lines naming strongest trigger conditions that were met.",
+    "QUINTESSENCE:",
+    "- 3 bullets max.",
+    "- Bullet 1: what changed globally, with one concrete headline or signal.",
+    "- Bullet 2: what it means for Taiwan specifically, with one concrete headline or signal.",
+    "- Bullet 3: why it matters now, or one clear counter-signal if pressure is limited.",
     "WATCH_24H:",
-    "- 3 concrete indicators to monitor in the next 24 hours.",
+    "- 2 concrete indicators to monitor in the next 24 hours.",
     "BOTTOM_LINE:",
     "- One sentence plain-language takeaway.",
-    "CONFIDENCE: low|medium|high",
     "",
     "Rules:",
     "- Use full country names, never ISO codes (no TW/UA/etc).",
     "- Keep language clear and easy to read aloud (TTS-friendly).",
-    "- In EVIDENCE_CHAIN, use at least 3 concrete items from feed_alerts, key_evidence, gdelt, or signal_context.",
-    "- Include at least 2 headline-level references (title + source) when available.",
+    "- Keep the headline content intact: do not replace the substance with vague abstractions.",
+    "- Include at least 2 concrete headline or signal references overall when available.",
+    "- Prefer essence over process: do not explain how scores are calculated.",
+    "- Do not expose score formulas, threshold logic, or internal weighting.",
+    "- Do not include a confidence line unless confidence is genuinely low and materially affects the conclusion; if so, mention it briefly in BOTTOM_LINE.",
     "- Include one brief counter-signal if data shows one.",
     "- If article_context summaries are present, prioritize them over headline-only interpretation.",
     "- Never invent facts, links, or numbers not in the packet.",
-    "- Keep total output under 340 words.",
+    "- Keep total output under 170 words.",
     "- If data is missing or stale, mention that briefly.",
     "",
     `TELEMETRY_PACKET=${JSON.stringify(packet)}`,
@@ -13319,6 +13316,10 @@ function makeWorldMonitorTextTtsFriendly(text) {
   if (!out) return "";
 
   // Make section markers read naturally.
+  out = out.replace(/\bHEADLINE\s*:\s*/gi, "Headline ");
+  out = out.replace(/\bQUINTESSENCE\s*:\s*/gi, "Quintessence ");
+  out = out.replace(/\bWATCH_24H\s*:\s*/gi, "Watch next 24 hours ");
+  out = out.replace(/\bBOTTOM_LINE\s*:\s*/gi, "Bottom line ");
   out = out.replace(/\bALERT_LEVEL\s*:\s*/gi, "Alert level ");
   out = out.replace(/\bSUMMARY\s*:\s*/gi, "Summary ");
   out = out.replace(/\bPRIMARY_TRIGGERS\s*:\s*/gi, "Primary triggers ");
@@ -13388,18 +13389,31 @@ function makeWorldMonitorCheckVoiceSummary(text) {
   };
 
   const headline = sectionFirstBullet("HEADLINE");
-  const global = sectionFirstBullet("GLOBAL");
-  const taiwan = sectionFirstBullet("TAIWAN");
+  const quintessence = (() => {
+    const out = [];
+    let inSection = false;
+    for (const line of lines) {
+      if (/^[A-Z_ ]+:\s*$/i.test(line)) {
+        inSection = /^QUINTESSENCE\s*:\s*$/i.test(line);
+        continue;
+      }
+      if (!inSection) continue;
+      if (/^\s*(?:[-*•]|\d+[.)])\s+/.test(line)) {
+        const cleaned = cleanBullet(line);
+        if (cleaned) out.push(cleaned);
+        if (out.length >= 2) break;
+      }
+    }
+    return out;
+  })();
   const watch = sectionFirstBullet("WATCH_24H");
-  const confidenceMatch = src.match(/\bCONFIDENCE\s*:\s*(low|medium|high)\b/i);
-  const confidence = confidenceMatch ? String(confidenceMatch[1] || "").toLowerCase() : "";
+  const bottomLine = sectionFirstBullet("BOTTOM_LINE");
 
   const parts = [];
   if (headline) parts.push(headline);
-  if (global) parts.push(`Global: ${global}.`);
-  if (taiwan) parts.push(`Taiwan: ${taiwan}.`);
+  for (const item of quintessence) parts.push(`${item}.`);
   if (watch) parts.push(`Watch next 24 hours: ${watch}.`);
-  if (confidence) parts.push(`Confidence ${confidence}.`);
+  if (bottomLine) parts.push(`Bottom line: ${bottomLine}.`);
 
   let summary = parts.join(" ").replace(/\s+/g, " ").trim();
   if (!summary) {
