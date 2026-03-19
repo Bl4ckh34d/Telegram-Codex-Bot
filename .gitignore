@@ -16,6 +16,7 @@ __pycache__/
 
 # Runtime artifacts (state, logs, outputs, temp files)
 runtime/
+tmp/
 
 # OS/editor junk
 .DS_Store
