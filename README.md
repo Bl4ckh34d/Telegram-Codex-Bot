@@ -158,6 +158,7 @@ Voice replies:
 - Use `/voice` to switch styles while running; no bot restart needed.
 - `/voice worker` enables role-based voices (each worker keeps a stable voice, orchestrator/general uses `starship-comms`).
 - `/voice <preset>` or preset buttons switch to single-voice mode (all workers share that one voice).
+- Optional: set `TTS_REFERENCE_AUDIO_ZH_TW` to a Taiwanese Mandarin reference clip and Chinese replies will automatically use it.
 - Optional override: set `TTS_WORKER_PRESET_MAP` (for example `astra:hologram-ai,orion:starship-comms,nova:cyber-oracle`).
 - Sci-fi presets are intentionally stylized:
   - `hologram-ai`: brighter hologram shimmer with stronger gain staging.
@@ -299,7 +300,7 @@ Media and voice:
 - `WHISPER_ENABLED`, `WHISPER_MODEL`, `WHISPER_LANGUAGE`
 - `VISION_ENABLED`
 - `TTS_ENABLED`, `TTS_REPLY_TO_VOICE`
-- `TTS_MODEL`, `TTS_REFERENCE_AUDIO`, `TTS_FFMPEG_BIN`
+- `TTS_MODEL`, `TTS_REFERENCE_AUDIO`, `TTS_REFERENCE_AUDIO_ZH_TW`, `TTS_FFMPEG_BIN`
 - `TTS_WORKER_PRESET_MAP`
 - `TTS_STARSHIP_BEEP_START`, `TTS_STARSHIP_BEEP_END`
 

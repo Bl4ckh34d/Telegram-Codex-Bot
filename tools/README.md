@@ -38,8 +38,8 @@ This folder contains a minimal desktop automation bridge for real browser UX tes
 - `-HighlightWidth -HighlightHeight` (highlight box size)
 - `-Text` (for `type`, `click_text`, `clipboard_copy`, optional for `clipboard_paste`)
 - `-TypewriterThreshold` (for `type`; default `180`; text at or below this length is typed character-by-character)
-- `-TypewriterMinDelay` (for `type`; per-character random delay minimum in ms, default `35`)
-- `-TypewriterMaxDelay` (for `type`; per-character random delay maximum in ms, default `110`)
+- `-TypewriterMinDelay` (for `type`; per-character random delay minimum in ms, default `8`)
+- `-TypewriterMaxDelay` (for `type`; per-character random delay maximum in ms, default `28`)
 - `-TypeDirect` (for `type`; force direct one-shot send instead of typewriter mode)
 - `-TextRegex` (for `click_text`, treat `-Text` as regex)
 - `-ExactText` (for `click_text`, exact match mode)
@@ -48,7 +48,7 @@ This folder contains a minimal desktop automation bridge for real browser UX tes
 - `-OcrCacheTtlMs` (for `click_text`, OCR cache TTL in milliseconds, default `1200`)
 - `-Keys` (for `key`; accepts SendKeys format or simple `Ctrl+L` style)
 - `-Delta` (for `scroll`, default `-120`)
-- `-Milliseconds` (for `wait`, default `250`)
+- `-Milliseconds` (for `wait`, default `100`)
 - `-Output` (for `screenshot`; defaults under `runtime/out`)
 - `-AllScreens` (for `screenshot` and `click_text`)
 - `-Limit` (for `windows`, default `20`)
@@ -209,19 +209,23 @@ Default flow:
 - Restart Sunshine (if running, close first; otherwise start) and verify process is running
 - Wake TV
 - Wait 2 seconds
-- Launch Artemis on TV
+- Launch Artemis on TV and verify it is foreground
+- If another app/prompt is foreground (for example USB chooser), dismiss/recover and retry Artemis
+- Switch Windows default playback output to `Bigscreen` (exact name match first, then partial/normalized match)
 - Wait 2 seconds
 - Attempt Artemis connect/start stream with center-button key presses
-- Wait for second-display activation (or continue if `-AllowUnverifiedStream`)
-- Open a brand new Firefox window
+- Wait for second-display activation before any browser control
+- Open a new Firefox window using your current Firefox profile
 - Move it to TV monitor with `Win+Shift+Right` (or `-MoveDirection Left`)
-- Fullscreen
-- Open `https://s.to`, then open `https://sflix.ps` in a new tab
+- Maximize window
+- Open `https://s.to` and `https://sflix.ps`
 
 Useful parameters:
 - `-SunshineCommand <path>` launcher command or script
 - `-TvHost <ip>` / `-TvPort <port>` / `-TvSerial <serial>`
 - `-SkipArtemisKeySequence`
-- `-AllowUnverifiedStream` (default on)
+- `-AllowUnverifiedStream` (optional bypass when stream verification fails)
+- `-PreferredAudioDevice <name>` (default `Bigscreen`)
+- `-UseIsolatedFirefoxProfile` (optional: run Firefox in a separate prep profile with seeded uBlock Origin)
 - `-MoveDirection <Left|Right>`
 - `-DryRun` (prints JSON plan without executing actions)
