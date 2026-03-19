@@ -4706,7 +4706,20 @@ async function sendMessage(chatId, text, options = {}) {
   const routeSnippet = String(options.routeSnippet || "").trim();
   const routeTaskId = Number(options.routeTaskId || 0);
   const routeSessionId = String(options.routeSessionId || "").trim();
-  const chunks = chunkText(normalizeResponse(text), TELEGRAM_MESSAGE_MAX_CHARS);
+  const skipWorkerNamePrefix = options.skipWorkerNamePrefix === true;
+  const worker = routeWorkerId ? getCodexWorker(routeWorkerId) : null;
+  const workerLabel = worker
+    ? String(worker.name || worker.title || worker.id || "").trim()
+    : "";
+  let normalizedText = normalizeResponse(text);
+  if (workerLabel && !skipWorkerNamePrefix) {
+    const escapedLabel = workerLabel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const labelPattern = new RegExp(`^${escapedLabel}\\s*:`, "i");
+    if (!labelPattern.test(normalizedText)) {
+      normalizedText = `${workerLabel}: ${normalizedText}`;
+    }
+  }
+  const chunks = chunkText(normalizedText, TELEGRAM_MESSAGE_MAX_CHARS);
   const sent = [];
   let previousSentMessageId = Number.isFinite(replyToMessageId) && replyToMessageId > 0 ? Math.trunc(replyToMessageId) : 0;
   for (let idx = 0; idx < chunks.length; idx += 1) {
