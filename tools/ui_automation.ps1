@@ -24,8 +24,8 @@ param(
   [string]$Text = "",
   [switch]$TypeDirect,
   [int]$TypewriterThreshold = 180,
-  [int]$TypewriterMinDelay = 35,
-  [int]$TypewriterMaxDelay = 110,
+  [int]$TypewriterMinDelay = 8,
+  [int]$TypewriterMaxDelay = 28,
   [switch]$TextRegex,
   [switch]$ExactText,
   [int]$MatchIndex = 1,
@@ -36,7 +36,7 @@ param(
   [int]$OcrCacheTtlMs = 1200,
   [string]$Keys = "",
   [int]$Delta = -120,
-  [int]$Milliseconds = 250,
+  [int]$Milliseconds = 100,
   [string]$Output = "",
   [switch]$AllScreens,
   [int]$Limit = 20,
@@ -2026,8 +2026,8 @@ function Invoke-UiRequest {
     $Text = [string](Get-MapValue -Source $map -Name "text" -DefaultValue "")
     $TypeDirect = [switch](Convert-ToSafeBool (Get-MapValue -Source $map -Name "typedirect" -DefaultValue $false))
     $TypewriterThreshold = [int](Get-MapValue -Source $map -Name "typewriterthreshold" -DefaultValue 180)
-    $TypewriterMinDelay = [int](Get-MapValue -Source $map -Name "typewritermindelay" -DefaultValue 35)
-    $TypewriterMaxDelay = [int](Get-MapValue -Source $map -Name "typewritermaxdelay" -DefaultValue 110)
+    $TypewriterMinDelay = [int](Get-MapValue -Source $map -Name "typewritermindelay" -DefaultValue 8)
+    $TypewriterMaxDelay = [int](Get-MapValue -Source $map -Name "typewritermaxdelay" -DefaultValue 28)
     $TextRegex = [switch](Convert-ToSafeBool (Get-MapValue -Source $map -Name "textregex" -DefaultValue $false))
     $ExactText = [switch](Convert-ToSafeBool (Get-MapValue -Source $map -Name "exacttext" -DefaultValue $false))
     $MatchIndex = [int](Get-MapValue -Source $map -Name "matchindex" -DefaultValue 1)
@@ -2038,7 +2038,7 @@ function Invoke-UiRequest {
     $OcrCacheTtlMs = [int](Get-MapValue -Source $map -Name "ocrcachettlms" -DefaultValue 1200)
     $Keys = [string](Get-MapValue -Source $map -Name "keys" -DefaultValue "")
     $Delta = [int](Get-MapValue -Source $map -Name "delta" -DefaultValue (-120))
-    $Milliseconds = [int](Get-MapValue -Source $map -Name "milliseconds" -DefaultValue 250)
+    $Milliseconds = [int](Get-MapValue -Source $map -Name "milliseconds" -DefaultValue 100)
     $Output = [string](Get-MapValue -Source $map -Name "output" -DefaultValue "")
     $AllScreens = [switch](Convert-ToSafeBool (Get-MapValue -Source $map -Name "allscreens" -DefaultValue $false))
     $Limit = [int](Get-MapValue -Source $map -Name "limit" -DefaultValue 20)

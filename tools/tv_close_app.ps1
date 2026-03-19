@@ -106,7 +106,7 @@ try {
       $candidates = @("dev.lizardbyte.app", "dev.lizardbyte.sunshine")
     }
     "artemis" {
-      $candidates = @("de.grill2010.artemis")
+      $candidates = @("de.grill2010.artemis", "com.limelight.noir", "com.limelight")
     }
     "retroarch" {
       $candidates = @("com.retroarch.ra32", "com.retroarch.ra64", "com.retroarch")

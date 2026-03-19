@@ -114,14 +114,16 @@ function Start-PackageLauncher {
       [Parameter(Mandatory = $true)][string]$TargetSerial,
       [Parameter(Mandatory = $true)][string]$PackageName
     )
-    $samples = @(
-      (Invoke-Adb @("shell", "dumpsys", "window", "windows") -DeviceSerial $TargetSerial | Out-String),
-      (Invoke-Adb @("shell", "dumpsys", "activity", "activities") -DeviceSerial $TargetSerial | Out-String)
-    )
-    foreach ($sample in $samples) {
-      if ([string]$sample -match [Regex]::Escape($PackageName)) {
-        return $true
-      }
+    $windowDump = (Invoke-Adb @("shell", "dumpsys", "window", "windows") -DeviceSerial $TargetSerial | Out-String)
+    $windowLine = ([string]$windowDump -split "(`r`n|`n|`r)" | Where-Object { $_ -match "mCurrentFocus|mFocusedApp" } | Select-Object -First 1)
+    if ($windowLine -and $windowLine -match ([Regex]::Escape($PackageName) + "\/")) {
+      return $true
+    }
+
+    $activityDump = (Invoke-Adb @("shell", "dumpsys", "activity", "activities") -DeviceSerial $TargetSerial | Out-String)
+    $activityLine = ([string]$activityDump -split "(`r`n|`n|`r)" | Where-Object { $_ -match "mResumedActivity|topResumedActivity|ResumedActivity" } | Select-Object -First 1)
+    if ($activityLine -and $activityLine -match ([Regex]::Escape($PackageName) + "\/")) {
+      return $true
     }
     return $false
   }
@@ -133,12 +135,17 @@ function Start-PackageLauncher {
       [Parameter(Mandatory = $true)][string]$PackageName
     )
     $raw = (Invoke-Adb -Args $CommandArgs -DeviceSerial $TargetSerial | Out-String).Trim()
-    if ($raw -match "Error|Exception|does not exist|No activities found") {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds(1800)
+    while ([DateTime]::UtcNow -lt $deadline) {
       Start-Sleep -Milliseconds 220
-      return (Test-PackageForeground -TargetSerial $TargetSerial -PackageName $PackageName)
+      if (Test-PackageForeground -TargetSerial $TargetSerial -PackageName $PackageName) {
+        return $true
+      }
     }
-    Start-Sleep -Milliseconds 220
-    return $true
+    if ($raw -match "Error|Exception|does not exist|No activities found") {
+      return $false
+    }
+    return $false
   }
 
   if ($Act) {
