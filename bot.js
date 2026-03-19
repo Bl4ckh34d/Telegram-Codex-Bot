@@ -4714,9 +4714,9 @@ async function sendMessage(chatId, text, options = {}) {
   let normalizedText = normalizeResponse(text);
   if (workerLabel && !skipWorkerNamePrefix) {
     const escapedLabel = workerLabel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const labelPattern = new RegExp(`^${escapedLabel}\\s*:`, "i");
+    const labelPattern = new RegExp(`^(?:\\*\\*)?${escapedLabel}(?:\\*\\*)?\\s*:`, "i");
     if (!labelPattern.test(normalizedText)) {
-      normalizedText = `${workerLabel}: ${normalizedText}`;
+      normalizedText = `${fmtBold(workerLabel)}: ${normalizedText}`;
     }
   }
   const chunks = chunkText(normalizedText, TELEGRAM_MESSAGE_MAX_CHARS);
