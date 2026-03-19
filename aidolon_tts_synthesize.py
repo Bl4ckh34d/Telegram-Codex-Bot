@@ -144,6 +144,32 @@ def _generate_with_recovery(tts, ctx, speak: str, *, model: str, ref_path: Path,
         return audio_retry, tts_retry, ctx_retry
 
 
+def _synthesize_batch_with_recovery(tts, ctx, texts: list[str], *, model: str, ref_path: Path, tts_factory):
+    try:
+        formatted_prompts = [tts.codec.format_prompt(t, ctx, None) for t in texts]
+        responses = tts.pipe(formatted_prompts, gen_config=tts.gen_config, do_preprocess=False)
+        if not isinstance(responses, list):
+            raise TypeError(f"Unexpected pipeline response type: {type(responses)}")
+        if len(responses) != len(texts):
+            raise RuntimeError(f"Unexpected pipeline response count: got {len(responses)}, expected {len(texts)}")
+        return [tts.codec.decode(resp.text, ctx) for resp in responses], tts, ctx
+    except Exception as exc:
+        if not _is_tokenizer_input_type_error(exc):
+            raise
+        print(
+            "TTS: tokenizer input type error detected in batch path; reloading runtime and retrying once.",
+            file=sys.stderr,
+        )
+        tts_retry, ctx_retry = _reload_tts_runtime(model, ref_path, tts_factory)
+        formatted_prompts = [tts_retry.codec.format_prompt(t, ctx_retry, None) for t in texts]
+        responses = tts_retry.pipe(formatted_prompts, gen_config=tts_retry.gen_config, do_preprocess=False)
+        if not isinstance(responses, list):
+            raise TypeError(f"Unexpected pipeline response type: {type(responses)}")
+        if len(responses) != len(texts):
+            raise RuntimeError(f"Unexpected pipeline response count: got {len(responses)}, expected {len(texts)}")
+        return [tts_retry.codec.decode(resp.text, ctx_retry) for resp in responses], tts_retry, ctx_retry
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Synthesize TTS WAV using MiraTTS")
     # In batch mode, use --out-wav-base instead.
@@ -310,22 +336,17 @@ def main() -> int:
     started = time.perf_counter()
 
     if args.batch_jsonl:
-        # Use per-item generate() to keep tokenizer input types simple and stable.
+        # Batch pipe path is more stable than repeated per-item generate() calls.
         try:
-            for idx, (speak, out_wav) in enumerate(zip(texts, out_wavs)):
-                try:
-                    audio, tts, ctx = _generate_with_recovery(
-                        tts,
-                        ctx,
-                        speak,
-                        model=model,
-                        ref_path=ref_path,
-                        tts_factory=MiraTTS,
-                    )
-                except Exception as exc:
-                    print(f"TTS: synthesis failed (item {idx}): {exc}", file=sys.stderr)
-                    return 7
-
+            audios, tts, ctx = _synthesize_batch_with_recovery(
+                tts,
+                ctx,
+                texts,
+                model=model,
+                ref_path=ref_path,
+                tts_factory=MiraTTS,
+            )
+            for idx, (audio, out_wav) in enumerate(zip(audios, out_wavs)):
                 try:
                     _write_wav(out_wav, audio, sample_rate)
                 except Exception as exc:

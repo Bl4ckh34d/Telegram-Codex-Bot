@@ -18,6 +18,21 @@ from pathlib import Path
 DEFAULT_ALLOWED_LANGUAGES = ("en", "de", "zh")
 
 
+def _configure_stdio_utf8() -> None:
+    # Windows redirected stdio can default to ANSI code pages (for example cp1252),
+    # which breaks non-Latin transcripts like Chinese. Force UTF-8 for JSON lines.
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
 def _normalize_language_code(value: str) -> str:
     code = str(value or "").strip().lower().replace("_", "-")
     if not code:
@@ -79,6 +94,7 @@ def _pick_language(request_language: str, default_language: str, allowed_languag
 
 
 def main() -> int:
+    _configure_stdio_utf8()
     args = _parse_args()
     allowed_languages = _parse_allowed_languages(args.allowed_languages)
 

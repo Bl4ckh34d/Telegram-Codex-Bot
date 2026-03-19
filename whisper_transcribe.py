@@ -10,6 +10,21 @@ import sys
 DEFAULT_ALLOWED_LANGUAGES = ("en", "de", "zh")
 
 
+def configure_stdio_utf8() -> None:
+    # Windows redirected stdio can default to ANSI code pages (for example cp1252),
+    # which breaks non-Latin transcripts like Chinese. Force UTF-8 for pipes/files.
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
 def normalize_language_code(value: str) -> str:
     code = str(value or "").strip().lower().replace("_", "-")
     if not code:
@@ -48,6 +63,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    configure_stdio_utf8()
     args = parse_args()
 
     if not os.path.isfile(args.audio):

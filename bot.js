@@ -32,7 +32,6 @@ const WORLDMONITOR_NATIVE_SIGNALS_PATH = path.join(RUNTIME_DIR, "worldmonitor-na
 const RESTART_REASON_PATH = path.join(RUNTIME_DIR, "restart.reason");
 const WHISPER_SCRIPT_PATH = path.join(ROOT, "whisper_transcribe.py");
 const WHISPER_SERVER_SCRIPT_PATH = path.join(ROOT, "whisper_transcribe_server.py");
-const AIDOLON_TTS_SCRIPT_PATH = path.join(ROOT, "aidolon_tts_synthesize.py");
 const AIDOLON_TTS_SERVER_SCRIPT_PATH = path.join(ROOT, "aidolon_tts_server.py");
 const RESTART_EXIT_CODE = 75;
 
@@ -733,18 +732,27 @@ const CODEX_BIN = String(process.env.CODEX_BIN || "codex").trim();
 const CODEX_USE_WSL = String(process.env.CODEX_USE_WSL || "auto").trim().toLowerCase();
 const CODEX_WSL_BIN = String(process.env.CODEX_WSL_BIN || "").trim();
 const CODEX_WORKDIR = String(process.env.CODEX_WORKDIR || ROOT).trim();
-const CODEX_MODEL = String(process.env.CODEX_MODEL || "gpt-5.4-codex").trim();
-const CODEX_MODEL_CHOICES = parseList(process.env.CODEX_MODEL_CHOICES || "");
+function normalizeCodexModelName(value) {
+  const model = String(value || "").trim();
+  if (!model) return "";
+  if (model.toLowerCase() === "gpt-5.4-codex") return "gpt-5.4";
+  return model;
+}
+
+const CODEX_MODEL = normalizeCodexModelName(process.env.CODEX_MODEL || "gpt-5.4");
+const CODEX_MODEL_CHOICES = parseList(process.env.CODEX_MODEL_CHOICES || "")
+  .map((model) => normalizeCodexModelName(model))
+  .filter(Boolean);
 const CODEX_REASONING_EFFORT = String(process.env.CODEX_REASONING_EFFORT || "xhigh").trim();
 const CODEX_REASONING_EFFORT_CHOICES = parseList(process.env.CODEX_REASONING_EFFORT_CHOICES || "");
 const CODEX_DEFAULT_MODEL_CHOICES = Object.freeze([
-  "gpt-5.4-codex",
+  "gpt-5.4",
   "gpt-5.3-codex",
   "gpt-5.2-codex",
   "gpt-5.1-codex",
 ]);
 const CODEX_REASONING_EFFORTS_BY_MODEL = Object.freeze({
-  "gpt-5.4-codex": ["low", "medium", "high", "xhigh"],
+  "gpt-5.4": ["low", "medium", "high", "xhigh"],
   "gpt-5.3-codex": ["low", "medium", "high", "xhigh"],
   "gpt-5.2-codex": ["low", "medium", "high"],
   "gpt-5.1-codex": ["low", "medium", "high"],
@@ -836,7 +844,7 @@ const TTS_UPLOAD_RETRIES = toInt(process.env.TTS_UPLOAD_RETRIES, 0, 0, 10);
 // Use chunk-streamed batch flow (send each chunk as it is done) instead of all-at-once batch synthesis.
 const TTS_BATCH_PIPELINED = toBool(process.env.TTS_BATCH_PIPELINED, true);
 // When pipelined batch mode is enabled, use it only up to this many chunks.
-// 0 = always use pipelined mode; larger values switch long replies to one-shot batch synthesis.
+// 0 = always use pipelined mode; larger values switch long replies to all-at-once keepalive batch synthesis.
 const TTS_BATCH_PIPELINED_MAX_CHUNKS = toInt(process.env.TTS_BATCH_PIPELINED_MAX_CHUNKS, 2, 0, 1000);
 const TTS_RETRY_BASE_DELAY_MS = toInt(process.env.TTS_RETRY_BASE_DELAY_MS, 300, 50, 30_000);
 const TTS_RETRY_MAX_DELAY_MS = toInt(process.env.TTS_RETRY_MAX_DELAY_MS, 4000, 100, 120_000);
@@ -845,9 +853,9 @@ const KEEPALIVE_RESTART_MAX_DELAY_MS = toInt(process.env.KEEPALIVE_RESTART_MAX_D
 const TTS_VENV_PATH = resolveMaybeRelativePath(process.env.TTS_VENV_PATH || path.join(ROOT, ".tts-venv"));
 const TTS_MODEL = String(process.env.TTS_MODEL || "").trim();
 const TTS_REFERENCE_AUDIO = resolveMaybeRelativePath(process.env.TTS_REFERENCE_AUDIO || "");
+const TTS_REFERENCE_AUDIO_ZH_TW = resolveMaybeRelativePath(process.env.TTS_REFERENCE_AUDIO_ZH_TW || "");
 const TTS_SAMPLE_RATE = toInt(process.env.TTS_SAMPLE_RATE, 48000);
 const TTS_PYTHON = String(process.env.TTS_PYTHON || "").trim();
-const TTS_KEEPALIVE = toBool(process.env.TTS_KEEPALIVE, true);
 const TTS_KEEPALIVE_STARTUP_TIMEOUT_MS = toTimeoutMs(
   process.env.TTS_KEEPALIVE_STARTUP_TIMEOUT_MS,
   180_000,
@@ -2073,7 +2081,7 @@ function getChatPrefs(chatId) {
   const ttsPreset = normalizeTtsPresetName(entry.ttsPreset, { allowDefault: true });
   const ttsMode = normalizeTtsVoiceMode(entry.ttsMode, { allowDefault: true });
   return {
-    model: String(entry.model || "").trim(),
+    model: normalizeCodexModelName(entry.model),
     reasoning: String(entry.reasoning || "").trim(),
     ttsPreset: ttsPreset === "default" ? "" : ttsPreset,
     ttsMode: ttsMode === "default" ? "" : ttsMode,
@@ -2183,12 +2191,13 @@ function rememberChatAutomationPrefsFromText(chatId, text) {
     patch.approveArtemisPrompts = true;
   }
   const hasWatchTvComputer = /\bwatch\b/.test(lower) && /\btv\b/.test(lower) && /\bcomputer\b/.test(lower);
-  const hasFirefoxFullscreen = /\bfirefox\b/.test(lower) && (/\bfull\s*screen\b/.test(lower) || /\bfullscreen\b/.test(lower));
+  const hasFirefoxWindowMaximizeIntent = /\bfirefox\b/.test(lower)
+    && (/\bfull\s*screen\b/.test(lower) || /\bfullscreen\b/.test(lower) || /\bmaximiz(?:e|ed|ing)\b/.test(lower));
   const hasSecondMonitor = /\bsecond monitor\b/.test(lower)
     || /\btv as .*monitor\b/.test(lower)
     || /\btv monitor\b/.test(lower)
     || /\bthat monitor\b/.test(lower);
-  if (hasWatchTvComputer && hasFirefoxFullscreen && hasSecondMonitor) {
+  if (hasWatchTvComputer && hasFirefoxWindowMaximizeIntent && hasSecondMonitor) {
     patch.openFirefoxFullscreenOnTvForWatch = true;
   }
   const hasSunshineStartOrRestart = /\bsunshine\b/.test(lower)
@@ -2242,7 +2251,7 @@ function rememberChatAutomationPrefsFromText(chatId, text) {
     patch.askWhatToWatchAfterSiteEntry = true;
   }
   if ((/\bclick play\b/.test(lower) || /\bplay back\b/.test(lower) || /\bplay\b/.test(lower))
-    && /\bfull\s*screen\b/.test(lower)) {
+    && (/\bfull\s*screen\b/.test(lower) || /\bfullscreen\b/.test(lower) || /\bmaximiz(?:e|ed|ing)\b/.test(lower))) {
     patch.playAndFullscreenAfterSelection = true;
   }
   const sunshinePathMatch = raw.match(/([a-z]:\\[^\r\n"'<>|?*]+?\.(?:cmd|bat|ps1))/i);
@@ -2344,7 +2353,7 @@ function buildChatAutomationPromptContext(chatId) {
     lines.push("- After entering the site main page, ask the user what they want to watch before searching.");
   }
   if (prefs.playAndFullscreenAfterSelection) {
-    lines.push("- After navigation to the selected title/episode, click play in preview and set fullscreen in the player.");
+    lines.push("- After navigation to the selected title/episode, click play in preview and keep Firefox maximized on the TV monitor.");
   }
   return lines.join("\n");
 }
@@ -2363,7 +2372,7 @@ function setChatPrefs(chatId, patch) {
     ? normalizeTtsVoiceMode(patch.ttsMode, { allowDefault: true })
     : normalizeTtsVoiceMode(prev.ttsMode, { allowDefault: true });
   const next = {
-    model: String(patch?.model ?? prev.model ?? "").trim(),
+    model: normalizeCodexModelName(patch?.model ?? prev.model ?? ""),
     reasoning: String(patch?.reasoning ?? prev.reasoning ?? "").trim(),
     ttsPreset: normalizedPreset === "default" ? "" : normalizedPreset,
     ttsMode: normalizedMode === "default" ? "" : normalizedMode,
@@ -3940,7 +3949,7 @@ function buildCodexExecSpec(job) {
     args.push("--color", "never", "-C", codexWorkdir, "-o", outputPath);
   }
   const prefs = getChatPrefs(job?.chatId);
-  const effectiveModel = String(job?.model || prefs.model || CODEX_MODEL || "").trim();
+  const effectiveModel = normalizeCodexModelName(job?.model || prefs.model || CODEX_MODEL || "");
   const effectiveReasoning = String(job?.reasoning || prefs.reasoning || CODEX_REASONING_EFFORT || "").trim();
   if (effectiveModel) args.push("-m", effectiveModel);
   if (effectiveReasoning) {
@@ -11188,15 +11197,13 @@ async function sendStatus(chatId) {
         : whisperKeepalive.proc
           ? "starting"
           : "idle";
-  const ttsKeepaliveState = !TTS_KEEPALIVE
-    ? "off"
-    : ttsKeepalive.ready
-      ? "ready"
-      : ttsKeepalive.startPromise
-        ? "warming"
-        : ttsKeepalive.proc
-          ? "starting"
-          : "idle";
+  const ttsKeepaliveState = ttsKeepalive.ready
+    ? "ready"
+    : ttsKeepalive.startPromise
+      ? "warming"
+      : ttsKeepalive.proc
+        ? "starting"
+        : "idle";
   const ttsBatchMode = !TTS_BATCH_PIPELINED
     ? "batch"
     : TTS_BATCH_PIPELINED_MAX_CHUNKS > 0
@@ -11457,7 +11464,7 @@ function getEffectiveReasoningChoices() {
 }
 
 function getEffectiveReasoningChoicesForModel(model) {
-  const cleanModel = String(model || "").trim().toLowerCase();
+  const cleanModel = normalizeCodexModelName(model).toLowerCase();
   const modelSpecific = Array.isArray(CODEX_REASONING_EFFORTS_BY_MODEL[cleanModel])
     ? CODEX_REASONING_EFFORTS_BY_MODEL[cleanModel]
     : [];
@@ -13590,16 +13597,15 @@ function resolveTtsFfmpegBin() {
 }
 
 function resolveTtsRuntime() {
-  const canUseKeepaliveSynth = TTS_KEEPALIVE && fs.existsSync(AIDOLON_TTS_SERVER_SCRIPT_PATH);
-  const canUseLegacySynth = fs.existsSync(AIDOLON_TTS_SCRIPT_PATH);
+  const hasKeepaliveSynth = fs.existsSync(AIDOLON_TTS_SERVER_SCRIPT_PATH);
 
   if (!TTS_ENABLED) {
     return { ok: false, error: "TTS is disabled on this bot (TTS_ENABLED=0)." };
   }
-  if (!canUseKeepaliveSynth && !canUseLegacySynth) {
+  if (!hasKeepaliveSynth) {
     return {
       ok: false,
-      error: `TTS helper scripts missing: ${AIDOLON_TTS_SCRIPT_PATH} / ${AIDOLON_TTS_SERVER_SCRIPT_PATH}`,
+      error: `TTS keepalive script missing: ${AIDOLON_TTS_SERVER_SCRIPT_PATH}`,
     };
   }
   if (!TTS_MODEL) {
@@ -13627,11 +13633,25 @@ function resolveTtsRuntime() {
 
   return {
     ok: true,
-    canUseKeepaliveSynth,
-    canUseLegacySynth,
     pyBin,
     ffmpegBin,
   };
+}
+
+const HAN_SCRIPT_CHAR_RE = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/u;
+
+function containsHanScript(text) {
+  const value = String(text || "");
+  if (!value) return false;
+  return HAN_SCRIPT_CHAR_RE.test(value);
+}
+
+function resolveTtsReferenceAudioForText(text) {
+  const twRef = String(TTS_REFERENCE_AUDIO_ZH_TW || "").trim();
+  if (!twRef) return TTS_REFERENCE_AUDIO;
+  if (!containsHanScript(text)) return TTS_REFERENCE_AUDIO;
+  if (!fs.existsSync(twRef)) return TTS_REFERENCE_AUDIO;
+  return twRef;
 }
 
 const _ffmpegAudioFilterCache = new Map(); // key: ffmpeg bin path -> Set<string> | null
@@ -14001,7 +14021,7 @@ function noteTtsKeepaliveFallback(mode, reason) {
 }
 
 function scheduleTtsKeepaliveRestart(reason = "") {
-  if (!TTS_KEEPALIVE || !TTS_KEEPALIVE_AUTO_RESTART) return;
+  if (!TTS_KEEPALIVE_AUTO_RESTART) return;
   if (shuttingDown) return;
   if (ttsKeepalive.proc || ttsKeepalive.startPromise) return;
   if (ttsKeepalive.restartTimer) return;
@@ -14022,7 +14042,7 @@ function scheduleTtsKeepaliveRestart(reason = "") {
 
   ttsKeepalive.restartTimer = setTimeout(async () => {
     ttsKeepalive.restartTimer = null;
-    if (shuttingDown || !TTS_KEEPALIVE || !TTS_KEEPALIVE_AUTO_RESTART) return;
+    if (shuttingDown || !TTS_KEEPALIVE_AUTO_RESTART) return;
     if (ttsKeepalive.proc || ttsKeepalive.startPromise) return;
     try {
       const pyBin = resolveTtsPythonBin();
@@ -14148,7 +14168,6 @@ function handleTtsKeepaliveLine(rawLine) {
 }
 
 async function ensureTtsKeepaliveRunning(pyBin) {
-  if (!TTS_KEEPALIVE) return null;
   if (!fs.existsSync(AIDOLON_TTS_SERVER_SCRIPT_PATH)) return null;
   if (!pyBin) return null;
 
@@ -14335,13 +14354,23 @@ async function requestTtsKeepalive(payload, { abortSignal, timeoutMs = 0, job } 
   });
 }
 
-async function runTtsSynthKeepaliveSingle({ text, outWavPath, timeoutMs = 0, abortSignal, job }) {
+async function runTtsSynthKeepaliveSingle({
+  text,
+  outWavPath,
+  timeoutMs = 0,
+  abortSignal,
+  job,
+  referenceAudioPath = "",
+}) {
+  const payload = {
+    type: "synthesize",
+    text,
+    out_wav: outWavPath,
+  };
+  const ref = String(referenceAudioPath || "").trim();
+  if (ref) payload.reference_audio = ref;
   const msg = await requestTtsKeepalive(
-    {
-      type: "synthesize",
-      text,
-      out_wav: outWavPath,
-    },
+    payload,
     { abortSignal, timeoutMs, job },
   );
   if (msg.ok !== true) {
@@ -14350,13 +14379,23 @@ async function runTtsSynthKeepaliveSingle({ text, outWavPath, timeoutMs = 0, abo
   return msg;
 }
 
-async function runTtsSynthKeepaliveBatch({ texts, outWavBase, timeoutMs = 0, abortSignal, job }) {
+async function runTtsSynthKeepaliveBatch({
+  texts,
+  outWavBase,
+  timeoutMs = 0,
+  abortSignal,
+  job,
+  referenceAudioPath = "",
+}) {
+  const payload = {
+    type: "synthesize_batch",
+    texts,
+    out_wav_base: outWavBase,
+  };
+  const ref = String(referenceAudioPath || "").trim();
+  if (ref) payload.reference_audio = ref;
   const msg = await requestTtsKeepalive(
-    {
-      type: "synthesize_batch",
-      texts,
-      out_wav_base: outWavBase,
-    },
+    payload,
     { abortSignal, timeoutMs, job },
   );
   if (msg.ok !== true) {
@@ -14387,7 +14426,6 @@ async function runTtsJob(job, lane) {
     return /tts backend fatal error/.test(msg);
   };
   const forceTtsKeepaliveRestartIfFatal = (errMsg, reason) => {
-    if (!TTS_KEEPALIVE) return;
     if (!shouldForceTtsKeepaliveRestart(errMsg)) return;
     stopTtsKeepalive(
       reason || "TTS backend fatal error during synthesis; forcing keepalive restart before next voice reply.",
@@ -14405,14 +14443,12 @@ async function runTtsJob(job, lane) {
       attachments,
     };
   }
-  const canUseKeepaliveSynth = Boolean(runtime.canUseKeepaliveSynth);
-  const canUseLegacySynth = Boolean(runtime.canUseLegacySynth);
-  const pyBin = String(runtime.pyBin || "").trim();
   const ffmpegBin = String(runtime.ffmpegBin || "").trim();
 
   if (!text) {
     return { ok: false, text: formatFailureText("Empty TTS text."), afterText, attachments };
   }
+  const referenceAudioPath = resolveTtsReferenceAudioForText(text);
 
   const maxStageAttempts = Math.max(1, 1 + Math.max(0, Number(TTS_TIMEOUT_RETRIES) || 0));
   const resetTimeoutState = () => {
@@ -14427,190 +14463,62 @@ async function runTtsJob(job, lane) {
 
   const runSynthOnce = async (outWavPath) => {
     const timeoutMs = minPositive([TTS_TIMEOUT_MS, hardTimeoutRemainingMs(job, TTS_HARD_TIMEOUT_MS)]);
-    if (canUseKeepaliveSynth) {
-      try {
-        await runTtsSynthKeepaliveSingle({
-          text,
-          outWavPath,
-          timeoutMs,
-          abortSignal,
-          job,
-        });
-        if (!fs.existsSync(outWavPath)) {
-          return { ok: false, text: "TTS synthesis finished, but WAV output file is missing." };
-        }
-        return { ok: true };
-      } catch (err) {
-        let msg = String(err?.message || err || "").trim();
-        if (job.cancelRequested || /tts canceled/i.test(msg)) {
-          return { ok: false, text: "TTS canceled." };
-        }
-        if (/timed out/i.test(msg)) {
-          job.timedOut = true;
-          job.timedOutMs = timeoutMs || Number(job.timedOutMs || 0);
-          job.timedOutStage = "synth";
-          return { ok: false, text: msg };
-        }
-        if (!keepaliveFatalRetryUsedSingle && shouldForceTtsKeepaliveRestart(msg)) {
-          keepaliveFatalRetryUsedSingle = true;
-          stopTtsKeepalive("TTS keepalive fatal synthesis error; restarting and retrying once.");
-          await sleep(250);
-          try {
-            await runTtsSynthKeepaliveSingle({
-              text,
-              outWavPath,
-              timeoutMs,
-              abortSignal,
-              job,
-            });
-            if (!fs.existsSync(outWavPath)) {
-              return { ok: false, text: "TTS synthesis finished, but WAV output file is missing." };
-            }
-            return { ok: true };
-          } catch (retryErr) {
-            msg = String(retryErr?.message || retryErr || "").trim();
-            if (job.cancelRequested || /tts canceled/i.test(msg)) {
-              return { ok: false, text: "TTS canceled." };
-            }
-            if (/timed out/i.test(msg)) {
-              job.timedOut = true;
-              job.timedOutMs = timeoutMs || Number(job.timedOutMs || 0);
-              job.timedOutStage = "synth";
-              return { ok: false, text: msg };
-            }
+    try {
+      await runTtsSynthKeepaliveSingle({
+        text,
+        outWavPath,
+        timeoutMs,
+        abortSignal,
+        job,
+        referenceAudioPath,
+      });
+      if (!fs.existsSync(outWavPath)) {
+        return { ok: false, text: "TTS synthesis finished, but WAV output file is missing." };
+      }
+      return { ok: true };
+    } catch (err) {
+      let msg = String(err?.message || err || "").trim();
+      if (job.cancelRequested || /tts canceled/i.test(msg)) {
+        return { ok: false, text: "TTS canceled." };
+      }
+      if (/timed out/i.test(msg)) {
+        job.timedOut = true;
+        job.timedOutMs = timeoutMs || Number(job.timedOutMs || 0);
+        job.timedOutStage = "synth";
+        return { ok: false, text: msg };
+      }
+      if (!keepaliveFatalRetryUsedSingle && shouldForceTtsKeepaliveRestart(msg)) {
+        keepaliveFatalRetryUsedSingle = true;
+        stopTtsKeepalive("TTS keepalive fatal synthesis error; restarting and retrying once.");
+        await sleep(250);
+        try {
+          await runTtsSynthKeepaliveSingle({
+            text,
+            outWavPath,
+            timeoutMs,
+            abortSignal,
+            job,
+            referenceAudioPath,
+          });
+          if (!fs.existsSync(outWavPath)) {
+            return { ok: false, text: "TTS synthesis finished, but WAV output file is missing." };
+          }
+          return { ok: true };
+        } catch (retryErr) {
+          msg = String(retryErr?.message || retryErr || "").trim();
+          if (job.cancelRequested || /tts canceled/i.test(msg)) {
+            return { ok: false, text: "TTS canceled." };
+          }
+          if (/timed out/i.test(msg)) {
+            job.timedOut = true;
+            job.timedOutMs = timeoutMs || Number(job.timedOutMs || 0);
+            job.timedOutStage = "synth";
+            return { ok: false, text: msg };
           }
         }
-        if (!canUseLegacySynth) {
-          return { ok: false, text: msg || "TTS keepalive synthesis failed." };
-        }
-        log(`TTS keepalive synth failed; falling back to one-shot process: ${oneLine(msg || "unknown error")}`);
-        noteTtsKeepaliveFallback("single", msg || "unknown error");
       }
+      return { ok: false, text: msg || "TTS keepalive synthesis failed." };
     }
-
-    const synthArgs = [
-      AIDOLON_TTS_SCRIPT_PATH,
-      "--out-wav",
-      outWavPath,
-      "--model",
-      TTS_MODEL,
-      "--reference-audio",
-      TTS_REFERENCE_AUDIO,
-      "--sample-rate",
-      String(TTS_SAMPLE_RATE || 48000),
-    ];
-
-    return await new Promise((resolve) => {
-      let done = false;
-      const finish = (result) => {
-        if (done) return;
-        done = true;
-        resolve(result);
-      };
-
-      let child;
-      try {
-        child = spawn(pyBin, synthArgs, {
-          cwd: ROOT,
-          windowsHide: true,
-          stdio: ["pipe", "pipe", "pipe"],
-        });
-      } catch (err) {
-        finish({ ok: false, text: `Failed to start TTS python: ${err.message || err}` });
-        return;
-      }
-
-      job.process = child;
-
-      try {
-        child.stdin.end(text);
-      } catch {
-        // best effort
-      }
-
-      let timeoutForceFinish = null;
-      let stderrScanCarry = "";
-      let stderrNoiseCarry = "";
-      const timeout = timeoutMs > 0
-        ? setTimeout(() => {
-          job.timedOut = true;
-          job.timedOutMs = timeoutMs;
-          job.timedOutStage = "synth";
-          terminateChildTree(child, { forceAfterMs: 3000 });
-          // Fail-safe: if termination doesn't trigger a close event, finish anyway.
-          timeoutForceFinish = setTimeout(() => {
-            const tail = job.stderrTail.trim() || job.stdoutTail.trim();
-            finish({
-              ok: false,
-              text: `TTS timed out after ${Math.round(timeoutMs / 1000)}s.${tail ? `\n\n${tail}` : ""}`,
-            });
-          }, 10_000);
-        }, timeoutMs)
-        : null;
-
-      child.stdout.on("data", (buf) => {
-        const chunk = String(buf || "");
-        job.stdoutTail = appendTail(job.stdoutTail, chunk, 50000);
-        if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
-      });
-      child.stderr.on("data", (buf) => {
-        const chunk = String(buf || "");
-        const noise = stripTtsBackendNoise(chunk, stderrNoiseCarry);
-        stderrNoiseCarry = noise.carry;
-        const filteredChunk = noise.text;
-        if (!filteredChunk) return;
-        job.stderrTail = appendTail(job.stderrTail, filteredChunk, 50000);
-        const fatal = detectTtsBackendFatalError(filteredChunk, stderrScanCarry);
-        stderrScanCarry = fatal.carry;
-        if (fatal.message && !job.cancelRequested) {
-          const msg = `TTS backend fatal error: ${fatal.message}`;
-          clearTimeout(timeout);
-          if (timeoutForceFinish) clearTimeout(timeoutForceFinish);
-          terminateChildTree(child, { forceAfterMs: 1200 });
-          finish({ ok: false, text: msg });
-          return;
-        }
-        if (typeof job.onProgressChunk === "function") job.onProgressChunk(filteredChunk, "stderr");
-      });
-      child.on("error", (err) => {
-        clearTimeout(timeout);
-        if (timeoutForceFinish) clearTimeout(timeoutForceFinish);
-        finish({ ok: false, text: `TTS python process error: ${err.message || err}` });
-      });
-      child.on("close", (code, signal) => {
-        clearTimeout(timeout);
-        if (timeoutForceFinish) clearTimeout(timeoutForceFinish);
-
-        if (job.cancelRequested) {
-          finish({ ok: false, text: "TTS canceled." });
-          return;
-        }
-        if (job.timedOut) {
-          const ms = Number(job.timedOutMs || 0) || timeoutMs || TTS_HARD_TIMEOUT_MS || 0;
-          const tail = job.stderrTail.trim() || job.stdoutTail.trim();
-          finish({
-            ok: false,
-            text: `TTS timed out after ${Math.round(ms / 1000)}s.${tail ? `\n\n${tail}` : ""}`,
-          });
-          return;
-        }
-        if (typeof code === "number" && code !== 0) {
-          const tail = job.stderrTail.trim() || job.stdoutTail.trim();
-          finish({
-            ok: false,
-            text: `TTS synthesis failed (exit ${code}${signal ? `, signal ${signal}` : ""}).${tail ? `\n\n${tail}` : ""}`,
-          });
-          return;
-        }
-
-        if (!fs.existsSync(outWavPath)) {
-          finish({ ok: false, text: "TTS synthesis finished, but WAV output file is missing." });
-          return;
-        }
-
-        finish({ ok: true });
-      });
-    });
   };
 
   let synthOk = { ok: false, text: "TTS synthesis failed." };
@@ -14903,9 +14811,7 @@ async function runTtsJob(job, lane) {
   }
 
   if (uploadErr) {
-    if (TTS_KEEPALIVE) {
-      stopTtsKeepalive("TTS voice delivery failure; forcing keepalive restart before next voice reply.");
-    }
+    stopTtsKeepalive("TTS voice delivery failure; forcing keepalive restart before next voice reply.");
     if (job.cancelRequested) {
       return { ok: false, text: "TTS canceled." };
     }
@@ -14998,6 +14904,8 @@ async function runTtsBatchJobPipelined(job, lane) {
 
   let sentCount = 0;
   let fallbackCount = 0;
+  const failedVoiceChunks = [];
+  let firstFallbackError = "";
   try {
     for (let idx = 0; idx < texts.length; idx += 1) {
       if (job.cancelRequested) {
@@ -15032,7 +14940,6 @@ async function runTtsBatchJobPipelined(job, lane) {
       }
 
       if (
-        TTS_KEEPALIVE &&
         /tts backend fatal error/i.test(
           String(chunkResult?.text || ""),
         )
@@ -15046,26 +14953,46 @@ async function runTtsBatchJobPipelined(job, lane) {
         `TTS batch chunk ${idx + 1}/${texts.length} failed in ${elapsedMs}ms; fallback to text${cappedErr ? ` (${cappedErr})` : ""}.`,
       );
 
-      const prefix = `Voice chunk ${idx + 1}/${texts.length} failed`;
-      const fallbackText = isVoiceReply
-        ? chunkText
-        : cappedErr
+      if (isVoiceReply) {
+        failedVoiceChunks.push(chunkText);
+        if (!firstFallbackError && cappedErr) firstFallbackError = cappedErr;
+      } else {
+        const prefix = `Voice chunk ${idx + 1}/${texts.length} failed`;
+        const fallbackText = cappedErr
           ? `${prefix}: ${cappedErr}\n\n${chunkText}`
           : `${prefix}.\n\n${chunkText}`;
+        try {
+          await sendMessage(job.chatId, fallbackText, {
+            replyToMessageId: job.replyToMessageId,
+            routeWorkerId: job.workerId,
+            routeTaskId: Number(job?.taskId || 0),
+            routeSessionId: String(job?.routeSessionId || getSessionForChatWorker(job.chatId, job.workerId) || "").trim(),
+          });
+        } catch (err) {
+          log(`TTS fallback send failed for chunk ${idx + 1}/${texts.length}: ${redactError(err?.message || err)}`);
+        }
+      }
+    }
+
+    if (fallbackCount > 0) {
+      log(`TTS batch completed with fallbacks: voice_sent=${sentCount}, text_fallbacks=${fallbackCount}, total=${texts.length}`);
+    }
+    if (isVoiceReply && failedVoiceChunks.length > 0) {
+      const failedText = failedVoiceChunks.join(" ").trim();
+      const suffix = firstFallbackError
+        ? `\n\n(Voice reply failed for ${failedVoiceChunks.length} chunk(s): ${firstFallbackError})`
+        : `\n\n(Voice reply failed for ${failedVoiceChunks.length} chunk(s).)`;
+      const mergedFallbackText = `${failedText}${suffix}`;
       try {
-        await sendMessage(job.chatId, fallbackText, {
+        await sendMessage(job.chatId, mergedFallbackText, {
           replyToMessageId: job.replyToMessageId,
           routeWorkerId: job.workerId,
           routeTaskId: Number(job?.taskId || 0),
           routeSessionId: String(job?.routeSessionId || getSessionForChatWorker(job.chatId, job.workerId) || "").trim(),
         });
       } catch (err) {
-        log(`TTS fallback send failed for chunk ${idx + 1}/${texts.length}: ${redactError(err?.message || err)}`);
+        log(`TTS merged fallback send failed: ${redactError(err?.message || err)}`);
       }
-    }
-
-    if (fallbackCount > 0) {
-      log(`TTS batch completed with fallbacks: voice_sent=${sentCount}, text_fallbacks=${fallbackCount}, total=${texts.length}`);
     }
 
     if (originalSkipResultText) {
@@ -15149,18 +15076,14 @@ async function runTtsBatchJob(job, lane) {
       attachments,
     };
   }
-  const canUseKeepaliveSynth = Boolean(runtime.canUseKeepaliveSynth);
-  const canUseLegacySynth = Boolean(runtime.canUseLegacySynth);
-  const pyBin = String(runtime.pyBin || "").trim();
   const ffmpegBin = String(runtime.ffmpegBin || "").trim();
 
   if (texts.length === 0) {
     return { ok: false, text: formatFailureText("Empty TTS text."), afterText, attachments };
   }
+  const referenceAudioPath = resolveTtsReferenceAudioForText(fullText);
 
   const pad3 = (n) => String(n).padStart(3, "0");
-  const payload = `${texts.map((t) => JSON.stringify({ text: t })).join("\n")}\n`;
-
   const maxStageAttempts = Math.max(1, 1 + Math.max(0, Number(TTS_TIMEOUT_RETRIES) || 0));
   const resetTimeoutState = () => {
     job.timedOut = false;
@@ -15185,183 +15108,56 @@ async function runTtsBatchJob(job, lane) {
 
   const runBatchSynthOnce = async (outWavBase) => {
     const timeoutMs = minPositive([TTS_TIMEOUT_MS, hardTimeoutRemainingMs(job, TTS_HARD_TIMEOUT_MS)]);
-    if (canUseKeepaliveSynth) {
-      try {
-        await runTtsSynthKeepaliveBatch({
-          texts,
-          outWavBase,
-          timeoutMs,
-          abortSignal,
-          job,
-        });
-        return { ok: true };
-      } catch (err) {
-        let msg = String(err?.message || err || "").trim();
-        if (job.cancelRequested || /tts canceled/i.test(msg)) {
-          return { ok: false, text: "TTS canceled." };
-        }
-        if (/timed out/i.test(msg)) {
-          job.timedOut = true;
-          job.timedOutMs = timeoutMs || Number(job.timedOutMs || 0);
-          job.timedOutStage = "synth";
-          return { ok: false, text: msg };
-        }
-        if (!keepaliveFatalRetryUsedBatch && shouldForceTtsKeepaliveRestart(msg)) {
-          keepaliveFatalRetryUsedBatch = true;
-          stopTtsKeepalive("TTS keepalive fatal batch synthesis error; restarting and retrying once.");
-          await sleep(250);
-          try {
-            await runTtsSynthKeepaliveBatch({
-              texts,
-              outWavBase,
-              timeoutMs,
-              abortSignal,
-              job,
-            });
-            return { ok: true };
-          } catch (retryErr) {
-            msg = String(retryErr?.message || retryErr || "").trim();
-            if (job.cancelRequested || /tts canceled/i.test(msg)) {
-              return { ok: false, text: "TTS canceled." };
-            }
-            if (/timed out/i.test(msg)) {
-              job.timedOut = true;
-              job.timedOutMs = timeoutMs || Number(job.timedOutMs || 0);
-              job.timedOutStage = "synth";
-              return { ok: false, text: msg };
-            }
+    try {
+      await runTtsSynthKeepaliveBatch({
+        texts,
+        outWavBase,
+        timeoutMs,
+        abortSignal,
+        job,
+        referenceAudioPath,
+      });
+      return { ok: true };
+    } catch (err) {
+      let msg = String(err?.message || err || "").trim();
+      if (job.cancelRequested || /tts canceled/i.test(msg)) {
+        return { ok: false, text: "TTS canceled." };
+      }
+      if (/timed out/i.test(msg)) {
+        job.timedOut = true;
+        job.timedOutMs = timeoutMs || Number(job.timedOutMs || 0);
+        job.timedOutStage = "synth";
+        return { ok: false, text: msg };
+      }
+      if (!keepaliveFatalRetryUsedBatch && shouldForceTtsKeepaliveRestart(msg)) {
+        keepaliveFatalRetryUsedBatch = true;
+        stopTtsKeepalive("TTS keepalive fatal batch synthesis error; restarting and retrying once.");
+        await sleep(250);
+        try {
+          await runTtsSynthKeepaliveBatch({
+            texts,
+            outWavBase,
+            timeoutMs,
+            abortSignal,
+            job,
+            referenceAudioPath,
+          });
+          return { ok: true };
+        } catch (retryErr) {
+          msg = String(retryErr?.message || retryErr || "").trim();
+          if (job.cancelRequested || /tts canceled/i.test(msg)) {
+            return { ok: false, text: "TTS canceled." };
+          }
+          if (/timed out/i.test(msg)) {
+            job.timedOut = true;
+            job.timedOutMs = timeoutMs || Number(job.timedOutMs || 0);
+            job.timedOutStage = "synth";
+            return { ok: false, text: msg };
           }
         }
-        if (!canUseLegacySynth) {
-          return { ok: false, text: msg || "TTS keepalive synthesis failed." };
-        }
-        log(`TTS keepalive batch synth failed; falling back to one-shot process: ${oneLine(msg || "unknown error")}`);
-        noteTtsKeepaliveFallback("batch", msg || "unknown error");
       }
+      return { ok: false, text: msg || "TTS keepalive synthesis failed." };
     }
-
-    const synthArgs = [
-      AIDOLON_TTS_SCRIPT_PATH,
-      "--batch-jsonl",
-      "--out-wav-base",
-      outWavBase,
-      "--model",
-      TTS_MODEL,
-      "--reference-audio",
-      TTS_REFERENCE_AUDIO,
-      "--sample-rate",
-      String(TTS_SAMPLE_RATE || 48000),
-    ];
-
-    return await new Promise((resolve) => {
-      let done = false;
-      const finish = (result) => {
-        if (done) return;
-        done = true;
-        resolve(result);
-      };
-
-      let child;
-      try {
-        child = spawn(pyBin, synthArgs, {
-          cwd: ROOT,
-          env: { ...process.env, PYTHONUNBUFFERED: "1" },
-          windowsHide: true,
-          stdio: ["pipe", "pipe", "pipe"],
-        });
-      } catch (err) {
-        finish({ ok: false, text: `Failed to start TTS python: ${err.message || err}` });
-        return;
-      }
-
-      job.process = child;
-
-      try {
-        child.stdin.end(payload);
-      } catch {
-        // best effort
-      }
-
-      let timeoutForceFinish = null;
-      let stderrScanCarry = "";
-      let stderrNoiseCarry = "";
-      const timeout = timeoutMs > 0
-        ? setTimeout(() => {
-          job.timedOut = true;
-          job.timedOutMs = timeoutMs;
-          job.timedOutStage = "synth";
-          terminateChildTree(child, { forceAfterMs: 3000 });
-          // Fail-safe: if termination doesn't trigger a close event, finish anyway.
-          timeoutForceFinish = setTimeout(() => {
-            const tail = job.stderrTail.trim() || job.stdoutTail.trim();
-            finish({
-              ok: false,
-              text: `TTS timed out after ${Math.round(timeoutMs / 1000)}s.${tail ? `\n\n${tail}` : ""}`,
-            });
-          }, 10_000);
-        }, timeoutMs)
-        : null;
-
-      child.stdout.on("data", (buf) => {
-        const chunk = String(buf || "");
-        job.stdoutTail = appendTail(job.stdoutTail, chunk, 50000);
-        if (TTS_STREAM_OUTPUT_TO_TERMINAL) process.stdout.write(chunk);
-        if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
-      });
-      child.stderr.on("data", (buf) => {
-        const chunk = String(buf || "");
-        const noise = stripTtsBackendNoise(chunk, stderrNoiseCarry);
-        stderrNoiseCarry = noise.carry;
-        const filteredChunk = noise.text;
-        if (!filteredChunk) return;
-        job.stderrTail = appendTail(job.stderrTail, filteredChunk, 50000);
-        const fatal = detectTtsBackendFatalError(filteredChunk, stderrScanCarry);
-        stderrScanCarry = fatal.carry;
-        if (fatal.message && !job.cancelRequested) {
-          const msg = `TTS backend fatal error: ${fatal.message}`;
-          clearTimeout(timeout);
-          if (timeoutForceFinish) clearTimeout(timeoutForceFinish);
-          terminateChildTree(child, { forceAfterMs: 1200 });
-          finish({ ok: false, text: msg });
-          return;
-        }
-        if (TTS_STREAM_OUTPUT_TO_TERMINAL) process.stderr.write(filteredChunk);
-        if (typeof job.onProgressChunk === "function") job.onProgressChunk(filteredChunk, "stderr");
-      });
-      child.on("error", (err) => {
-        clearTimeout(timeout);
-        if (timeoutForceFinish) clearTimeout(timeoutForceFinish);
-        finish({ ok: false, text: `TTS python process error: ${err.message || err}` });
-      });
-      child.on("close", (code, signal) => {
-        clearTimeout(timeout);
-        if (timeoutForceFinish) clearTimeout(timeoutForceFinish);
-
-        if (job.cancelRequested) {
-          finish({ ok: false, text: "TTS canceled." });
-          return;
-        }
-        if (job.timedOut) {
-          const ms = Number(job.timedOutMs || 0) || timeoutMs || TTS_HARD_TIMEOUT_MS || 0;
-          const tail = job.stderrTail.trim() || job.stdoutTail.trim();
-          finish({
-            ok: false,
-            text: `TTS timed out after ${Math.round(ms / 1000)}s.${tail ? `\n\n${tail}` : ""}`,
-          });
-          return;
-        }
-        if (typeof code === "number" && code !== 0) {
-          const tail = job.stderrTail.trim() || job.stdoutTail.trim();
-          finish({
-            ok: false,
-            text: `TTS synthesis failed (exit ${code}${signal ? `, signal ${signal}` : ""}).${tail ? `\n\n${tail}` : ""}`,
-          });
-          return;
-        }
-
-        finish({ ok: true });
-      });
-    });
   };
 
   let synthOk = { ok: false, text: "TTS synthesis failed." };
@@ -15649,9 +15445,7 @@ async function runTtsBatchJob(job, lane) {
     }
 
     if (uploadErr) {
-      if (TTS_KEEPALIVE) {
-        stopTtsKeepalive("TTS voice delivery failure; forcing keepalive restart before next voice reply.");
-      }
+      stopTtsKeepalive("TTS voice delivery failure; forcing keepalive restart before next voice reply.");
       cleanupWavs();
       if (job.cancelRequested) {
         return { ok: false, text: "TTS canceled." };
@@ -16130,7 +15924,12 @@ async function ensureWhisperKeepaliveRunning() {
     ];
     proc = spawn(WHISPER_PYTHON, args, {
       cwd: ROOT,
-      env: { ...process.env, PYTHONUNBUFFERED: "1" },
+      env: {
+        ...process.env,
+        PYTHONUNBUFFERED: "1",
+        PYTHONIOENCODING: "utf-8",
+        PYTHONUTF8: "1",
+      },
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -16288,7 +16087,12 @@ async function transcribeAudioWithWhisper(audioPath, { abortSignal, job } = {}) 
   return await new Promise((resolve, reject) => {
     const py = spawn(WHISPER_PYTHON, args, {
       cwd: ROOT,
-      env: { ...process.env, PYTHONUNBUFFERED: "1" },
+      env: {
+        ...process.env,
+        PYTHONUNBUFFERED: "1",
+        PYTHONIOENCODING: "utf-8",
+        PYTHONUTF8: "1",
+      },
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -16376,7 +16180,7 @@ async function prewarmAudioKeepalives() {
     }
   }
 
-  if (TTS_ENABLED && TTS_KEEPALIVE && TTS_PREWARM_ON_STARTUP) {
+  if (TTS_ENABLED && TTS_PREWARM_ON_STARTUP) {
     const pyBin = resolveTtsPythonBin();
     if (!pyBin) {
       log("TTS prewarm skipped: python not found.");
@@ -17247,19 +17051,14 @@ process.on("unhandledRejection", (err) => {
       }
     }
     if (TTS_ENABLED) {
-      const ttsMode = TTS_KEEPALIVE ? "keepalive" : "one-shot";
       const hasTtsServer = fs.existsSync(AIDOLON_TTS_SERVER_SCRIPT_PATH);
-      const hasTtsLegacy = fs.existsSync(AIDOLON_TTS_SCRIPT_PATH);
       const pyBin = resolveTtsPythonBin();
       if (!pyBin) {
         log("TTS is enabled but Python is not available (set TTS_PYTHON or create TTS_VENV_PATH).");
-      } else if (!hasTtsLegacy && !hasTtsServer) {
-        log(`TTS helper scripts missing at ${AIDOLON_TTS_SCRIPT_PATH} / ${AIDOLON_TTS_SERVER_SCRIPT_PATH}`);
-      } else if (TTS_KEEPALIVE && !hasTtsServer) {
-        log(`TTS keepalive requested, but server script is missing at ${AIDOLON_TTS_SERVER_SCRIPT_PATH} (falling back to one-shot).`);
-        log(`TTS enabled (model=${TTS_MODEL || "(unset)"}, mode=one-shot)`);
+      } else if (!hasTtsServer) {
+        log(`TTS keepalive server script is missing at ${AIDOLON_TTS_SERVER_SCRIPT_PATH}.`);
       } else {
-        log(`TTS enabled (model=${TTS_MODEL || "(unset)"}, mode=${ttsMode}, auto_restart=${TTS_KEEPALIVE_AUTO_RESTART})`);
+        log(`TTS enabled (model=${TTS_MODEL || "(unset)"}, mode=keepalive, auto_restart=${TTS_KEEPALIVE_AUTO_RESTART})`);
       }
     }
     log(

@@ -120,22 +120,57 @@ def _is_tokenizer_input_type_error(exc: Exception) -> bool:
 
 def _reload_tts_runtime(state: dict) -> None:
     model = str(state.get("model", "") or "")
-    ref_path = state.get("ref_path")
+    ref_path = state.get("default_ref_path")
     if not model:
         raise RuntimeError("Cannot reload TTS runtime: missing model")
     if not isinstance(ref_path, Path):
         raise RuntimeError("Cannot reload TTS runtime: missing reference audio path")
     tts = state.get("tts_factory")(model)
-    ctx = tts.encode_audio(str(ref_path))
     state["tts"] = tts
-    state["ctx"] = ctx
+    state["ctx_cache"] = {}
+    _get_ctx_for_ref_path(state, ref_path)
 
 
-def _generate_with_recovery(state: dict, text: str):
+def _resolve_request_ref_path(state: dict, payload: dict) -> Path:
+    raw = str(payload.get("reference_audio", "") or "").strip()
+    if not raw:
+        ref_path = state.get("default_ref_path")
+        if isinstance(ref_path, Path):
+            return ref_path
+        raise RuntimeError("TTS runtime missing default reference audio path")
+
+    ref_path = Path(raw).expanduser().resolve()
+    if not ref_path.is_file():
+        raise RuntimeError(f"Reference audio not found: {ref_path}")
+    return ref_path
+
+
+def _get_ctx_for_ref_path(state: dict, ref_path: Path):
+    if not isinstance(ref_path, Path):
+        raise RuntimeError("Missing reference audio path")
     tts = state.get("tts")
-    ctx = state.get("ctx")
     if tts is None:
         raise RuntimeError("TTS runtime unavailable")
+
+    cache = state.get("ctx_cache")
+    if not isinstance(cache, dict):
+        cache = {}
+        state["ctx_cache"] = cache
+
+    key = str(ref_path)
+    if key in cache:
+        return cache[key]
+
+    ctx = tts.encode_audio(str(ref_path))
+    cache[key] = ctx
+    return ctx
+
+
+def _generate_with_recovery(state: dict, text: str, ref_path: Path):
+    tts = state.get("tts")
+    if tts is None:
+        raise RuntimeError("TTS runtime unavailable")
+    ctx = _get_ctx_for_ref_path(state, ref_path)
     try:
         return tts.generate(text, ctx)
     except Exception as exc:
@@ -147,8 +182,40 @@ def _generate_with_recovery(state: dict, text: str):
         )
         _reload_tts_runtime(state)
         tts_retry = state.get("tts")
-        ctx_retry = state.get("ctx")
+        ctx_retry = _get_ctx_for_ref_path(state, ref_path)
         return tts_retry.generate(text, ctx_retry)
+
+
+def _synthesize_batch_with_recovery(state: dict, cleaned: list[str], ref_path: Path):
+    tts = state.get("tts")
+    if tts is None:
+        raise RuntimeError("TTS runtime unavailable")
+    ctx = _get_ctx_for_ref_path(state, ref_path)
+    try:
+        prompts = [tts.codec.format_prompt(text, ctx, None) for text in cleaned]
+        responses = tts.pipe(prompts, gen_config=tts.gen_config, do_preprocess=False)
+        if not isinstance(responses, list):
+            raise TypeError(f"Unexpected response type: {type(responses)}")
+        if len(responses) != len(cleaned):
+            raise RuntimeError(f"Unexpected response count: got {len(responses)}, expected {len(cleaned)}")
+        return [tts.codec.decode(response.text, ctx) for response in responses]
+    except Exception as exc:
+        if not _is_tokenizer_input_type_error(exc):
+            raise
+        print(
+            "TTS server: tokenizer input type error detected in batch path; reloading runtime and retrying once.",
+            file=sys.stderr,
+        )
+        _reload_tts_runtime(state)
+        tts_retry = state.get("tts")
+        ctx_retry = _get_ctx_for_ref_path(state, ref_path)
+        prompts = [tts_retry.codec.format_prompt(text, ctx_retry, None) for text in cleaned]
+        responses = tts_retry.pipe(prompts, gen_config=tts_retry.gen_config, do_preprocess=False)
+        if not isinstance(responses, list):
+            raise TypeError(f"Unexpected response type: {type(responses)}")
+        if len(responses) != len(cleaned):
+            raise RuntimeError(f"Unexpected response count: got {len(responses)}, expected {len(cleaned)}")
+        return [tts_retry.codec.decode(response.text, ctx_retry) for response in responses]
 
 
 def _write_wav(out_wav: Path, audio, sample_rate: int) -> None:
@@ -178,7 +245,8 @@ def _handle_synthesize(request_id: str, payload: dict, *, state: dict, sample_ra
     out_wav = Path(out_raw).expanduser().resolve()
 
     try:
-        audio = _generate_with_recovery(state, text)
+        ref_path = _resolve_request_ref_path(state, payload)
+        audio = _generate_with_recovery(state, text, ref_path)
         _write_wav(out_wav, audio, sample_rate)
         if not out_wav.is_file():
             raise RuntimeError("Output WAV file missing after synthesis")
@@ -212,8 +280,9 @@ def _handle_synthesize_batch(request_id: str, payload: dict, *, state: dict, sam
     out_paths = [Path(f"{out_base}-{idx:03}.wav") for idx in range(len(cleaned))]
 
     try:
-        for idx, (text, out_wav) in enumerate(zip(cleaned, out_paths)):
-            audio = _generate_with_recovery(state, text)
+        ref_path = _resolve_request_ref_path(state, payload)
+        audios = _synthesize_batch_with_recovery(state, cleaned, ref_path)
+        for idx, (audio, out_wav) in enumerate(zip(audios, out_paths)):
             _write_wav(out_wav, audio, sample_rate)
             if not out_wav.is_file():
                 raise RuntimeError(f"Output WAV missing for index {idx}")
@@ -253,10 +322,10 @@ def main() -> int:
     try:
         state = {
             "model": str(args.model),
-            "ref_path": ref_path,
+            "default_ref_path": ref_path,
             "tts_factory": MiraTTS,
             "tts": None,
-            "ctx": None,
+            "ctx_cache": {},
         }
         _reload_tts_runtime(state)
     except Exception as exc:
