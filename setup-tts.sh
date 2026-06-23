@@ -125,8 +125,21 @@ pip_install() {
   fi
 }
 
-if ! command -v nvidia-smi >/dev/null 2>&1; then
-  echo "NVIDIA GPU not detected. Falling back to CPU-only torch..."
+pip_uninstall() {
+  if [[ "$HAS_UV" == "1" ]]; then
+    uv pip uninstall --python "$VENV_PY" "$@" || true
+  else
+    "$VENV_PY" -m pip uninstall -y "$@" || true
+  fi
+}
+
+HAS_WORKING_NVIDIA=0
+if nvidia-smi >/dev/null 2>&1; then
+  HAS_WORKING_NVIDIA=1
+fi
+
+if [[ "$HAS_WORKING_NVIDIA" != "1" ]]; then
+  echo "Working NVIDIA GPU not detected. Falling back to CPU-capable torch..."
   pip_install "${TORCH_CPU_PACKAGES[@]}"
 else
   if ! "$VENV_PY" -c "import torch,sys; v=torch.__version__.split('+')[0].split('.'); sys.exit(0 if torch.cuda.is_available() and (int(v[0]),int(v[1])) >= (2,8) else 1)" >/dev/null 2>&1; then
@@ -137,7 +150,9 @@ else
       "$VENV_PY" -m pip install --upgrade --force-reinstall "${TORCH_CUDA_PACKAGES[@]}" --index-url https://download.pytorch.org/whl/cu128
     fi
   fi
-  "$VENV_PY" -c "import torch,torchaudio; assert torch.cuda.is_available()" >/dev/null
+  if ! "$VENV_PY" -c "import torch,torchaudio; assert torch.cuda.is_available()" >/dev/null; then
+    echo "CUDA torch installed but CUDA is unavailable. Continuing with CPU execution."
+  fi
 fi
 
 pip_install "numpy<2" soundfile omegaconf
@@ -148,5 +163,10 @@ if ! command -v git >/dev/null 2>&1; then
   exit 1
 fi
 pip_install "git+https://github.com/ysharma3501/MiraTTS.git"
+
+echo "Using CPU ONNX Runtime for MiraTTS decoder compatibility..."
+pip_uninstall onnxruntime-gpu
+pip_install --upgrade --force-reinstall onnxruntime
+pip_install "numpy<2"
 
 "$VENV_PY" -c "from mira.model import MiraTTS; print('MiraTTS import ok')"

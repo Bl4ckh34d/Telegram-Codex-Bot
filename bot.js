@@ -5,6 +5,7 @@ const fs = require("fs");
 const dns = require("dns");
 const os = require("os");
 const path = require("path");
+const { Agent: UndiciAgent } = require("undici");
 const { spawn, spawnSync } = require("child_process");
 const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
@@ -663,11 +664,26 @@ function log(msg) {
 function normalizeDnsResultOrder(rawValue) {
   const raw = String(rawValue || "").trim().toLowerCase();
   if (!raw || raw === "auto") {
-    return process.platform === "win32" ? "ipv4first" : "";
+    return "ipv4first";
   }
   if (["off", "none", "disabled", "0", "false", "no"].includes(raw)) return "";
   if (["ipv4first", "ipv6first", "verbatim"].includes(raw)) return raw;
   return "";
+}
+
+function createTelegramFetchDispatcher(resultOrder) {
+  const order = String(resultOrder || "").trim().toLowerCase();
+  if (order !== "ipv4first" && order !== "ipv6first") return null;
+  const family = order === "ipv6first" ? 6 : 4;
+  return new UndiciAgent({
+    connect: {
+      lookup(hostname, options, callback) {
+        dns.lookup(hostname, { family, all: false }, (err, address, resolvedFamily) => {
+          callback(err, err ? undefined : [{ address, family: resolvedFamily }]);
+        });
+      },
+    },
+  });
 }
 
 loadEnv(ENV_PATH);
@@ -693,6 +709,7 @@ const POLL_TIMEOUT_SEC = toInt(process.env.TELEGRAM_POLL_TIMEOUT_SEC, 20);
 const TELEGRAM_API_TIMEOUT_MS = toTimeoutMs(process.env.TELEGRAM_API_TIMEOUT_MS, 60_000);
 const TELEGRAM_UPLOAD_TIMEOUT_MS = toTimeoutMs(process.env.TELEGRAM_UPLOAD_TIMEOUT_MS, 120_000);
 const TELEGRAM_DNS_RESULT_ORDER = normalizeDnsResultOrder(process.env.TELEGRAM_DNS_RESULT_ORDER || "auto");
+const TELEGRAM_FETCH_DISPATCHER = createTelegramFetchDispatcher(TELEGRAM_DNS_RESULT_ORDER);
 const TELEGRAM_STARTUP_MAX_ATTEMPTS = toInt(process.env.TELEGRAM_STARTUP_MAX_ATTEMPTS, 8, 1, 120);
 const TELEGRAM_STARTUP_RETRY_BASE_MS = toInt(process.env.TELEGRAM_STARTUP_RETRY_BASE_MS, 1500, 100, 120_000);
 const TELEGRAM_STARTUP_RETRY_MAX_MS = toInt(process.env.TELEGRAM_STARTUP_RETRY_MAX_MS, 15_000, 500, 180_000);
@@ -4002,6 +4019,7 @@ async function telegramApi(method, { query = "", body = null, timeoutMs = TELEGR
       headers: body ? { "Content-Type": "application/json" } : undefined,
       body: body ? JSON.stringify(body) : undefined,
       signal: combined.signal,
+      dispatcher: TELEGRAM_FETCH_DISPATCHER || undefined,
     });
 
     const data = await res.json().catch(() => ({}));
@@ -4028,6 +4046,7 @@ async function telegramApiMultipart(method, formData, timeoutMs = TELEGRAM_UPLOA
       method: "POST",
       body: formData,
       signal: combined.signal,
+      dispatcher: TELEGRAM_FETCH_DISPATCHER || undefined,
     });
 
     const data = await res.json().catch(() => ({}));
