@@ -15788,7 +15788,10 @@ async function downloadTelegramFile(filePath, destinationPath, { signal } = {}) 
   const maxAttempts = 3;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      const res = await fetch(url, { signal });
+      const res = await fetch(url, {
+        signal,
+        dispatcher: TELEGRAM_FETCH_DISPATCHER || undefined,
+      });
       if (!res.ok) {
         if ((res.status === 429 || res.status >= 500) && attempt < maxAttempts) {
           const delayMs = computeExponentialBackoffMs(attempt, 300, 3000, 0.15);
