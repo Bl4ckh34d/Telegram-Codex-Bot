@@ -15,6 +15,7 @@ These rules apply to any AI agent (including multi-worker setups) operating in t
 ## Front-End UI Automation Toolset
 
 - For real browser UX testing on Windows, use `tools/ui_automation.ps1` (or `tools/ui.cmd`).
+- For real browser UX testing on Linux, use `tools/ui.sh`.
 - Minimal supported actions: `windows`, `focus`, `click`, `double_click`, `right_click`, `move`, `type`, `key`, `scroll`, `wait`, `screenshot`.
 - Preferred execution loop: focus target window, screenshot, perform one action, screenshot again, repeat.
 - Keep actions small and reproducible. Ask for confirmation before destructive steps.

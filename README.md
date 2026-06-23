@@ -35,7 +35,7 @@ This bot is built for local personal use. It long-polls Telegram and runs Codex 
 Notes:
 - Windows and Ubuntu Linux are supported runtimes.
 - Desktop screenshot capture works on Windows and Linux. On Ubuntu, install `gnome-screenshot` or another supported capture tool (`grim`, `scrot`, `maim`, or ImageMagick `import`).
-- Desktop UI automation is Windows-only.
+- Desktop UI automation has Windows and Linux entrypoints.
 - Whisper and TTS are optional and can be disabled in `.env`.
 
 ## Run
@@ -62,7 +62,7 @@ Recommended Ubuntu packages:
 
 ```bash
 sudo apt update
-sudo apt install -y nodejs npm python3 python3-venv python3-pip ffmpeg git curl gnome-screenshot
+sudo apt install -y nodejs npm python3 python3-venv python3-pip ffmpeg git curl gnome-screenshot xdotool android-tools-adb xclip tesseract-ocr
 ```
 
 Install and authenticate the Codex CLI before starting the bot. If Codex is not on `PATH`, set `CODEX_BIN` in `.env`.
@@ -204,16 +204,16 @@ Voice replies:
 - Send an image first, then ask using `/ask`.
 - `/see` captures screenshots and includes them in the vision request.
 
-## Desktop UI automation (Windows)
+## Desktop UI automation (Windows and Linux)
 
 Minimal browser-control toolset for real UI testing:
 
-- `tools/ui_automation.ps1` (PowerShell entrypoint)
-- `tools/ui.cmd` (wrapper)
-- `tools/tv_capture.ps1` and `tools/tv_capture.cmd` (Android TV screenshot capture/pull/cleanup)
-- `tools/tv_open_app.ps1` and `tools/tv_open_app.cmd` (Android TV app launcher with presets + custom package)
-- `tools/tv_close_app.ps1` and `tools/tv_close_app.cmd` (Android TV app closer with presets + custom package)
-- `tools/tv_power.ps1` plus `tools/tv_power_on.cmd` and `tools/tv_power_off.cmd` (TV wake/sleep over ADB)
+- Windows desktop UI: `tools/ui_automation.ps1` (or `tools/ui.cmd`)
+- Linux desktop UI: `tools/ui.sh`
+- Windows TV ADB: `tools/tv_capture.ps1`, `tools/tv_open_app.ps1`, `tools/tv_close_app.ps1`, `tools/tv_power.ps1`
+- Linux TV ADB: `tools/tv_capture.sh`, `tools/tv_open_app.sh`, `tools/tv_close_app.sh`, `tools/tv_power.sh`
+- Power shortcuts: `tools/tv_power_on.cmd`, `tools/tv_power_off.cmd`, `tools/tv_power_on.sh`, `tools/tv_power_off.sh`
+- Watch prep workflow: `tools/watch_tv_prep.ps1` on Windows, `tools/watch_tv_prep.sh` on Linux
 
 Supported actions:
 
@@ -249,6 +249,14 @@ Move behavior notes:
 - `batch` and `host` requests accept optional integer `priority` so higher-priority queued actions execute first.
 - `host` supports telemetry control messages (`telemetry`, optional reset) in addition to normal actions.
 - Phase 3 adds telemetry and adaptive tuning: repeated cursor misses auto-increase move/drag smoothness, and repeated OCR misses raise OCR cache TTL (and can widen `click_text` scans when safe).
+
+Linux notes:
+- Required for UI mutation actions: `xdotool`.
+- Required for Linux ADB TV tools: `android-tools-adb`.
+- Recommended optional packages: `wmctrl`, `xclip` or `xsel`, `tesseract-ocr`, and `gnome-screenshot`.
+- The Linux `click_text` action needs `tesseract`; without it, OCR calls return a JSON error.
+- Linux `highlight` is a lightweight cursor-position wait, not a drawn frame.
+- Linux `host` and `telemetry` keep the JSON protocol but do not persist adaptive telemetry yet.
 
 Recommended loop for frontend UX checks:
 

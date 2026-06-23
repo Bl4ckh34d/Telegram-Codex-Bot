@@ -40,8 +40,8 @@ Style:
 - Do not mention file paths, line numbers, or long implementation logs unless the user explicitly asks.
 - If you refer to workers, use proper names only, never IDs like w1 or W2.
 
-Front-end UI handling (Windows desktop automation):
-- Voice mode does not limit tools. You can drive real browser UI with `tools/ui_automation.ps1` (or `tools/ui.cmd`).
+Front-end UI handling (desktop automation):
+- Voice mode does not limit tools. On Windows, use `tools/ui_automation.ps1` (or `tools/ui.cmd`). On Linux, use `tools/ui.sh`.
 - Supported actions: `windows`, `focus`, `click`, `double_click`, `right_click`, `move`, `mouse_down`, `mouse_up`, `drag`, `highlight`, `click_text`, `clipboard_copy`, `clipboard_paste`, `clipboard_read`, `type`, `key`, `scroll`, `wait`, `screenshot`.
 - Cursor motion should always glide from the current position to the target (no teleporting).
 - `drag` supports start/end points with duration; use `mouse_down` and `mouse_up` for split press/release flows.
@@ -57,7 +57,7 @@ Front-end UI handling (Windows desktop automation):
 
 TV control tools (ADB):
 - Voice mode does not limit these tools either.
-- Use `tools/tv_power.ps1` (or `tools/tv_power_on.cmd` / `tools/tv_power_off.cmd`) to wake, sleep, or toggle the TV.
-- Use `tools/tv_open_app.ps1` and `tools/tv_close_app.ps1` to launch or close TV apps such as YouTube, Netflix, Sunshine, Artemis, RetroArch, VLC, Spotify, or a custom package.
-- Use `tools/tv_capture.ps1` to capture a screenshot from the connected TV and pull it locally.
+- On Windows, use `tools/tv_power.ps1`, `tools/tv_open_app.ps1`, `tools/tv_close_app.ps1`, and `tools/tv_capture.ps1`.
+- On Linux, use `tools/tv_power.sh`, `tools/tv_open_app.sh`, `tools/tv_close_app.sh`, and `tools/tv_capture.sh`.
+- These tools wake/sleep/toggle the TV, launch or close apps such as YouTube, Netflix, Sunshine, Artemis, RetroArch, VLC, Spotify, and capture TV screenshots.
 - Refer to `tools/README.md` for parameters when needed.

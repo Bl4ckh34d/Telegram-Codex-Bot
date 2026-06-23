@@ -1,23 +1,22 @@
-# UI Automation Toolset (Windows)
+# UI Automation Toolset (Windows and Linux)
 
 This folder contains a minimal desktop automation bridge for real browser UX testing.
 
 ## Entrypoints
 
-- `ui_automation.ps1` (PowerShell)
-- `ui.cmd` (wrapper that calls PowerShell script)
-- `tv_capture.ps1` (ADB TV screenshot capture, pull, and remote cleanup)
-- `tv_capture.cmd` (wrapper that calls `tv_capture.ps1`)
-- `tv_open_app.ps1` (ADB TV app launcher with presets)
-- `tv_open_app.cmd` (wrapper that calls `tv_open_app.ps1`)
-- `tv_close_app.ps1` (ADB TV app closer with presets)
-- `tv_close_app.cmd` (wrapper that calls `tv_close_app.ps1`)
-- `tv_power.ps1` (ADB TV power control: on/off/toggle)
-- `tv_power.cmd` (wrapper that calls `tv_power.ps1`)
-- `tv_power_on.cmd` (turn TV on / wake)
-- `tv_power_off.cmd` (turn TV off / sleep)
-- `watch_tv_prep.ps1` (single workflow: Sunshine -> TV on -> Artemis -> stream attempt -> Firefox TV window -> open sites)
-- `watch_tv_prep.cmd` (wrapper that calls `watch_tv_prep.ps1`)
+- Windows UI: `ui_automation.ps1` (or `ui.cmd`)
+- Linux UI: `ui.sh` (calls `linux_ui_automation.py`)
+- Windows TV ADB: `tv_capture.ps1`, `tv_open_app.ps1`, `tv_close_app.ps1`, `tv_power.ps1`
+- Linux TV ADB: `tv_capture.sh`, `tv_open_app.sh`, `tv_close_app.sh`, `tv_power.sh`
+- Power shortcuts: `tv_power_on.cmd`, `tv_power_off.cmd`, `tv_power_on.sh`, `tv_power_off.sh`
+- Watch prep workflow: `watch_tv_prep.ps1` on Windows, `watch_tv_prep.sh` on Linux
+
+Linux package notes:
+- UI mutation actions require `xdotool`.
+- Screenshots require one of `gnome-screenshot`, `grim`, `scrot`, `maim`, or ImageMagick `import`.
+- Clipboard actions require `wl-clipboard`, `xclip`, or `xsel`.
+- `click_text` requires `tesseract-ocr`.
+- TV tools require `android-tools-adb`.
 
 ## Parameters
 
@@ -126,7 +125,7 @@ Drag reliability guidance:
 
 ## TV screenshot flow (ADB)
 
-Use `tv_capture.ps1` when capturing screenshots from a connected Android TV.
+Use `tv_capture.ps1` on Windows or `tv_capture.sh` on Linux when capturing screenshots from a connected Android TV.
 
 Default behavior (single command):
 - Deletes any stale remote files that match `orion_capture_*.png` in `/sdcard/Download`
@@ -144,7 +143,7 @@ Useful parameters:
 
 ## TV app tools (ADB)
 
-Use `tv_open_app.ps1` for app launches on a connected Android TV.
+Use `tv_open_app.ps1` on Windows or `tv_open_app.sh` on Linux for app launches on a connected Android TV.
 
 Actions:
 - `youtube`
@@ -161,7 +160,7 @@ Useful parameters:
 - `-Activity <activity>` optional explicit activity for `custom` or advanced launch cases
 - `-WaitMs <milliseconds>` post-launch settle wait
 
-Use `tv_close_app.ps1` for closing apps on a connected Android TV.
+Use `tv_close_app.ps1` on Windows or `tv_close_app.sh` on Linux for closing apps on a connected Android TV.
 
 Actions:
 - `youtube`
@@ -183,7 +182,7 @@ Useful parameters:
 
 ## TV power tools (ADB over Wi-Fi or USB)
 
-Use `tv_power.ps1` to wake the TV or turn it off.
+Use `tv_power.ps1` on Windows or `tv_power.sh` on Linux to wake the TV or turn it off.
 
 Actions:
 - `on` (sends wake + home)
@@ -203,7 +202,7 @@ Shortcut wrappers:
 
 ## One-shot TV watch prep
 
-Use `watch_tv_prep.ps1` to automate the fixed setup before selecting a show/movie.
+Use `watch_tv_prep.ps1` on Windows or `watch_tv_prep.sh` on Linux to automate the fixed setup before selecting a show/movie.
 
 Default flow:
 - Restart Sunshine (if running, close first; otherwise start) and verify process is running

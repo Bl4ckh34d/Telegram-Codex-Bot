@@ -2813,7 +2813,7 @@ function summarizeWorkerCapabilities(worker) {
     : workdir
       ? `repo work in ${workdir}`
       : "workspace-specific coding tasks";
-  return `best_for=${scope}; tools=files, shell, git, web lookup, Windows UI automation, TV ADB control via tv_power/tv_open_app/tv_close_app/tv_capture; channels=text/voice`;
+  return `best_for=${scope}; tools=files, shell, git, web lookup, desktop UI automation (Windows .ps1/.cmd, Linux .sh), TV ADB control via tv_power/tv_open_app/tv_close_app/tv_capture; channels=text/voice`;
 }
 
 function listWorkerCapabilities() {
@@ -3338,8 +3338,8 @@ function defaultPromptPreamble() {
     "Default to English unless the user explicitly asks for German or Chinese.",
     "If ambiguous, ask one clear follow-up question.",
     "",
-    "Front-end UI handling (Windows desktop automation):",
-    "- You can drive real browser UI with tools/ui_automation.ps1 (or tools/ui.cmd).",
+    "Front-end UI handling (desktop automation):",
+    "- On Windows, use tools/ui_automation.ps1 (or tools/ui.cmd). On Linux, use tools/ui.sh.",
     "- Supported actions: windows, focus, click, double_click, right_click, move, mouse_down, mouse_up, drag, highlight, click_text, clipboard_copy, clipboard_paste, clipboard_read, type, key, scroll, wait, screenshot.",
     "- Cursor movement should glide from current position to target (no teleport jumps); drag supports start/end points and duration; move still supports DragLeft.",
     "- click_text uses OCR and can target visible text; click actions can preview with HighlightBeforeClick.",
@@ -3353,9 +3353,9 @@ function defaultPromptPreamble() {
     "- Ask one short confirmation question before destructive actions.",
     "",
     "TV control tools (ADB):",
-    "- Use tools/tv_power.ps1 (or tools/tv_power_on.cmd / tools/tv_power_off.cmd) to wake, sleep, or toggle the TV.",
-    "- Use tools/tv_open_app.ps1 and tools/tv_close_app.ps1 to launch or close TV apps such as YouTube, Netflix, Sunshine, Artemis, RetroArch, VLC, Spotify, or a custom package.",
-    "- Use tools/tv_capture.ps1 to capture a screenshot from the connected TV and pull it locally.",
+    "- On Windows, use tools/tv_power.ps1, tools/tv_open_app.ps1, tools/tv_close_app.ps1, and tools/tv_capture.ps1.",
+    "- On Linux, use tools/tv_power.sh, tools/tv_open_app.sh, tools/tv_close_app.sh, and tools/tv_capture.sh.",
+    "- These tools wake, sleep, or toggle the TV; launch or close TV apps such as YouTube, Netflix, Sunshine, Artemis, RetroArch, VLC, Spotify, or custom packages; and capture TV screenshots.",
     "- Refer to tools/README.md for parameters when needed.",
   ].join("\n");
 }
@@ -3372,8 +3372,8 @@ function defaultVoicePromptPreamble() {
     "Avoid weird symbols and formatting; use plain words and short sentences.",
     "If you refer to workers, use their proper names only, not IDs like w1 or W2.",
     "",
-    "Front-end UI handling (Windows desktop automation):",
-    "- Voice mode does not reduce capabilities. You can use tools/ui_automation.ps1 (or tools/ui.cmd).",
+    "Front-end UI handling (desktop automation):",
+    "- Voice mode does not reduce capabilities. On Windows, use tools/ui_automation.ps1 (or tools/ui.cmd). On Linux, use tools/ui.sh.",
     "- Supported actions: windows, focus, click, double_click, right_click, move, mouse_down, mouse_up, drag, highlight, click_text, clipboard_copy, clipboard_paste, clipboard_read, type, key, scroll, wait, screenshot.",
     "- Cursor movement should glide from current position to target (no teleport jumps); drag supports start/end points and duration; move still supports DragLeft.",
     "- click_text uses OCR and can target visible text; click actions can preview with HighlightBeforeClick.",
@@ -3388,9 +3388,9 @@ function defaultVoicePromptPreamble() {
     "",
     "TV control tools (ADB):",
     "- Voice mode does not limit these tools either.",
-    "- Use tools/tv_power.ps1 (or tools/tv_power_on.cmd / tools/tv_power_off.cmd) to wake, sleep, or toggle the TV.",
-    "- Use tools/tv_open_app.ps1 and tools/tv_close_app.ps1 to launch or close TV apps such as YouTube, Netflix, Sunshine, Artemis, RetroArch, VLC, Spotify, or a custom package.",
-    "- Use tools/tv_capture.ps1 to capture a screenshot from the connected TV and pull it locally.",
+    "- On Windows, use tools/tv_power.ps1, tools/tv_open_app.ps1, tools/tv_close_app.ps1, and tools/tv_capture.ps1.",
+    "- On Linux, use tools/tv_power.sh, tools/tv_open_app.sh, tools/tv_close_app.sh, and tools/tv_capture.sh.",
+    "- These tools wake, sleep, or toggle the TV; launch or close TV apps such as YouTube, Netflix, Sunshine, Artemis, RetroArch, VLC, Spotify, or custom packages; and capture TV screenshots.",
     "- Refer to tools/README.md for parameters when needed.",
     "",
     "Output format:",
