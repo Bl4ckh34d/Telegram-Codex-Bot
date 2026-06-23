@@ -34,7 +34,8 @@ This bot is built for local personal use. It long-polls Telegram and runs Codex 
 
 Notes:
 - Windows and Ubuntu Linux are supported runtimes.
-- Desktop screenshot capture and UI automation are Windows-only.
+- Desktop screenshot capture works on Windows and Linux. On Ubuntu, install `gnome-screenshot` or another supported capture tool (`grim`, `scrot`, `maim`, or ImageMagick `import`).
+- Desktop UI automation is Windows-only.
 - Whisper and TTS are optional and can be disabled in `.env`.
 
 ## Run
@@ -61,7 +62,7 @@ Recommended Ubuntu packages:
 
 ```bash
 sudo apt update
-sudo apt install -y nodejs npm python3 python3-venv python3-pip ffmpeg git curl
+sudo apt install -y nodejs npm python3 python3-venv python3-pip ffmpeg git curl gnome-screenshot
 ```
 
 Install and authenticate the Codex CLI before starting the bot. If Codex is not on `PATH`, set `CODEX_BIN` in `.env`.

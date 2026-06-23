@@ -5051,7 +5051,8 @@ async function runPowerShellScript(psScript, envVars = {}, options = {}) {
 
 async function capturePrimaryScreenshot(filePath) {
   if (process.platform !== "win32") {
-    throw new Error("Screenshot capture is only configured for Windows in this bot.");
+    await captureLinuxScreenshot(filePath);
+    return;
   }
 
   const psScript = [
@@ -5087,7 +5088,15 @@ async function capturePrimaryScreenshot(filePath) {
 
 async function captureAllScreenshots(outputDir, prefix = "screenshot") {
   if (process.platform !== "win32") {
-    throw new Error("Screenshot capture is only configured for Windows in this bot.");
+    const dir = String(outputDir || "").trim();
+    if (!dir) {
+      throw new Error("Screenshot output directory is required.");
+    }
+    ensureDir(dir);
+    const safePrefix = String(prefix || "screenshot").trim() || "screenshot";
+    const filePath = path.join(dir, `${safePrefix}-1.png`);
+    await captureLinuxScreenshot(filePath);
+    return [filePath];
   }
 
   const dir = String(outputDir || "").trim();
@@ -5154,6 +5163,101 @@ async function captureAllScreenshots(outputDir, prefix = "screenshot") {
   }
 
   return existing;
+}
+
+async function runProcessCapture(bin, args, { env = {}, timeoutMs = SCREENSHOT_CAPTURE_TIMEOUT_MS } = {}) {
+  return await new Promise((resolve, reject) => {
+    let stderr = "";
+    let stdout = "";
+    let settled = false;
+    let timeout = null;
+    let killTimer = null;
+    const child = spawn(bin, args, {
+      cwd: ROOT,
+      env: { ...process.env, ...env },
+      windowsHide: true,
+    });
+
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      if (killTimer) clearTimeout(killTimer);
+      if (err) reject(err);
+      else resolve({ stdout, stderr });
+    };
+
+    child.stdout.on("data", (buf) => {
+      stdout = appendTail(stdout, String(buf || ""), 64_000);
+    });
+    child.stderr.on("data", (buf) => {
+      stderr = appendTail(stderr, String(buf || ""), 64_000);
+    });
+    child.on("error", (err) => {
+      finish(new Error(`Failed to start ${bin}: ${err.message || err}`));
+    });
+    child.on("close", (code) => {
+      if (code !== 0) {
+        finish(new Error(stderr.trim() || `${bin} failed with exit ${code}`));
+        return;
+      }
+      finish(null);
+    });
+
+    const ms = Number(timeoutMs);
+    timeout = Number.isFinite(ms) && ms > 0
+      ? setTimeout(() => {
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // best effort
+        }
+        killTimer = setTimeout(() => {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            // best effort
+          }
+        }, 1500);
+        finish(new Error(`${bin} timed out after ${Math.max(1, Math.round(ms / 1000))}s.`));
+      }, ms)
+      : null;
+  });
+}
+
+async function captureLinuxScreenshot(filePath) {
+  const target = String(filePath || "").trim();
+  if (!target) {
+    throw new Error("Screenshot output path is required.");
+  }
+  ensureDir(path.dirname(target));
+
+  const env = {};
+  if (!env.DISPLAY && !process.env.DISPLAY) env.DISPLAY = ":0";
+  const candidates = [
+    { bin: "gnome-screenshot", args: ["-f", target] },
+    { bin: "grim", args: [target] },
+    { bin: "scrot", args: [target] },
+    { bin: "maim", args: [target] },
+    { bin: "import", args: ["-window", "root", target] },
+  ].filter((item) => commandExists(item.bin));
+
+  if (candidates.length === 0) {
+    throw new Error("No Linux screenshot tool found. Install gnome-screenshot, grim, scrot, maim, or ImageMagick import.");
+  }
+
+  const errors = [];
+  for (const candidate of candidates) {
+    try {
+      await runProcessCapture(candidate.bin, candidate.args, { env });
+      if (fs.existsSync(target) && fs.statSync(target).size > 0) return;
+      errors.push(`${candidate.bin}: output file missing`);
+    } catch (err) {
+      errors.push(`${candidate.bin}: ${String(err?.message || err)}`);
+    }
+  }
+
+  throw new Error(`Linux screenshot failed. ${errors.join(" | ")}`);
 }
 
 async function captureScreenshotsWithFallback(outputDir, prefix = "screenshot") {
