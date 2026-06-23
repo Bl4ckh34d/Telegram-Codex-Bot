@@ -33,13 +33,13 @@ This bot is built for local personal use. It long-polls Telegram and runs Codex 
 - Codex CLI installed and authenticated
 
 Notes:
-- Windows is the first-class runtime here.
-- Screenshot capture is Windows-only.
+- Windows and Ubuntu Linux are supported runtimes.
+- Desktop screenshot capture and UI automation are Windows-only.
 - Whisper and TTS are optional and can be disabled in `.env`.
 
 ## Run
 
-Windows (recommended):
+Windows:
 
 ```bat
 copy .env.example .env
@@ -48,13 +48,30 @@ start.cmd
 
 `start.cmd` can bootstrap Whisper and TTS dependencies when those features are enabled.
 
-Non-Windows:
+Ubuntu Linux:
 
 ```bash
-node bot.js
+cp .env.example .env
+./start.sh
 ```
 
-On non-Windows platforms, set up Whisper/TTS dependencies yourself if enabled.
+`start.sh` mirrors the Windows launcher: it creates `.env` if needed, checks Node/Codex, bootstraps `uv` when allowed, prepares Whisper/TTS virtual environments when those features are enabled, and restarts the bot when `/restart` requests it.
+
+Recommended Ubuntu packages:
+
+```bash
+sudo apt update
+sudo apt install -y nodejs npm python3 python3-venv python3-pip ffmpeg git curl
+```
+
+Install and authenticate the Codex CLI before starting the bot. If Codex is not on `PATH`, set `CODEX_BIN` in `.env`.
+
+Optional setup scripts can also be run directly:
+
+```bash
+./setup-whisper-venv.sh
+./setup-tts.sh
+```
 
 ## Command Reference
 

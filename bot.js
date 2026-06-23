@@ -15700,7 +15700,7 @@ async function runCodexJob(job) {
       if (typeof code === "number" && code !== 0) {
         const errText = job.stderrTail.trim() || job.stdoutTail.trim();
         const staleProcessHint = /unexpected argument ['"]?-a['"]? found/i.test(errText)
-          ? "\n\nHint: this usually means an older bot process is still running. Stop all old bot windows, then restart with start.cmd."
+          ? `\n\nHint: this usually means an older bot process is still running. Stop all old bot windows/processes, then restart with ${process.platform === "win32" ? "start.cmd" : "./start.sh"}.`
           : "";
         if (output) {
           finish({
@@ -16124,7 +16124,7 @@ async function transcribeAudioWithWhisper(audioPath, { abortSignal, job } = {}) 
   }
   if (!fs.existsSync(WHISPER_PYTHON)) {
     throw new Error(
-      `Whisper venv python missing: ${WHISPER_PYTHON}. Run setup-whisper-venv.cmd`,
+      `Whisper venv python missing: ${WHISPER_PYTHON}. Run ${process.platform === "win32" ? "setup-whisper-venv.cmd" : "./setup-whisper-venv.sh"}`,
     );
   }
 
@@ -17104,7 +17104,7 @@ process.on("unhandledRejection", (err) => {
       const hasWhisperServer = fs.existsSync(WHISPER_SERVER_SCRIPT_PATH);
       const hasWhisperLegacy = fs.existsSync(WHISPER_SCRIPT_PATH);
       if (!fs.existsSync(WHISPER_PYTHON)) {
-        log(`Whisper venv missing at ${WHISPER_PYTHON} (run setup-whisper-venv.cmd)`);
+        log(`Whisper venv missing at ${WHISPER_PYTHON} (run ${process.platform === "win32" ? "setup-whisper-venv.cmd" : "./setup-whisper-venv.sh"})`);
       } else if (!hasWhisperLegacy && !hasWhisperServer) {
         log(`Whisper scripts missing at ${WHISPER_SCRIPT_PATH} / ${WHISPER_SERVER_SCRIPT_PATH}`);
       } else if (WHISPER_KEEPALIVE && !hasWhisperServer) {
