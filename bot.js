@@ -3685,18 +3685,102 @@ function renderCommandForProgress(commandLike) {
   );
 }
 
+function parseJsonObjectLoose(value) {
+  if (!value || typeof value !== "string") return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function summarizePatchChanges(changes) {
+  if (!changes) return "";
+  const rows = Array.isArray(changes)
+    ? changes
+    : (typeof changes === "object" ? Object.entries(changes).map(([file, value]) => ({ file, value })) : []);
+  const files = [];
+  for (const row of rows) {
+    if (typeof row === "string" && row.trim()) {
+      files.push(row.trim());
+      continue;
+    }
+    if (!row || typeof row !== "object") continue;
+    const file = firstStringAtPaths(row, [["file"], ["path"], ["filename"], ["name"]]);
+    if (file) {
+      files.push(file);
+      continue;
+    }
+    if (typeof row.value === "string" && row.value.trim()) files.push(row.value.trim());
+  }
+  const unique = [...new Set(files.map((f) => String(f || "").trim()).filter(Boolean))];
+  if (unique.length === 0) return "";
+  const shown = unique.slice(0, 4).join(", ");
+  return unique.length > 4 ? `${shown}, +${unique.length - 4} more` : shown;
+}
+
+function renderToolCallName(payload) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  const item = p.item && typeof p.item === "object" ? p.item : {};
+  return firstStringAtPaths(p, [["name"], ["tool_name"], ["tool"], ["function", "name"]]) ||
+    firstStringAtPaths(item, [["name"], ["tool_name"], ["tool"], ["function", "name"]]);
+}
+
+function renderToolCallArguments(payload) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  const raw = firstStringAtPaths(p, [["arguments"], ["input"], ["args"]]);
+  const parsed = parseJsonObjectLoose(raw);
+  if (parsed) {
+    return renderCommandForProgress(parsed.cmd) ||
+      renderCommandForProgress(parsed.command) ||
+      renderCommandForProgress(parsed.argv) ||
+      renderCommandForProgress(parsed.args) ||
+      "";
+  }
+  return renderCommandForProgress(raw);
+}
+
+function formatResponseItemProgress(payload) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  const subtype = normalizeCodexEventType(p.type || "");
+  if (!subtype) return "";
+
+  if (subtype === "reasoning") return "";
+
+  if (subtype === "function_call" || subtype === "custom_tool_call" || subtype === "tool_search_call") {
+    const name = renderToolCallName(p);
+    if (name === "exec_command") {
+      const args = renderToolCallArguments(p);
+      return `Tool: shell started${args ? `: ${truncateLine(args, 180)}` : ""}`;
+    }
+    if (name === "apply_patch") return "Tool: patch apply started";
+    if (subtype === "tool_search_call") return "Tool: tool search started";
+    return `Tool: started${name ? `: ${name}` : ""}`;
+  }
+
+  if (subtype === "function_call_output" || subtype === "custom_tool_call_output" || subtype === "tool_search_output") {
+    const status = String(p.status || "").trim().toLowerCase();
+    const failed = status === "failed" || p.is_error === true || Boolean(p.error);
+    if (subtype === "tool_search_output") return `Tool: tool search ${failed ? "failed" : "finished"}`;
+    return `Tool: ${failed ? "failed" : "finished"}`;
+  }
+
+  return "";
+}
+
 function formatCodexJsonEventProgress(type, payload) {
   const p = payload && typeof payload === "object" ? payload : {};
-  if (/^(thread_settings|settings_applied|session_configured|token_count|turn_context|raw_response_item)/.test(type)) {
+  if (/^(thread_settings|settings_applied|session_configured|token_count|turn_context|raw_response_item|session_meta|user_message)$/.test(type)) {
     return "";
   }
-  if (type === "thread_started" || type === "conversation_started") {
+  if (type === "thread_started" || type === "conversation_started" || type === "task_started") {
     return "AIDOLON: session started";
   }
   if (type === "turn_started") {
     return "AIDOLON: turn started";
   }
-  if (type === "turn_complete" || type === "turn_completed") {
+  if (type === "turn_complete" || type === "turn_completed" || type === "task_complete") {
     const usage = p.usage || p.token_usage || p.total_token_usage || {};
     const total = Number(usage.total_tokens || usage.total || 0);
     return total > 0 ? `AIDOLON: turn completed (${total} tokens)` : "AIDOLON: turn completed";
@@ -3736,7 +3820,12 @@ function formatCodexJsonEventProgress(type, payload) {
   if (type === "patch_apply_begin") return "Tool: patch apply started";
   if (type === "patch_apply_end") {
     const ok = p.success === false || p.status === "failed" ? "failed" : "finished";
-    return `Tool: patch apply ${ok}`;
+    const files = summarizePatchChanges(p.changes);
+    return `Tool: patch apply ${ok}${files ? `: ${files}` : ""}`;
+  }
+  if (/approval/.test(type)) {
+    const msg = firstStringAtPaths(p, [["message"], ["reason"], ["type"], ["status"]]);
+    return `Approval: ${msg ? truncateLine(msg, 180) : "requested"}`;
   }
   if (type === "hook_started") {
     const name = firstStringAtPaths(p, [["event_name"], ["name"], ["source_path"]]);
@@ -3750,10 +3839,9 @@ function formatCodexJsonEventProgress(type, payload) {
     const name = firstStringAtPaths(p, [["agent_nickname"], ["new_agent_nickname"], ["receiver_agent_nickname"]]);
     return `Subagent: ${name || "activity"}`;
   }
-  if (type === "agent_reasoning" || type === "agent_reasoning_content_delta") {
-    const text = firstStringAtPaths(p, [["text"], ["delta"], ["summary"], ["content"]]);
-    return text ? `Reasoning: ${truncateLine(text, 180)}` : "";
-  }
+  if (type === "response_item") return formatResponseItemProgress(p);
+  if (type === "agent_message" || type === "agent_message_event") return "";
+  if (type === "agent_reasoning" || type === "agent_reasoning_content_delta") return "";
   return "";
 }
 
@@ -3797,7 +3885,11 @@ function ingestCodexJsonLine(job, line, streamName = "stdout") {
   try {
     parsed = JSON.parse(raw);
   } catch {
-    emitCodexProgressLine(job, raw, streamName);
+    job.codexMalformedJsonTail = appendTail(
+      String(job.codexMalformedJsonTail || ""),
+      `${raw}\n`,
+      12000,
+    );
     return;
   }
 
@@ -16119,7 +16211,7 @@ async function runCodexJob(job) {
     child.stderr.on("data", (buf) => {
       const chunk = String(buf || "");
       job.stderrTail = appendTail(job.stderrTail, chunk);
-      if (spec.jsonEvents && chunk.trim().startsWith("{")) {
+      if (spec.jsonEvents) {
         ingestCodexJsonChunk(job, chunk, "stderr");
       } else {
         if (CODEX_STREAM_OUTPUT_TO_TERMINAL) writeWorkerStreamChunk(chunk, { workerId: job?.workerId, stream: "stderr" });
@@ -16160,7 +16252,7 @@ async function runCodexJob(job) {
       }
 
       if (job.timedOut) {
-        const tail = String(job.codexEventTail || "").trim() || job.stderrTail.trim() || job.stdoutTail.trim();
+        const tail = String(job.codexEventTail || "").trim() || String(job.codexMalformedJsonTail || "").trim() || job.stderrTail.trim() || job.stdoutTail.trim();
         finish({
           ok: false,
           sessionId,
@@ -16170,7 +16262,7 @@ async function runCodexJob(job) {
       }
 
       if (typeof code === "number" && code !== 0) {
-        const errText = String(job.codexEventTail || "").trim() || job.stderrTail.trim() || job.stdoutTail.trim();
+        const errText = String(job.codexEventTail || "").trim() || String(job.codexMalformedJsonTail || "").trim() || job.stderrTail.trim() || job.stdoutTail.trim();
         const staleProcessHint = /unexpected argument ['"]?-a['"]? found/i.test(errText)
           ? `\n\nHint: this usually means an older bot process is still running. Stop all old bot windows/processes, then restart with ${process.platform === "win32" ? "start.cmd" : "./start.sh"}.`
           : "";
