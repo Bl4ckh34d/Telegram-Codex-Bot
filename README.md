@@ -16,6 +16,7 @@ This bot is built for local personal use. It long-polls Telegram and runs Codex 
 - File attachment upload from assistant output
 - Optional native WorldMonitor feed monitoring
 - Scheduled daily weather briefing (text + voice)
+- Native Codex MCP/plugin/skill compatibility through inherited Codex config
 
 ## Quickstart
 
@@ -138,7 +139,7 @@ Natural language shortcuts are also mapped to commands (for example `c` -> `/com
 
 ## Workspaces and routing
 
-Each worker is a separate Codex lane with its own working directory.
+Each worker is a separate Codex lane with its own working directory. The bot still handles Telegram routing and queues, but Codex itself now owns its native config surfaces: MCP servers, plugins, skills, hooks, sandboxing, approvals, and web search are not stripped unless you explicitly configure that.
 
 - One worker runs one job at a time.
 - Multiple workers run in parallel.
@@ -307,6 +308,7 @@ Codex execution:
 - `CODEX_MODEL`, `CODEX_MODEL_CHOICES`
 - `CODEX_REASONING_EFFORT`
 - `CODEX_SANDBOX`, `CODEX_APPROVAL_POLICY`, `CODEX_DANGEROUS_FULL_ACCESS`
+- `CODEX_DISABLE_MCP`, `CODEX_SEARCH_ENABLED`
 - `CODEX_TIMEOUT_MS`
 
 Orchestration:
@@ -363,12 +365,21 @@ Prompts:
 - `codex_prompt_voice.txt` - voice/TTS style responses
 - `codex_prompt_router.txt` - worker routing policy
 
+## Native Codex integration
+
+- The bot launches Codex through `codex exec` and passes the configured sandbox and approval policy instead of forcing full bypass.
+- MCP servers and plugin-provided MCP servers from Codex config remain available by default. Set `CODEX_DISABLE_MCP=1` only when you intentionally want an isolated run.
+- Native Codex web search can be enabled with `CODEX_SEARCH_ENABLED=1`; this is separate from shell/network access in the sandbox.
+- Reusable Telegram response behavior is also available as a repo skill under `.agents/skills/`.
+- For large tasks, ask Codex explicitly to use subagents. The bot no longer needs to fake that behavior with prompt-only routing.
+
 ## Privacy and safety
 
 - Do not commit `.env`.
 - Do not commit anything under `runtime/`.
 - By default, only configured chat IDs are allowed.
 - Group chats are blocked unless explicitly enabled.
+- Prefer `CODEX_SANDBOX=workspace-write` and `CODEX_APPROVAL_POLICY=never` for Telegram/noninteractive use. Use `CODEX_DANGEROUS_FULL_ACCESS=1` only on a separately sandboxed machine.
 
 This bot can run Codex with broad machine access depending on your config. Run it only in an environment you trust.
 

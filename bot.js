@@ -754,6 +754,7 @@ const CODEX_WORKDIR = String(process.env.CODEX_WORKDIR || ROOT).trim();
 function normalizeCodexModelName(value) {
   const model = String(value || "").trim();
   if (!model) return "";
+  if (model.toLowerCase() === "gpt-5.5-codex") return "gpt-5.5";
   if (model.toLowerCase() === "gpt-5.4-codex") return "gpt-5.4";
   return model;
 }
@@ -765,12 +766,14 @@ const CODEX_MODEL_CHOICES = parseList(process.env.CODEX_MODEL_CHOICES || "")
 const CODEX_REASONING_EFFORT = String(process.env.CODEX_REASONING_EFFORT || "xhigh").trim();
 const CODEX_REASONING_EFFORT_CHOICES = parseList(process.env.CODEX_REASONING_EFFORT_CHOICES || "");
 const CODEX_DEFAULT_MODEL_CHOICES = Object.freeze([
+  "gpt-5.5",
   "gpt-5.4",
   "gpt-5.3-codex",
   "gpt-5.2-codex",
   "gpt-5.1-codex",
 ]);
 const CODEX_REASONING_EFFORTS_BY_MODEL = Object.freeze({
+  "gpt-5.5": ["low", "medium", "high", "xhigh"],
   "gpt-5.4": ["low", "medium", "high", "xhigh"],
   "gpt-5.3-codex": ["low", "medium", "high", "xhigh"],
   "gpt-5.2-codex": ["low", "medium", "high"],
@@ -778,19 +781,21 @@ const CODEX_REASONING_EFFORTS_BY_MODEL = Object.freeze({
 });
 const CODEX_STREAM_OUTPUT_TO_TERMINAL = toBool(process.env.CODEX_STREAM_OUTPUT_TO_TERMINAL, true);
 const CODEX_PROFILE = String(process.env.CODEX_PROFILE || "").trim();
-const CODEX_DANGEROUS_FULL_ACCESS = toBool(process.env.CODEX_DANGEROUS_FULL_ACCESS, true);
+const CODEX_DANGEROUS_FULL_ACCESS = toBool(process.env.CODEX_DANGEROUS_FULL_ACCESS, false);
 const CODEX_SANDBOX_RAW = String(process.env.CODEX_SANDBOX || "workspace-write").trim();
 const CODEX_SANDBOX = ["read-only", "workspace-write", "danger-full-access"].includes(
   CODEX_SANDBOX_RAW,
 )
   ? CODEX_SANDBOX_RAW
   : "workspace-write";
-const CODEX_APPROVAL_RAW = String(process.env.CODEX_APPROVAL_POLICY || "on-request").trim();
+const CODEX_APPROVAL_RAW = String(process.env.CODEX_APPROVAL_POLICY || "never").trim();
 const CODEX_APPROVAL_POLICY = ["untrusted", "on-failure", "on-request", "never"].includes(
   CODEX_APPROVAL_RAW,
 )
   ? CODEX_APPROVAL_RAW
-  : "on-request";
+  : "never";
+const CODEX_DISABLE_MCP = toBool(process.env.CODEX_DISABLE_MCP, false);
+const CODEX_SEARCH_ENABLED = toBool(process.env.CODEX_SEARCH_ENABLED, false);
 const MAX_TIMEOUT_MS = 2_147_483_647; // Node timers clamp near this anyway (~24.8 days)
 // Used for spawnSync()-based probing (ffmpeg filters, command --version).
 // 0 disables probing timeouts (not recommended; a hung subprocess can freeze the bot).
@@ -3908,6 +3913,17 @@ function buildRawCodexSpec(job) {
   };
 }
 
+function buildCodexGlobalArgs() {
+  const args = [];
+  if (!CODEX_DANGEROUS_FULL_ACCESS) {
+    args.push("-a", CODEX_APPROVAL_POLICY);
+  }
+  if (CODEX_SEARCH_ENABLED) {
+    args.push("--search");
+  }
+  return args;
+}
+
 function buildCodexExecSpec(job) {
   const rawImagePaths = Array.isArray(job?.imagePaths)
     ? job.imagePaths.map((p) => String(p || "").trim()).filter(Boolean)
@@ -3950,42 +3966,45 @@ function buildCodexExecSpec(job) {
   });
   const outputFile = String(job?.outputFile || "");
   const outputPath = codexMode.mode === "wsl" ? toWslPath(outputFile) : outputFile;
-  const args = ["exec"];
+  const args = [...buildCodexGlobalArgs(), "exec"];
+  const execOptions = [];
   const resumeSessionId = String(job?.resumeSessionId || "").trim();
   const isResume = Boolean(resumeSessionId);
-  if (isResume) {
-    args.push("resume", resumeSessionId);
-  }
 
   if (CODEX_DANGEROUS_FULL_ACCESS) {
-    args.push("--dangerously-bypass-approvals-and-sandbox");
+    execOptions.push("--dangerously-bypass-approvals-and-sandbox");
   } else {
-    args.push("--full-auto");
-    if (!isResume) args.push("-s", CODEX_SANDBOX);
+    execOptions.push("-s", CODEX_SANDBOX);
   }
 
+  execOptions.push("--color", "never");
   if (!isResume) {
-    args.push("--color", "never", "-C", codexWorkdir, "-o", outputPath);
+    execOptions.push("-C", codexWorkdir);
   }
+  if (outputPath) execOptions.push("-o", outputPath);
+
   const prefs = getChatPrefs(job?.chatId);
   const effectiveModel = normalizeCodexModelName(job?.model || prefs.model || CODEX_MODEL || "");
   const effectiveReasoning = String(job?.reasoning || prefs.reasoning || CODEX_REASONING_EFFORT || "").trim();
-  if (effectiveModel) args.push("-m", effectiveModel);
+  if (effectiveModel) execOptions.push("-m", effectiveModel);
   if (effectiveReasoning) {
-    args.push("-c", `model_reasoning_effort=\"${effectiveReasoning}\"`);
+    execOptions.push("-c", `model_reasoning_effort=\"${effectiveReasoning}\"`);
   }
-  // This project does not use MCP servers. Force-disable MCP even if globally configured.
-  args.push("-c", "mcp_servers={}");
-  if (!isResume && CODEX_PROFILE) args.push("-p", CODEX_PROFILE);
-  if (CODEX_EXTRA_ARGS.length > 0) args.push(...CODEX_EXTRA_ARGS);
+  if (CODEX_DISABLE_MCP) execOptions.push("-c", "mcp_servers={}");
+  if (!isResume && CODEX_PROFILE) execOptions.push("-p", CODEX_PROFILE);
+  if (CODEX_EXTRA_ARGS.length > 0) execOptions.push(...CODEX_EXTRA_ARGS);
 
   if (rawImagePaths.length > 0) {
     for (const imgPath of rawImagePaths) {
       const resolved = codexMode.mode === "wsl" ? toWslPath(imgPath) : imgPath;
-      args.push("-i", resolved);
+      execOptions.push("-i", resolved);
     }
   }
 
+  args.push(...execOptions);
+  if (isResume) {
+    args.push("resume", resumeSessionId);
+  }
   args.push("-");
   if (codexMode.mode === "wsl") {
     const shellCmd = [codexMode.codexPath || "codex", ...args].map(shQuote).join(" ");
@@ -11091,9 +11110,22 @@ async function handleWeatherLocationMessage(msg) {
     });
     await sendMessage(chatId, briefing.text);
     if (TTS_ENABLED) {
-      await enqueueTts(chatId, briefing.spoken, "weather-command", {
-        skipResultText: true,
-      });
+      const split = splitSpeakableTextIntoVoiceChunks(briefing.spoken);
+      const spokenChunks = Array.isArray(split?.chunks) ? split.chunks.filter(Boolean) : [];
+      const allChunks = spokenChunks.length > 0
+        ? spokenChunks
+        : [String(briefing.spoken || "").trim()].filter(Boolean);
+      const overflowText = String(split?.overflowText || "").trim();
+      if (overflowText) allChunks.push(overflowText);
+      if (allChunks.length > 1) {
+        await enqueueTtsBatch(chatId, allChunks, "weather-command", {
+          skipResultText: true,
+        });
+      } else if (allChunks[0]) {
+        await enqueueTts(chatId, allChunks[0], "weather-command", {
+          skipResultText: true,
+        });
+      }
     }
   } catch (err) {
     const message = String(err?.message || err || "weather update failed").trim() || "weather update failed";
@@ -11160,9 +11192,22 @@ async function runWeatherDailyCycle(options = {}) {
     await sendMessage(chatId, briefing.text);
     let voiceQueued = false;
     if (WEATHER_DAILY_VOICE_ENABLED && TTS_ENABLED) {
-      voiceQueued = await enqueueTts(chatId, briefing.spoken, "weather-daily", {
-        skipResultText: true,
-      });
+      const split = splitSpeakableTextIntoVoiceChunks(briefing.spoken);
+      const spokenChunks = Array.isArray(split?.chunks) ? split.chunks.filter(Boolean) : [];
+      const allChunks = spokenChunks.length > 0
+        ? spokenChunks
+        : [String(briefing.spoken || "").trim()].filter(Boolean);
+      const overflowText = String(split?.overflowText || "").trim();
+      if (overflowText) allChunks.push(overflowText);
+      if (allChunks.length > 1) {
+        voiceQueued = await enqueueTtsBatch(chatId, allChunks, "weather-daily", {
+          skipResultText: true,
+        });
+      } else if (allChunks[0]) {
+        voiceQueued = await enqueueTts(chatId, allChunks[0], "weather-daily", {
+          skipResultText: true,
+        });
+      }
     }
     weatherDailyState.lastRunAt = now;
     weatherDailyState.lastSentAt = Date.now();
@@ -11443,6 +11488,8 @@ async function sendStatus(chatId) {
     `- full_access: ${CODEX_DANGEROUS_FULL_ACCESS}`,
     `- sandbox: ${CODEX_SANDBOX}`,
     `- approval: ${CODEX_APPROVAL_POLICY}`,
+    `- mcp: ${CODEX_DISABLE_MCP ? "disabled by bot config" : "inherited from Codex config/plugins"}`,
+    `- web_search: ${CODEX_SEARCH_ENABLED ? "enabled" : "default"}`,
     `- general_workdir: ${String(getCodexWorker(ORCH_GENERAL_WORKER_ID)?.workdir || ROOT)}`,
     `- time: ${nowIso()}`,
   ];
@@ -17213,6 +17260,9 @@ process.on("unhandledRejection", (err) => {
     log(`Connected as @${me.username || me.id}`);
     log(
       `AIDOLON execution mode: ${codexMode.mode} (${codexMode.mode === "wsl" ? `wsl.exe -e bash -lic <${codexMode.codexPath}>` : `${codexMode.bin}${codexMode.shell ? " via shell" : ""}`})`,
+    );
+    log(
+      `Codex policy: full_access=${CODEX_DANGEROUS_FULL_ACCESS}, sandbox=${CODEX_SANDBOX}, approval=${CODEX_APPROVAL_POLICY}, mcp=${CODEX_DISABLE_MCP ? "disabled" : "inherited"}, search=${CODEX_SEARCH_ENABLED ? "enabled" : "default"}`,
     );
     if (TELEGRAM_SET_COMMANDS) {
       try {
