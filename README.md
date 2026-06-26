@@ -59,6 +59,8 @@ cp .env.example .env
 
 `start.sh` mirrors the Windows launcher: it creates `.env` if needed, checks Node/Codex, bootstraps `uv` when allowed, prepares Whisper/TTS virtual environments when those features are enabled, and restarts the bot when `/restart` requests it.
 
+Keep the launcher in the foreground shell you want to monitor. Restarts are handled by `node bot.js` exiting with code `75`, after which `start.sh`/`start.cmd` relaunches the bot in the same terminal. Do not restart by spawning a detached background copy of `start.sh`; that hides logs and can leave the shell showing a stale stopped instance.
+
 Recommended Ubuntu packages:
 
 ```bash
@@ -309,6 +311,7 @@ Codex execution:
 - `CODEX_REASONING_EFFORT`
 - `CODEX_SANDBOX`, `CODEX_APPROVAL_POLICY`, `CODEX_DANGEROUS_FULL_ACCESS`
 - `CODEX_DISABLE_MCP`, `CODEX_SEARCH_ENABLED`
+- `CODEX_EXEC_JSON`, `CODEX_OUTPUT_SCHEMA_ENABLED`, `CODEX_OUTPUT_SCHEMA_FILE`
 - `CODEX_TIMEOUT_MS`
 
 Orchestration:
@@ -368,9 +371,12 @@ Prompts:
 ## Native Codex integration
 
 - The bot launches Codex through `codex exec` and passes the configured sandbox and approval policy instead of forcing full bypass.
+- By default the bot adds `--json`, parses Codex JSONL events, and turns tool calls, MCP calls, hooks, web search, and turn completion into clean progress updates.
+- Normal Telegram replies use `schemas/aidolon-telegram-final.schema.json` with `--output-schema` when enabled; router calls stay plain text.
 - MCP servers and plugin-provided MCP servers from Codex config remain available by default. Set `CODEX_DISABLE_MCP=1` only when you intentionally want an isolated run.
 - Native Codex web search can be enabled with `CODEX_SEARCH_ENABLED=1`; this is separate from shell/network access in the sandbox.
 - Reusable Telegram response behavior is also available as a repo skill under `.agents/skills/`.
+- Repo-local plugin packaging uses `.agents/plugins/marketplace.json` plus `plugins/aidolon-native-control`, which exposes the existing desktop/TV scripts as Codex-native MCP tools plus a skill.
 - For large tasks, ask Codex explicitly to use subagents. The bot no longer needs to fake that behavior with prompt-only routing.
 
 ## Privacy and safety

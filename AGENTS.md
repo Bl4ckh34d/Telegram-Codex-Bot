@@ -19,6 +19,12 @@ These rules apply to any AI agent (including multi-worker setups) operating in t
 - Never add `.env` to git.
 - Never add anything from `runtime/` to git (logs, screenshots, audio, chat logs, state, outputs).
 
+## Runtime And Restart Discipline
+
+- Do not start a second detached bot with `nohup`, `setsid`, `disown`, background `./start.sh`, or redirected `runtime/restart_after_*.log` output.
+- If the bot is already running under `start.sh` or `start.cmd`, restart it through `/restart` or by making `node bot.js` exit with code `75`; the launcher will relaunch it in the same terminal.
+- If the user wants to run the bot manually, stop the existing `node bot.js` process tree first, confirm `runtime/bot.lock` is gone, then let the user start `./start.sh` in their chosen shell.
+
 ## Front-End UI Automation Toolset
 
 - For real browser UX testing on Windows, use `tools/ui_automation.ps1` (or `tools/ui.cmd`).

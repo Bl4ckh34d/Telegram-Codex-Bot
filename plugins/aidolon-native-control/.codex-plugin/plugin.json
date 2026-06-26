@@ -1,0 +1,23 @@
+{
+  "name": "aidolon-native-control",
+  "version": "0.1.0",
+  "description": "AIDOLON desktop and Android TV control tools for Codex.",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Aidolon Native Control",
+    "shortDescription": "Control local desktop and TV tools from Codex.",
+    "longDescription": "AIDOLON Native Control exposes the repo desktop automation and Android TV scripts through Codex-native skills and an MCP server.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Local tools"],
+    "defaultPrompt": [
+      "Inspect my desktop and take one safe UI step.",
+      "Open an app on the TV and capture the screen.",
+      "Use AIDOLON native control tools."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

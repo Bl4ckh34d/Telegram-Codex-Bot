@@ -796,6 +796,11 @@ const CODEX_APPROVAL_POLICY = ["untrusted", "on-failure", "on-request", "never"]
   : "never";
 const CODEX_DISABLE_MCP = toBool(process.env.CODEX_DISABLE_MCP, false);
 const CODEX_SEARCH_ENABLED = toBool(process.env.CODEX_SEARCH_ENABLED, false);
+const CODEX_EXEC_JSON = toBool(process.env.CODEX_EXEC_JSON, true);
+const CODEX_OUTPUT_SCHEMA_ENABLED = toBool(process.env.CODEX_OUTPUT_SCHEMA_ENABLED, true);
+const CODEX_OUTPUT_SCHEMA_FILE = resolveMaybeRelativePath(
+  process.env.CODEX_OUTPUT_SCHEMA_FILE || path.join(ROOT, "schemas", "aidolon-telegram-final.schema.json"),
+);
 const MAX_TIMEOUT_MS = 2_147_483_647; // Node timers clamp near this anyway (~24.8 days)
 // Used for spawnSync()-based probing (ffmpeg filters, command --version).
 // 0 disables probing timeouts (not recommended; a hung subprocess can freeze the bot).
@@ -3611,6 +3616,282 @@ function extractResponseContentText(content) {
   return parts.join("\n").trim();
 }
 
+function getObjectPath(obj, pathParts) {
+  let cur = obj;
+  for (const part of pathParts) {
+    if (!cur || typeof cur !== "object") return undefined;
+    cur = cur[part];
+  }
+  return cur;
+}
+
+function firstStringAtPaths(obj, paths) {
+  for (const pathParts of paths) {
+    const value = getObjectPath(obj, pathParts);
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function findSessionIdDeep(value, depth = 0) {
+  if (depth > 5 || value === null || value === undefined) return "";
+  if (typeof value === "string") {
+    return extractSessionIdFromText(value);
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findSessionIdDeep(item, depth + 1);
+      if (found) return found;
+    }
+    return "";
+  }
+  if (typeof value !== "object") return "";
+  for (const [key, item] of Object.entries(value)) {
+    if (/(^|_)(thread|session|conversation)_?id$/i.test(key) && isSessionId(item)) {
+      return String(item).trim();
+    }
+  }
+  for (const item of Object.values(value)) {
+    const found = findSessionIdDeep(item, depth + 1);
+    if (found) return found;
+  }
+  return "";
+}
+
+function normalizeCodexEventType(raw) {
+  return String(raw || "")
+    .trim()
+    .replace(/[.-]/g, "_")
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase();
+}
+
+function extractCodexEventPayload(obj) {
+  if (!obj || typeof obj !== "object") return { type: "", payload: null };
+  const payload = obj.payload && typeof obj.payload === "object" ? obj.payload : obj;
+  const type = normalizeCodexEventType(payload.type || obj.type || payload.event || obj.event || payload.event_name || obj.event_name);
+  return { type, payload };
+}
+
+function renderCommandForProgress(commandLike) {
+  if (Array.isArray(commandLike)) return commandLike.map((x) => String(x || "")).filter(Boolean).join(" ");
+  if (typeof commandLike === "string") return commandLike;
+  if (!commandLike || typeof commandLike !== "object") return "";
+  return (
+    renderCommandForProgress(commandLike.cmd) ||
+    renderCommandForProgress(commandLike.command) ||
+    renderCommandForProgress(commandLike.args) ||
+    renderCommandForProgress(commandLike.argv)
+  );
+}
+
+function formatCodexJsonEventProgress(type, payload) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  if (/^(thread_settings|settings_applied|session_configured|token_count|turn_context|raw_response_item)/.test(type)) {
+    return "";
+  }
+  if (type === "thread_started" || type === "conversation_started") {
+    return "AIDOLON: session started";
+  }
+  if (type === "turn_started") {
+    return "AIDOLON: turn started";
+  }
+  if (type === "turn_complete" || type === "turn_completed") {
+    const usage = p.usage || p.token_usage || p.total_token_usage || {};
+    const total = Number(usage.total_tokens || usage.total || 0);
+    return total > 0 ? `AIDOLON: turn completed (${total} tokens)` : "AIDOLON: turn completed";
+  }
+  if (type === "turn_aborted") {
+    return `AIDOLON: turn aborted${p.reason ? ` (${oneLine(p.reason)})` : ""}`;
+  }
+  if (type === "error" || type === "stream_error") {
+    const msg = firstStringAtPaths(p, [["message"], ["error"], ["details"], ["error", "message"]]);
+    return `AIDOLON error${msg ? `: ${msg}` : ""}`;
+  }
+  if (type === "warning" || type === "guardian_warning") {
+    const msg = firstStringAtPaths(p, [["message"], ["warning"], ["details"]]);
+    return `AIDOLON warning${msg ? `: ${msg}` : ""}`;
+  }
+  if (type === "exec_command_begin") {
+    const cmd = firstStringAtPaths(p, [["display_command"], ["command"], ["cmd"]]) || renderCommandForProgress(p.invocation);
+    return `Tool: shell started${cmd ? `: ${truncateLine(cmd, 180)}` : ""}`;
+  }
+  if (type === "exec_command_end") {
+    const code = Number(p.exit_code ?? p.exitCode ?? p.code);
+    const status = Number.isFinite(code) ? `exit ${code}` : "finished";
+    return `Tool: shell ${status}`;
+  }
+  if (type === "mcp_tool_call_begin") {
+    const tool = firstStringAtPaths(p, [["tool_name"], ["name"], ["tool"], ["invocation", "tool_name"]]);
+    const server = firstStringAtPaths(p, [["server_name"], ["server"], ["mcp_server"], ["invocation", "server_name"]]);
+    return `Tool: MCP started${server || tool ? `: ${[server, tool].filter(Boolean).join("/")}` : ""}`;
+  }
+  if (type === "mcp_tool_call_end") {
+    const tool = firstStringAtPaths(p, [["tool_name"], ["name"], ["tool"], ["invocation", "tool_name"]]);
+    const failed = p.is_error === true || p.error || p.status === "failed";
+    return `Tool: MCP ${failed ? "failed" : "finished"}${tool ? `: ${tool}` : ""}`;
+  }
+  if (type === "web_search_begin") return "Tool: web search started";
+  if (type === "web_search_end") return "Tool: web search finished";
+  if (type === "patch_apply_begin") return "Tool: patch apply started";
+  if (type === "patch_apply_end") {
+    const ok = p.success === false || p.status === "failed" ? "failed" : "finished";
+    return `Tool: patch apply ${ok}`;
+  }
+  if (type === "hook_started") {
+    const name = firstStringAtPaths(p, [["event_name"], ["name"], ["source_path"]]);
+    return `Hook: started${name ? `: ${name}` : ""}`;
+  }
+  if (type === "hook_completed") {
+    const name = firstStringAtPaths(p, [["event_name"], ["name"], ["source_path"]]);
+    return `Hook: completed${name ? `: ${name}` : ""}`;
+  }
+  if (type === "sub_agent_activity" || type === "collab_agent_spawn_begin" || type === "collab_agent_spawn_end") {
+    const name = firstStringAtPaths(p, [["agent_nickname"], ["new_agent_nickname"], ["receiver_agent_nickname"]]);
+    return `Subagent: ${name || "activity"}`;
+  }
+  if (type === "agent_reasoning" || type === "agent_reasoning_content_delta") {
+    const text = firstStringAtPaths(p, [["text"], ["delta"], ["summary"], ["content"]]);
+    return text ? `Reasoning: ${truncateLine(text, 180)}` : "";
+  }
+  return "";
+}
+
+function extractCodexFinalTextFromEvent(type, payload) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  if (type === "agent_message" || type === "agent_message_event") {
+    return firstStringAtPaths(p, [["message"], ["text"], ["content"], ["output_text"]]) || extractResponseContentText(p.content);
+  }
+  if (type === "turn_complete" || type === "turn_completed") {
+    return firstStringAtPaths(p, [["last_agent_message"], ["message"], ["text"], ["output_text"]]) || extractResponseContentText(p.content);
+  }
+  if (type === "response_item" && (p.type === "message" || p.type === "agent_message")) {
+    return firstStringAtPaths(p, [["message"], ["text"], ["output_text"]]) || extractResponseContentText(p.content);
+  }
+  return "";
+}
+
+function appendCodexMessageDelta(job, type, payload) {
+  if (!job || !payload || typeof payload !== "object") return;
+  if (type !== "agent_message_content_delta") return;
+  const delta = firstStringAtPaths(payload, [["delta"], ["text"], ["content"], ["chunk"]]);
+  if (!delta) return;
+  job.codexMessageDeltaTail = appendTail(String(job.codexMessageDeltaTail || ""), delta, 50000);
+}
+
+function emitCodexProgressLine(job, line, streamName = "stdout") {
+  const text = String(line || "").trim();
+  if (!text) return;
+  const withNewline = `${text}\n`;
+  job.codexEventTail = appendTail(String(job.codexEventTail || ""), withNewline, 50000);
+  if (CODEX_STREAM_OUTPUT_TO_TERMINAL) {
+    writeWorkerStreamChunk(withNewline, { workerId: job?.workerId, stream: streamName });
+  }
+  if (typeof job.onProgressChunk === "function") job.onProgressChunk(withNewline, streamName);
+}
+
+function ingestCodexJsonLine(job, line, streamName = "stdout") {
+  const raw = String(line || "").trim();
+  if (!raw) return;
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    emitCodexProgressLine(job, raw, streamName);
+    return;
+  }
+
+  const sessionId = findSessionIdDeep(parsed);
+  if (sessionId) job.codexSessionId = sessionId;
+
+  const { type, payload } = extractCodexEventPayload(parsed);
+  appendCodexMessageDelta(job, type, payload);
+  const finalText = extractCodexFinalTextFromEvent(type, payload);
+  if (finalText) job.codexFinalText = finalText;
+
+  const progress = formatCodexJsonEventProgress(type, payload);
+  if (progress) emitCodexProgressLine(job, progress, streamName);
+}
+
+function ingestCodexJsonChunk(job, chunkText, streamName = "stdout") {
+  const chunk = String(chunkText || "");
+  if (!chunk) return;
+  const key = streamName === "stderr" ? "codexJsonStderrRemainder" : "codexJsonStdoutRemainder";
+  const combined = `${String(job[key] || "")}${chunk}`.replace(/\r/g, "");
+  const parts = combined.split("\n");
+  let remainder = parts.pop() ?? "";
+  if (remainder.length > 100_000) remainder = remainder.slice(-100_000);
+  job[key] = remainder;
+  for (const line of parts) ingestCodexJsonLine(job, line, streamName);
+}
+
+function flushCodexJsonRemainders(job) {
+  for (const [key, streamName] of [
+    ["codexJsonStdoutRemainder", "stdout"],
+    ["codexJsonStderrRemainder", "stderr"],
+  ]) {
+    const line = String(job?.[key] || "").trim();
+    if (!line) continue;
+    job[key] = "";
+    ingestCodexJsonLine(job, line, streamName);
+  }
+}
+
+function normalizeStructuredFinalAttachments(raw) {
+  const rows = Array.isArray(raw) ? raw : [];
+  const out = [];
+  for (const item of rows) {
+    if (typeof item === "string" && item.trim()) {
+      out.push({ path: item.trim(), caption: "" });
+      continue;
+    }
+    if (!item || typeof item !== "object") continue;
+    const pathValue = String(item.path || item.file || item.filename || "").trim();
+    if (!pathValue) continue;
+    out.push({
+      path: pathValue,
+      caption: String(item.caption || item.title || "").trim(),
+    });
+  }
+  return out;
+}
+
+function parseCodexStructuredFinalText(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return "";
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return raw;
+
+  const main = String(parsed.text || parsed.final || parsed.message || "").trim();
+  const spoken = String(parsed.spoken || "").trim();
+  const textOnly = String(parsed.text_only || parsed.textOnly || "").trim();
+  const sections = [];
+  if (spoken) {
+    sections.push(`SPOKEN:\n${spoken}`);
+    if (textOnly || main) sections.push(`TEXT_ONLY:\n${textOnly || main}`);
+  } else {
+    sections.push(main || textOnly);
+  }
+
+  for (const attachment of normalizeStructuredFinalAttachments(parsed.attachments)) {
+    sections.push(`ATTACH: ${attachment.path}${attachment.caption ? ` | ${attachment.caption}` : ""}`);
+  }
+
+  return sections.filter(Boolean).join("\n\n").trim() || raw;
+}
+
+function shouldUseCodexOutputSchema(job) {
+  if (!CODEX_OUTPUT_SCHEMA_ENABLED) return false;
+  if (!CODEX_OUTPUT_SCHEMA_FILE || !fs.existsSync(CODEX_OUTPUT_SCHEMA_FILE)) return false;
+  const style = String(job?.replyStyle || "").trim().toLowerCase();
+  return style !== "router";
+}
+
 function extractUserMessageSnippet(rawText) {
   const text = String(rawText || "").trim();
   if (!text) return "";
@@ -3966,6 +4247,10 @@ function buildCodexExecSpec(job) {
   });
   const outputFile = String(job?.outputFile || "");
   const outputPath = codexMode.mode === "wsl" ? toWslPath(outputFile) : outputFile;
+  const outputSchemaFile = shouldUseCodexOutputSchema(job) ? CODEX_OUTPUT_SCHEMA_FILE : "";
+  const outputSchemaPath = outputSchemaFile
+    ? (codexMode.mode === "wsl" ? toWslPath(outputSchemaFile) : outputSchemaFile)
+    : "";
   const args = [...buildCodexGlobalArgs(), "exec"];
   const execOptions = [];
   const resumeSessionId = String(job?.resumeSessionId || "").trim();
@@ -3978,10 +4263,12 @@ function buildCodexExecSpec(job) {
   }
 
   execOptions.push("--color", "never");
+  if (CODEX_EXEC_JSON) execOptions.push("--json");
   if (!isResume) {
     execOptions.push("-C", codexWorkdir);
   }
   if (outputPath) execOptions.push("-o", outputPath);
+  if (outputSchemaPath) execOptions.push("--output-schema", outputSchemaPath);
 
   const prefs = getChatPrefs(job?.chatId);
   const effectiveModel = normalizeCodexModelName(job?.model || prefs.model || CODEX_MODEL || "");
@@ -4013,6 +4300,7 @@ function buildCodexExecSpec(job) {
       args: ["-e", "bash", "-lic", shellCmd],
       stdinText: promptText,
       cwd: ROOT,
+      jsonEvents: CODEX_EXEC_JSON,
     };
   }
   return {
@@ -4021,6 +4309,7 @@ function buildCodexExecSpec(job) {
     shell: Boolean(codexMode.shell),
     stdinText: promptText,
     cwd: workdir,
+    jsonEvents: CODEX_EXEC_JSON,
   };
 }
 
@@ -11490,6 +11779,8 @@ async function sendStatus(chatId) {
     `- approval: ${CODEX_APPROVAL_POLICY}`,
     `- mcp: ${CODEX_DISABLE_MCP ? "disabled by bot config" : "inherited from Codex config/plugins"}`,
     `- web_search: ${CODEX_SEARCH_ENABLED ? "enabled" : "default"}`,
+    `- exec_json: ${CODEX_EXEC_JSON ? "enabled" : "disabled"}`,
+    `- output_schema: ${CODEX_OUTPUT_SCHEMA_ENABLED && fs.existsSync(CODEX_OUTPUT_SCHEMA_FILE) ? "enabled" : "disabled"}`,
     `- general_workdir: ${String(getCodexWorker(ORCH_GENERAL_WORKER_ID)?.workdir || ROOT)}`,
     `- time: ${nowIso()}`,
   ];
@@ -15817,15 +16108,23 @@ async function runCodexJob(job) {
     child.stdout.on("data", (buf) => {
       const chunk = String(buf || "");
       job.stdoutTail = appendTail(job.stdoutTail, chunk);
-      if (CODEX_STREAM_OUTPUT_TO_TERMINAL) writeWorkerStreamChunk(chunk, { workerId: job?.workerId, stream: "stdout" });
-      if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
+      if (spec.jsonEvents) {
+        ingestCodexJsonChunk(job, chunk, "stdout");
+      } else {
+        if (CODEX_STREAM_OUTPUT_TO_TERMINAL) writeWorkerStreamChunk(chunk, { workerId: job?.workerId, stream: "stdout" });
+        if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
+      }
     });
 
     child.stderr.on("data", (buf) => {
       const chunk = String(buf || "");
       job.stderrTail = appendTail(job.stderrTail, chunk);
-      if (CODEX_STREAM_OUTPUT_TO_TERMINAL) writeWorkerStreamChunk(chunk, { workerId: job?.workerId, stream: "stderr" });
-      if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
+      if (spec.jsonEvents && chunk.trim().startsWith("{")) {
+        ingestCodexJsonChunk(job, chunk, "stderr");
+      } else {
+        if (CODEX_STREAM_OUTPUT_TO_TERMINAL) writeWorkerStreamChunk(chunk, { workerId: job?.workerId, stream: "stderr" });
+        if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
+      }
     });
 
     child.on("error", (err) => {
@@ -15835,20 +16134,23 @@ async function runCodexJob(job) {
 
     child.on("close", (code, signal) => {
       clearTimeout(timeout);
+      if (spec.jsonEvents) flushCodexJsonRemainders(job);
 
       let output = "";
       try {
         if (fs.existsSync(job.outputFile)) {
-          output = fs.readFileSync(job.outputFile, "utf8").trim();
+          output = parseCodexStructuredFinalText(fs.readFileSync(job.outputFile, "utf8").trim());
         }
       } catch {
         // best effort
       }
 
       if (!output && job.stdoutTail.trim()) {
-        output = job.stdoutTail.trim();
+        output = spec.jsonEvents
+          ? parseCodexStructuredFinalText(String(job.codexFinalText || job.codexMessageDeltaTail || "").trim())
+          : job.stdoutTail.trim();
       }
-      const sessionId = extractSessionIdFromText(
+      const sessionId = String(job.codexSessionId || "").trim() || extractSessionIdFromText(
         `${job.stderrTail || ""}\n${job.stdoutTail || ""}\n${output || ""}`,
       );
 
@@ -15858,7 +16160,7 @@ async function runCodexJob(job) {
       }
 
       if (job.timedOut) {
-        const tail = job.stderrTail.trim() || job.stdoutTail.trim();
+        const tail = String(job.codexEventTail || "").trim() || job.stderrTail.trim() || job.stdoutTail.trim();
         finish({
           ok: false,
           sessionId,
@@ -15868,7 +16170,7 @@ async function runCodexJob(job) {
       }
 
       if (typeof code === "number" && code !== 0) {
-        const errText = job.stderrTail.trim() || job.stdoutTail.trim();
+        const errText = String(job.codexEventTail || "").trim() || job.stderrTail.trim() || job.stdoutTail.trim();
         const staleProcessHint = /unexpected argument ['"]?-a['"]? found/i.test(errText)
           ? `\n\nHint: this usually means an older bot process is still running. Stop all old bot windows/processes, then restart with ${process.platform === "win32" ? "start.cmd" : "./start.sh"}.`
           : "";

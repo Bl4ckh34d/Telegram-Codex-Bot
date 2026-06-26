@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "aidolon-native-control": {
+      "command": "node",
+      "args": ["./scripts/aidolon-control-mcp.js"]
+    }
+  }
+}

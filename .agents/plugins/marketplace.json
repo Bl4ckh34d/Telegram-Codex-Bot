@@ -1,0 +1,20 @@
+{
+  "name": "aidolon-local",
+  "interface": {
+    "displayName": "AIDOLON Local"
+  },
+  "plugins": [
+    {
+      "name": "aidolon-native-control",
+      "source": {
+        "source": "local",
+        "path": "./plugins/aidolon-native-control"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
