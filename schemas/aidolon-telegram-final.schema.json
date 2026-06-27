@@ -9,15 +9,15 @@
       "description": "The concise Telegram-ready final answer. Use English, German, or Chinese only."
     },
     "spoken": {
-      "type": "string",
+      "type": ["string", "null"],
       "description": "Optional voice-ready answer for voice replies."
     },
     "text_only": {
-      "type": "string",
+      "type": ["string", "null"],
       "description": "Optional non-spoken details, commands, links, or attachment notes."
     },
     "attachments": {
-      "type": "array",
+      "type": ["array", "null"],
       "description": "Files saved under the bot attachment output folder.",
       "items": {
         "type": "object",
@@ -28,16 +28,16 @@
             "description": "Path relative to runtime/out, without a runtime/out prefix."
           },
           "caption": {
-            "type": "string"
+            "type": ["string", "null"]
           }
         },
-        "required": ["path"]
+        "required": ["path", "caption"]
       }
     },
     "status": {
-      "type": "string",
-      "enum": ["ok", "blocked", "failed"]
+      "type": ["string", "null"],
+      "enum": ["ok", "blocked", "failed", null]
     }
   },
-  "required": ["text"]
+  "required": ["text", "spoken", "text_only", "attachments", "status"]
 }
