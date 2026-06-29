@@ -2,6 +2,10 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
+if [[ -z "${AIDOLON_LAUNCH_STARTED_AT_MS:-}" ]]; then
+  AIDOLON_LAUNCH_STARTED_AT_MS="$(date +%s%3N 2>/dev/null || printf '0')"
+  export AIDOLON_LAUNCH_STARTED_AT_MS
+fi
 
 if [[ ! -f ".env" ]]; then
   if [[ -f ".env.example" ]]; then

@@ -37,6 +37,10 @@ const WHISPER_SCRIPT_PATH = path.join(ROOT, "whisper_transcribe.py");
 const WHISPER_SERVER_SCRIPT_PATH = path.join(ROOT, "whisper_transcribe_server.py");
 const AIDOLON_TTS_SERVER_SCRIPT_PATH = path.join(ROOT, "aidolon_tts_server.py");
 const RESTART_EXIT_CODE = 75;
+const PROCESS_STARTED_AT_MS = (() => {
+  const raw = Number(process.env.AIDOLON_LAUNCH_STARTED_AT_MS);
+  return Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : Date.now();
+})();
 
 let terminalOutputBroken = false;
 
@@ -5603,8 +5607,8 @@ function getTelegramCommandList() {
     { command: "cancel", description: "cancel the active codex run" },
     { command: "stop", description: "cancel the active codex run" },
     { command: "clear", description: "clear queued prompts" },
-    { command: "prune", description: "prune runtime artifacts and logs" },
-    { command: "wipe", description: "wipe runtime artifacts and chat context" },
+    { command: "prune", description: "prune runtime artifacts" },
+    { command: "wipe", description: "wipe artifacts and chat context" },
     { command: "screenshot", description: "send a screenshot image" },
     { command: "sendfile", description: "send a file attachment" },
     { command: "resume", description: "resume a codex session" },
@@ -6887,8 +6891,8 @@ async function sendHelp(chatId) {
     "- /newsstatus - show WorldMonitor monitor state and last alerts",
     "- /cancel - stop current AIDOLON run",
     "- /clear - clear queued prompts",
-    "- /prune - prune runtime files/logs (keeps chat context)",
-    "- /wipe - wipe runtime files and reset this chat context",
+    "- /prune - prune runtime artifacts (keeps chat context and chat log)",
+    "- /wipe - wipe runtime artifacts and reset this chat context (keeps chat log)",
     "",
     fmtBold("CLI flow"),
     "- /cmd <args> - stage a raw AIDOLON CLI command",
@@ -13515,6 +13519,7 @@ function wipeRuntimeArtifacts() {
     deletedFiles: 0,
     deletedDirs: 0,
     deletedBytes: 0,
+    preservedFiles: 0,
     errors: [],
   };
 
@@ -13522,7 +13527,9 @@ function wipeRuntimeArtifacts() {
   wipeDirectoryContents(VOICE_DIR, summary);
   wipeDirectoryContents(IMAGE_DIR, summary);
   wipeDirectoryContents(TTS_DIR, summary);
-  wipeRemovePathTree(CHAT_LOG_PATH, summary);
+  if (fs.existsSync(CHAT_LOG_PATH)) {
+    summary.preservedFiles += 1;
+  }
 
   let runtimeEntries = [];
   try {
@@ -13611,6 +13618,7 @@ async function wipeRuntime(chatId) {
     `- Runtime files deleted: ${runtime.deletedFiles}`,
     `- Runtime directories removed: ${runtime.deletedDirs}`,
     `- Runtime bytes freed: ${runtime.deletedBytes}`,
+    `- Runtime logs kept: ${runtime.preservedFiles > 0 ? "yes" : "no active chat log"}`,
     `- Queued prompts cleared (this chat): ${chat.queuedRemoved}`,
     `- Pending /cmd cleared (this chat): ${chat.pendingCommandCleared ? "yes" : "no"}`,
     `- Learned lessons cleared (this chat): ${chat.lessonsRemoved}`,
@@ -13644,6 +13652,7 @@ async function pruneRuntime(chatId) {
     `- Runtime files deleted: ${runtime.deletedFiles}`,
     `- Runtime directories removed: ${runtime.deletedDirs}`,
     `- Runtime bytes freed: ${runtime.deletedBytes}`,
+    `- Runtime logs kept: ${runtime.preservedFiles > 0 ? "yes" : "no active chat log"}`,
     "- Chat context kept: yes",
   ];
   if (runtime.errors.length > 0) {
@@ -18326,6 +18335,39 @@ function isAllowedMessage(msg) {
   return true;
 }
 
+function describeTelegramChatForLog(msg) {
+  const chat = msg?.chat && typeof msg.chat === "object" ? msg.chat : {};
+  const parts = [];
+  const id = String(chat.id || "").trim();
+  const type = String(chat.type || "").trim();
+  const title = String(chat.title || chat.username || "").trim();
+  if (id) parts.push(`chat=${id}`);
+  if (type) parts.push(`type=${type}`);
+  if (title) parts.push(`title=${oneLine(title).slice(0, 120)}`);
+  return parts.join(" ") || "chat=unknown";
+}
+
+function logDroppedTelegramMessage(msg, reason) {
+  const chatId = String(msg?.chat?.id || "");
+  const user = senderLabel(msg);
+  const messageId = Number(msg?.message_id || 0);
+  const text = String(msg?.text || msg?.caption || "").trim();
+  const detail = [
+    `Dropped Telegram message (${String(reason || "unknown").trim() || "unknown"})`,
+    describeTelegramChatForLog(msg),
+    `user=${user}`,
+    messageId > 0 ? `message_id=${Math.trunc(messageId)}` : "",
+    text ? `text=${oneLine(text).slice(0, 240)}` : "",
+  ].filter(Boolean).join(" ");
+  logSystemEvent(detail, "chat:drop");
+  if (CHAT_LOG_TO_FILE) {
+    logChat("drop", chatId || "-", text || "[non-text-message]", {
+      source: String(reason || "drop").trim() || "drop",
+      user,
+    });
+  }
+}
+
 async function answerCallbackQuery(callbackQueryId, text = "") {
   const id = String(callbackQueryId || "").trim();
   if (!id) return;
@@ -18530,7 +18572,7 @@ async function handleIncomingMessage(msg) {
   const user = senderLabel(msg);
   const replyContext = buildReplyContextFromIncomingMessage(msg);
   if (!isAllowedMessage(msg)) {
-    log(`[chat:drop] unauthorized chat=${chatId || "unknown"} user=${user}`);
+    logDroppedTelegramMessage(msg, "unauthorized");
     return;
   }
   recordIncomingTelegramMessageMeta(msg);
@@ -18641,17 +18683,43 @@ async function pollUpdates(timeoutSec) {
   });
 }
 
+function getTelegramUpdateMessageDateMs(update) {
+  const candidates = [
+    update?.message?.date,
+    update?.edited_message?.date,
+  ];
+  for (const raw of candidates) {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0) return Math.trunc(n * 1000);
+  }
+  return 0;
+}
+
 async function skipStaleUpdates() {
   if (!SKIP_STALE_UPDATES) return;
   const stale = await pollUpdates(0);
   if (!Array.isArray(stale) || stale.length === 0) return;
 
+  let skipped = 0;
+  let retained = 0;
   for (const upd of stale) {
     const id = Number(upd.update_id || 0);
+    const messageDateMs = getTelegramUpdateMessageDateMs(upd);
+    const isOlderThanThisProcess = messageDateMs > 0 && messageDateMs < PROCESS_STARTED_AT_MS;
+    if (!isOlderThanThisProcess) {
+      retained += 1;
+      continue;
+    }
     if (id > lastUpdateId) lastUpdateId = id;
+    skipped += 1;
   }
-  persistState();
-  log(`Skipped ${stale.length} stale update(s) on startup.`);
+  if (skipped > 0) {
+    persistState();
+    logSystemEvent(`Skipped ${skipped} stale update(s) from before process start up to update_id=${lastUpdateId}.`, "telegram");
+  }
+  if (retained > 0) {
+    logSystemEvent(`Retained ${retained} startup-time update(s) for normal handling.`, "telegram");
+  }
 }
 
 async function pollLoop() {
@@ -18687,7 +18755,7 @@ async function pollLoop() {
           updateFailureCounts.set(id, attempts);
           const detail = oneLine(redactError(err?.stack || err?.message || err));
           if (attempts >= maxUpdateRetries) {
-            log(`update ${id} failed ${attempts} time(s); skipping: ${detail}`);
+            logSystemEvent(`update ${id} failed ${attempts} time(s); skipping: ${detail}`, "telegram:error");
             updateFailureCounts.delete(id);
             if (id > lastUpdateId) {
               lastUpdateId = id;
@@ -18695,7 +18763,7 @@ async function pollLoop() {
             }
             continue;
           }
-          log(`update ${id} handler failed (attempt ${attempts}/${maxUpdateRetries}): ${detail}`);
+          logSystemEvent(`update ${id} handler failed (attempt ${attempts}/${maxUpdateRetries}): ${detail}`, "telegram:error");
           await sleep(Math.min(2000, attempts * 500));
           break;
         }
@@ -18703,10 +18771,10 @@ async function pollLoop() {
     } catch (err) {
       const message = redactError(err.message || String(err));
       if (/\b409\b/.test(message)) {
-        log("Telegram getUpdates conflict (another poller is active). Retrying in 5s...");
+        logSystemEvent("Telegram getUpdates conflict (another poller is active). Retrying in 5s...", "telegram:error");
         await sleep(5000);
       } else {
-        log(`poll error: ${message}`);
+        logSystemEvent(`poll error: ${message}`, "telegram:error");
         await sleep(2500);
       }
     }

@@ -93,8 +93,8 @@ Core:
 - `/weather [city]` - weather update for today and tomorrow (text + voice when enabled)
 - `/cancel` or `/stop` - cancel active run
 - `/clear` - clear queued prompts
-- `/prune` - prune runtime artifacts/logs (keeps chat context)
-- `/wipe` - wipe runtime artifacts and reset chat context
+- `/prune` - prune runtime artifacts (keeps chat context and chat log)
+- `/wipe` - wipe runtime artifacts and reset chat context (keeps chat log)
 - `/restart` - restart process when workers are idle and queue is empty
 
 Codex command staging flow:
