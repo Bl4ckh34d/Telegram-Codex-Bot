@@ -19,7 +19,8 @@ AIDOLON should stay a Telegram transport, media pipeline, and local scheduler. C
 - `CODEX_SEARCH_ENABLED=1` enables native Codex web search without granting shell network access.
 - Telegram response behavior is available as the `aidolon-telegram` repo skill.
 - Project-scoped custom agents are available for explicit architecture and verification subagent work.
-- Codex runs use `codex exec --json` by default and parse JSONL events into Telegram-friendly progress.
+- Codex runs use `codex exec --json` by default and parse JSONL events, including reasoning deltas, into Telegram-friendly progress.
+- Terminal audit output stays enabled by default with compact JSON event lines; `CODEX_TERMINAL_RAW_JSON=1` can dump the raw JSONL stream for debugging.
 - Normal Telegram replies can use `schemas/aidolon-telegram-final.schema.json` through `codex exec --output-schema`.
 - A repo-local plugin package, `aidolon-native-control`, exposes desktop UI and TV control scripts through a Codex MCP server and skill.
 

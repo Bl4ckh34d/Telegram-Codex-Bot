@@ -5,6 +5,7 @@ const fs = require("fs");
 const dns = require("dns");
 const os = require("os");
 const path = require("path");
+const vm = require("vm");
 const { Agent: UndiciAgent } = require("undici");
 const { spawn, spawnSync } = require("child_process");
 const { Readable } = require("stream");
@@ -36,6 +37,41 @@ const WHISPER_SCRIPT_PATH = path.join(ROOT, "whisper_transcribe.py");
 const WHISPER_SERVER_SCRIPT_PATH = path.join(ROOT, "whisper_transcribe_server.py");
 const AIDOLON_TTS_SERVER_SCRIPT_PATH = path.join(ROOT, "aidolon_tts_server.py");
 const RESTART_EXIT_CODE = 75;
+
+let terminalOutputBroken = false;
+
+function isTerminalOutputError(err) {
+  const code = String(err?.code || "").trim().toUpperCase();
+  return ["EIO", "EPIPE", "EBADF", "ERR_STREAM_DESTROYED"].includes(code);
+}
+
+function noteTerminalOutputError(err) {
+  if (isTerminalOutputError(err)) {
+    terminalOutputBroken = true;
+  }
+}
+
+function safeTerminalWrite(stream, text) {
+  if (terminalOutputBroken) return false;
+  if (!stream || typeof stream.write !== "function" || stream.destroyed) return false;
+  try {
+    stream.write(String(text || ""));
+    return true;
+  } catch (err) {
+    noteTerminalOutputError(err);
+    return false;
+  }
+}
+
+function safeTerminalError(message) {
+  safeTerminalWrite(process.stderr, `${String(message || "")}\n`);
+}
+
+for (const stream of [process.stdout, process.stderr]) {
+  if (stream && typeof stream.on === "function") {
+    stream.on("error", noteTerminalOutputError);
+  }
+}
 
 const {
   ensureDir,
@@ -594,15 +630,15 @@ function writeWorkerStreamChunk(chunk, { workerId = "", stream = "stdout" } = {}
   if (!text) return;
   const out = String(stream || "").toLowerCase() === "stderr" ? process.stderr : process.stdout;
   if (!useWorkerStreamColors() || hasAnsi(text)) {
-    out.write(text);
+    safeTerminalWrite(out, text);
     return;
   }
   const color = getWorkerTerminalColors(workerId).light;
   if (!color) {
-    out.write(text);
+    safeTerminalWrite(out, text);
     return;
   }
-  out.write(`${color}${text}${ANSI.reset}`);
+  safeTerminalWrite(out, `${color}${text}${ANSI.reset}`);
 }
 
 function detectSeverityTag(source, rest) {
@@ -655,10 +691,10 @@ function formatLogMessageForTerminal(rawMessage) {
 function log(msg) {
   const ts = `[${nowIso()}]`;
   if (useTerminalColorsForLogs()) {
-    console.log(`${paint(ts, ANSI.dim)} ${formatLogMessageForTerminal(msg)}`);
+    safeTerminalWrite(process.stdout, `${paint(ts, ANSI.dim)} ${formatLogMessageForTerminal(msg)}\n`);
     return;
   }
-  console.log(`${ts} ${msg}`);
+  safeTerminalWrite(process.stdout, `${ts} ${msg}\n`);
 }
 
 function normalizeDnsResultOrder(rawValue) {
@@ -708,6 +744,11 @@ const POLL_TIMEOUT_SEC = toInt(process.env.TELEGRAM_POLL_TIMEOUT_SEC, 20);
 // Telegram API request timeouts: 0 disables abort-based timeouts entirely.
 const TELEGRAM_API_TIMEOUT_MS = toTimeoutMs(process.env.TELEGRAM_API_TIMEOUT_MS, 60_000);
 const TELEGRAM_UPLOAD_TIMEOUT_MS = toTimeoutMs(process.env.TELEGRAM_UPLOAD_TIMEOUT_MS, 120_000);
+const TELEGRAM_COMMAND_SYNC_TIMEOUT_MS = toTimeoutMs(
+  process.env.TELEGRAM_COMMAND_SYNC_TIMEOUT_MS,
+  TELEGRAM_API_TIMEOUT_MS > 0 ? Math.min(TELEGRAM_API_TIMEOUT_MS, 5_000) : 5_000,
+  0,
+);
 const TELEGRAM_DNS_RESULT_ORDER = normalizeDnsResultOrder(process.env.TELEGRAM_DNS_RESULT_ORDER || "auto");
 const TELEGRAM_FETCH_DISPATCHER = createTelegramFetchDispatcher(TELEGRAM_DNS_RESULT_ORDER);
 const TELEGRAM_STARTUP_MAX_ATTEMPTS = toInt(process.env.TELEGRAM_STARTUP_MAX_ATTEMPTS, 8, 1, 120);
@@ -718,6 +759,7 @@ const TELEGRAM_MESSAGE_MAX_CHARS = toInt(process.env.TELEGRAM_MESSAGE_MAX_CHARS,
 const STARTUP_MESSAGE = toBool(process.env.STARTUP_MESSAGE, true);
 const SKIP_STALE_UPDATES = toBool(process.env.SKIP_STALE_UPDATES, true);
 const TELEGRAM_SET_COMMANDS = toBool(process.env.TELEGRAM_SET_COMMANDS, true);
+const TELEGRAM_COMMAND_CLEANUP_CHAT_SCOPES = toBool(process.env.TELEGRAM_COMMAND_CLEANUP_CHAT_SCOPES, false);
 const TELEGRAM_COMMAND_SCOPES = parseList(process.env.TELEGRAM_COMMAND_SCOPE || "default")
   .map((s) => String(s || "").trim().toLowerCase())
   .filter(Boolean);
@@ -797,6 +839,10 @@ const CODEX_APPROVAL_POLICY = ["untrusted", "on-failure", "on-request", "never"]
 const CODEX_DISABLE_MCP = toBool(process.env.CODEX_DISABLE_MCP, false);
 const CODEX_SEARCH_ENABLED = toBool(process.env.CODEX_SEARCH_ENABLED, false);
 const CODEX_EXEC_JSON = toBool(process.env.CODEX_EXEC_JSON, true);
+const CODEX_REASONING_PROGRESS = toBool(process.env.CODEX_REASONING_PROGRESS, true);
+const CODEX_REASONING_PROGRESS_MAX_CHARS = toInt(process.env.CODEX_REASONING_PROGRESS_MAX_CHARS, 260, 120, 1200);
+const CODEX_TERMINAL_EVENT_AUDIT = toBool(process.env.CODEX_TERMINAL_EVENT_AUDIT, true);
+const CODEX_TERMINAL_RAW_JSON = toBool(process.env.CODEX_TERMINAL_RAW_JSON, false);
 const CODEX_OUTPUT_SCHEMA_ENABLED = toBool(process.env.CODEX_OUTPUT_SCHEMA_ENABLED, true);
 const CODEX_OUTPUT_SCHEMA_FILE = resolveMaybeRelativePath(
   process.env.CODEX_OUTPUT_SCHEMA_FILE || path.join(ROOT, "schemas", "aidolon-telegram-final.schema.json"),
@@ -932,16 +978,33 @@ const SCREENSHOT_CAPTURE_TIMEOUT_MS = toTimeoutMs(
   0,
   MAX_TIMEOUT_MS,
 );
+const SCREENSHOT_TOOL_TIMEOUT_MS = toTimeoutMs(
+  process.env.SCREENSHOT_TOOL_TIMEOUT_MS,
+  SCREENSHOT_CAPTURE_TIMEOUT_MS > 0 ? Math.min(SCREENSHOT_CAPTURE_TIMEOUT_MS, 8_000) : 8_000,
+  0,
+  MAX_TIMEOUT_MS,
+);
 const SCREENSHOT_UPLOAD_TIMEOUT_MS = toTimeoutMs(
   process.env.SCREENSHOT_UPLOAD_TIMEOUT_MS,
   TELEGRAM_UPLOAD_TIMEOUT_MS > 0 ? TELEGRAM_UPLOAD_TIMEOUT_MS : 120_000,
   0,
   MAX_TIMEOUT_MS,
 );
+const LINUX_TRUSTED_CAPTURE_MODE = String(process.env.AIDOLON_TRUSTED_CAPTURE_ENABLED || "0").trim().toLowerCase();
+const LINUX_TRUSTED_CAPTURE_SOCKET = String(process.env.AIDOLON_CAPTURE_SOCKET || "/run/aidolon-capture.sock").trim();
+const LINUX_TRUSTED_CAPTURE_CLIENT = resolveMaybeRelativePath(
+  process.env.AIDOLON_TRUSTED_CAPTURE_CLIENT || path.join(ROOT, "tools", "linux_trusted_capture_client.py"),
+);
+const LINUX_MUTTER_SCREENCAST_CAPTURE = resolveMaybeRelativePath(
+  process.env.AIDOLON_MUTTER_SCREENCAST_CAPTURE || path.join(ROOT, "tools", "linux_mutter_screencast_capture.py"),
+);
+const LINUX_DIRECT_CAPTURE_MODE = String(process.env.AIDOLON_DIRECT_CAPTURE_ENABLED || "0").trim().toLowerCase();
+const LINUX_PORTAL_SCREENSHOT_MODE = String(process.env.AIDOLON_PORTAL_SCREENSHOT_ENABLED || "0").trim().toLowerCase();
+const LINUX_SCREENSAVER_WAKE_MODE = String(process.env.AIDOLON_SCREENSHOT_WAKE_SCREENSAVER || "auto").trim().toLowerCase();
 
 if (ATTACH_ENABLED && !ensureDirSafe(ATTACH_ROOT, { label: "attachments", required: false })) {
   ATTACH_ENABLED = false;
-  console.error(`[startup] Attachments disabled because ATTACH_ROOT is unavailable: ${ATTACH_ROOT}`);
+  safeTerminalError(`[startup] Attachments disabled because ATTACH_ROOT is unavailable: ${ATTACH_ROOT}`);
 }
 
 const CODEX_PROMPT_FILE = resolveMaybeRelativePath(
@@ -975,7 +1038,7 @@ const ORCH_ROUTER_MODEL = String(process.env.ORCH_ROUTER_MODEL || "").trim();
 const ORCH_ROUTER_REASONING_EFFORT = String(process.env.ORCH_ROUTER_REASONING_EFFORT || "low").trim();
 const ORCH_SPLIT_ENABLED = toBool(process.env.ORCH_SPLIT_ENABLED, true);
 const ORCH_SPLIT_MAX_TASKS = toInt(process.env.ORCH_SPLIT_MAX_TASKS, 3, 2, 8);
-const ORCH_DELEGATION_ACK_ENABLED = toBool(process.env.ORCH_DELEGATION_ACK_ENABLED, true);
+const ORCH_DELEGATION_ACK_ENABLED = toBool(process.env.ORCH_DELEGATION_ACK_ENABLED, false);
 const ORCH_DELEGATION_ACK_SILENT = toBool(process.env.ORCH_DELEGATION_ACK_SILENT, true);
 const ORCH_LESSONS_ENABLED = toBool(process.env.ORCH_LESSONS_ENABLED, true);
 const ORCH_LESSONS_MAX_ITEMS = toInt(process.env.ORCH_LESSONS_MAX_ITEMS, 240, 20, 2000);
@@ -1209,6 +1272,7 @@ const WEATHER_DAILY_VOICE_ENABLED = toBool(process.env.WEATHER_DAILY_VOICE_ENABL
 const WEATHER_DAILY_NOTIFY_ERRORS = toBool(process.env.WEATHER_DAILY_NOTIFY_ERRORS, true);
 const WEATHER_FORECAST_TIMEOUT_MS = toTimeoutMs(process.env.WEATHER_FORECAST_TIMEOUT_MS, 12_000, 0, MAX_TIMEOUT_MS);
 const WEATHER_GEOCODING_TIMEOUT_MS = toTimeoutMs(process.env.WEATHER_GEOCODING_TIMEOUT_MS, 10_000, 0, MAX_TIMEOUT_MS);
+const WEATHER_TAIWAN_CWA_ENABLED = toBool(process.env.WEATHER_TAIWAN_CWA_ENABLED, true);
 const NATURAL_NEWS_FOLLOWUP_TTL_MS = 5 * 60 * 1000;
 const NATURAL_SAFE_COMMAND_INTENT_THRESHOLD_RAW = Number(process.env.NATURAL_SAFE_COMMAND_INTENT_THRESHOLD);
 const NATURAL_SAFE_COMMAND_INTENT_THRESHOLD = Number.isFinite(NATURAL_SAFE_COMMAND_INTENT_THRESHOLD_RAW)
@@ -1231,22 +1295,22 @@ if (TELEGRAM_DNS_RESULT_ORDER) {
   try {
     dns.setDefaultResultOrder(TELEGRAM_DNS_RESULT_ORDER);
   } catch (err) {
-    console.error(`[startup] Failed to set DNS result order (${TELEGRAM_DNS_RESULT_ORDER}): ${err?.message || err}`);
+    safeTerminalError(`[startup] Failed to set DNS result order (${TELEGRAM_DNS_RESULT_ORDER}): ${err?.message || err}`);
   }
 }
 
 if (!TOKEN || !PRIMARY_CHAT_ID) {
-  console.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in .env");
+  safeTerminalError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in .env");
   process.exit(1);
 }
 
 if (BOT_REQUIRE_TTY && !process.stdout?.isTTY && !process.stderr?.isTTY) {
-  console.error("Refusing to start without an interactive terminal (BOT_REQUIRE_TTY=1).");
+  safeTerminalError("Refusing to start without an interactive terminal (BOT_REQUIRE_TTY=1).");
   process.exit(1);
 }
 
 if (!fs.existsSync(CODEX_WORKDIR)) {
-  console.error(`CODEX_WORKDIR does not exist: ${CODEX_WORKDIR}`);
+  safeTerminalError(`CODEX_WORKDIR does not exist: ${CODEX_WORKDIR}`);
   process.exit(1);
 }
 
@@ -1301,7 +1365,7 @@ let codexMode;
 try {
   codexMode = resolveCodexMode();
 } catch (err) {
-  console.error(err.message || String(err));
+  safeTerminalError(err.message || String(err));
   process.exit(1);
 }
 
@@ -1310,7 +1374,7 @@ try {
   acquireProcessLock(LOCK_PATH);
   lockHeld = true;
 } catch (err) {
-  console.error(err.message || String(err));
+  safeTerminalError(err.message || String(err));
   process.exit(1);
 }
 
@@ -2037,7 +2101,7 @@ statePersister = createStatePersister({
     try {
       writeJsonAtomic(WORKFLOW_CATALOG_PATH, buildWorkflowCatalogSnapshot());
     } catch (err) {
-      console.error(`[state] Failed to write workflow catalog: ${err?.message || err}`);
+      safeTerminalError(`[state] Failed to write workflow catalog: ${err?.message || err}`);
     }
   },
   delayMs: STATE_WRITE_DEBOUNCE_MS,
@@ -2950,6 +3014,7 @@ const orchLaneRuntime = createOrchLaneRuntime({
   maybeTriggerPendingRestart,
   truncateLine,
   isProgressNoiseLine,
+  formatQueuedPromptBatchText,
 });
 
 const orchRouterRuntime = createOrchRouterRuntime({
@@ -3130,14 +3195,51 @@ function getLastImageForChat(chatId) {
   };
 }
 
+function getRecentImagesForChat(chatId) {
+  const key = String(chatId || "").trim();
+  if (!key) return [];
+  const entry = lastImages[key] || null;
+  if (!entry || typeof entry !== "object") return [];
+  const candidates = Array.isArray(entry.items) && entry.items.length > 0
+    ? entry.items
+    : [entry];
+  const ttlSec = Number(VISION_AUTO_FOLLOWUP_SEC);
+  const cutoff = Number.isFinite(ttlSec) && ttlSec > 0 ? Date.now() - ttlSec * 1000 : 0;
+  const out = [];
+  const seen = new Set();
+  for (const item of candidates) {
+    const filePath = String(item?.path || "").trim();
+    if (!filePath || seen.has(filePath)) continue;
+    if (cutoff > 0 && Number(item?.at || 0) > 0 && Number(item.at) < cutoff) continue;
+    if (!fs.existsSync(filePath)) continue;
+    seen.add(filePath);
+    out.push({
+      path: filePath,
+      mime: String(item?.mime || "").trim(),
+      name: String(item?.name || "").trim(),
+      at: Number(item?.at || 0),
+    });
+  }
+  return out;
+}
+
 function setLastImageForChat(chatId, info) {
   const key = String(chatId || "").trim();
   if (!key) return;
-  lastImages[key] = {
+  const now = Date.now();
+  const next = {
     path: String(info?.path || "").trim(),
     mime: String(info?.mime || "").trim(),
     name: String(info?.name || "").trim(),
-    at: Date.now(),
+    at: now,
+  };
+  const prevItems = getRecentImagesForChat(chatId);
+  const items = [...prevItems.filter((item) => item.path !== next.path), next]
+    .filter((item) => item.path)
+    .slice(-8);
+  lastImages[key] = {
+    ...next,
+    items,
   };
   persistState();
 }
@@ -3565,6 +3667,89 @@ function formatCodexPrompt(userText, options = {}) {
   return lines.join("\n");
 }
 
+function formatQueuedPromptBatchText(jobs) {
+  const items = Array.isArray(jobs) ? jobs.filter((job) => job && typeof job === "object") : [];
+  if (items.length <= 1) return String(items[0]?.text || "").trim();
+
+  const lines = [
+    `Combined queued Telegram batch (${items.length} messages).`,
+    "Handle every message below in order. Treat later messages as newer instructions when they conflict.",
+    "Each item includes its own reply/recent context when available.",
+  ];
+
+  items.forEach((job, idx) => {
+    const n = idx + 1;
+    const source = String(job?.source || "").trim();
+    const imagePaths = Array.isArray(job?.imagePaths)
+      ? job.imagePaths.map((p) => String(p || "").trim()).filter(Boolean)
+      : [];
+    const taskId = Number(job?.taskId || 0);
+    const replyToMessageId = Number(job?.replyToMessageId || 0);
+    const originMessageId = Number(job?.originMessageId || 0);
+    const replyContext = job?.replyContext && typeof job.replyContext === "object" ? job.replyContext : null;
+    const replyThreadContext = job?.replyThreadContext && typeof job.replyThreadContext === "object" ? job.replyThreadContext : null;
+    const recentHistoryContext = job?.recentHistoryContext && typeof job.recentHistoryContext === "object" ? job.recentHistoryContext : null;
+
+    lines.push("", `Message ${n}:`);
+    if (source) lines.push(`- Source: ${source}`);
+    if (Number.isFinite(taskId) && taskId > 0) lines.push(`- Task id: ${Math.trunc(taskId)}`);
+    if (Number.isFinite(originMessageId) && originMessageId > 0) lines.push(`- Telegram message id: ${Math.trunc(originMessageId)}`);
+    if (Number.isFinite(replyToMessageId) && replyToMessageId > 0) lines.push(`- Reply target message id: ${Math.trunc(replyToMessageId)}`);
+    if (imagePaths.length > 0) lines.push(`- Attached images for this message: ${imagePaths.length}`);
+
+    if (replyContext) {
+      const replyMessageId = Number(replyContext.messageId || 0);
+      const replyFrom = String(replyContext.from || "").trim();
+      const replySource = String(replyContext.source || "").trim();
+      const replySnippet = normalizeReplySnippet(replyContext.snippet || "");
+      const replySessionId = String(replyContext.sessionId || "").trim();
+      const replyTaskId = Number(replyContext.taskId || 0);
+      const replyTaskLinks = normalizeTaskLinks(replyContext.taskLinks);
+      lines.push("- Reply context:");
+      if (Number.isFinite(replyMessageId) && replyMessageId > 0) lines.push(`  - Replied-to Telegram message id: ${Math.trunc(replyMessageId)}`);
+      if (replyFrom) lines.push(`  - Replied-to sender: ${replyFrom}${replyContext.fromIsBot === true ? " (bot)" : ""}`);
+      if (replySource) lines.push(`  - Replied-to message type: ${replySource}`);
+      if (Number.isFinite(replyTaskId) && replyTaskId > 0) lines.push(`  - Replied-to task id: ${Math.trunc(replyTaskId)}`);
+      if (replySessionId) lines.push(`  - Replied-to session id: ${replySessionId}`);
+      if (replyTaskLinks.length > 0) {
+        const encoded = replyTaskLinks
+          .map((x) => {
+            const tid = Number(x.taskId || 0);
+            const wid = String(x.workerId || "").trim();
+            const sid = String(x.sessionId || "").trim();
+            const parts = [];
+            if (Number.isFinite(tid) && tid > 0) parts.push(`task=${Math.trunc(tid)}`);
+            if (wid) parts.push(`worker=${wid}`);
+            if (sid) parts.push(`session=${sid}`);
+            return parts.join(",");
+          })
+          .filter(Boolean)
+          .join(" | ");
+        if (encoded) lines.push(`  - Replied-to task links: ${encoded}`);
+      }
+      lines.push("  - Replied-to content:");
+      lines.push(replySnippet || "unavailable");
+    }
+
+    const threadText = String(replyThreadContext?.text || "").trim();
+    if (threadText) {
+      lines.push("- Reply thread context:");
+      lines.push(threadText);
+    }
+
+    const recentText = String(recentHistoryContext?.text || "").trim();
+    if (recentText) {
+      lines.push("- Recent chat context:");
+      lines.push(recentText);
+    }
+
+    lines.push("- User message:");
+    lines.push(String(job?.text || "").trim());
+  });
+
+  return lines.join("\n").trim();
+}
+
 function isSessionId(value) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
     String(value || "").trim(),
@@ -3695,6 +3880,14 @@ function parseJsonObjectLoose(value) {
   }
 }
 
+function compactJsonForTerminal(value, maxChars = 320) {
+  try {
+    return truncateLine(JSON.stringify(value), maxChars);
+  } catch {
+    return "";
+  }
+}
+
 function summarizePatchChanges(changes) {
   if (!changes) return "";
   const rows = Array.isArray(changes)
@@ -3720,33 +3913,366 @@ function summarizePatchChanges(changes) {
   return unique.length > 4 ? `${shown}, +${unique.length - 4} more` : shown;
 }
 
+function addCodexFileCandidate(files, value) {
+  const raw = String(value || "").trim();
+  if (!raw) return;
+  if (raw.length > 500) return;
+  if (/[\r\n{}]/.test(raw)) return;
+  files.push(raw);
+}
+
+function summarizeCodexFileChanges(payload) {
+  const files = [];
+  for (const candidate of getCodexAuditCandidates(payload)) {
+    for (const pathParts of [
+      ["file"],
+      ["path"],
+      ["filename"],
+      ["file_path"],
+      ["filepath"],
+      ["target"],
+      ["target_file"],
+      ["target_path"],
+      ["source_path"],
+      ["destination"],
+      ["destination_path"],
+    ]) {
+      addCodexFileCandidate(files, firstStringAtPaths(candidate, [pathParts]));
+    }
+
+    for (const key of ["changes", "files", "paths", "changed_files"]) {
+      const value = candidate[key];
+      const summary = summarizePatchChanges(value);
+      if (summary) {
+        for (const file of summary.split(/\s*,\s*/)) addCodexFileCandidate(files, file);
+      }
+    }
+  }
+
+  const unique = [...new Set(files.map((f) => String(f || "").trim()).filter(Boolean))];
+  if (unique.length === 0) return "";
+  const shown = unique.slice(0, 4).join(", ");
+  return unique.length > 4 ? `${shown}, +${unique.length - 4} more` : shown;
+}
+
+function isCodexItemWrapperType(type) {
+  return /^(?:item|response_item)_(?:started|completed|complete)$/.test(normalizeCodexEventType(type));
+}
+
+function collectCodexPayloadCandidates(value, out = [], seen = new Set(), depth = 0) {
+  if (depth > 4 || !value || typeof value !== "object" || Array.isArray(value)) return out;
+  if (seen.has(value)) return out;
+  seen.add(value);
+  out.push(value);
+
+  for (const key of ["item", "payload", "data", "event", "call", "function", "invocation", "input", "arguments", "result"]) {
+    const child = value[key];
+    if (!child) continue;
+    if (typeof child === "string" && (key === "input" || key === "arguments")) {
+      const parsed = parseJsonObjectLoose(child);
+      if (parsed) collectCodexPayloadCandidates(parsed, out, seen, depth + 1);
+      continue;
+    }
+    collectCodexPayloadCandidates(child, out, seen, depth + 1);
+  }
+  return out;
+}
+
+function getCodexAuditCandidates(payload) {
+  return collectCodexPayloadCandidates(payload && typeof payload === "object" ? payload : {});
+}
+
+function getCodexItemSubtype(type, payload) {
+  const normalizedType = normalizeCodexEventType(type);
+  for (const candidate of getCodexAuditCandidates(payload)) {
+    const subtype = normalizeCodexEventType(candidate.type || candidate.kind || "");
+    if (subtype && subtype !== normalizedType && !isCodexItemWrapperType(subtype)) return subtype;
+  }
+  return "";
+}
+
 function renderToolCallName(payload) {
-  const p = payload && typeof payload === "object" ? payload : {};
-  const item = p.item && typeof p.item === "object" ? p.item : {};
-  return firstStringAtPaths(p, [["name"], ["tool_name"], ["tool"], ["function", "name"]]) ||
-    firstStringAtPaths(item, [["name"], ["tool_name"], ["tool"], ["function", "name"]]);
+  for (const candidate of getCodexAuditCandidates(payload)) {
+    const name = firstStringAtPaths(candidate, [["name"], ["tool_name"], ["tool"], ["function", "name"]]);
+    if (name) return name;
+  }
+  return "";
 }
 
 function renderToolCallArguments(payload) {
-  const p = payload && typeof payload === "object" ? payload : {};
-  const raw = firstStringAtPaths(p, [["arguments"], ["input"], ["args"]]);
-  const parsed = parseJsonObjectLoose(raw);
-  if (parsed) {
-    return renderCommandForProgress(parsed.cmd) ||
-      renderCommandForProgress(parsed.command) ||
-      renderCommandForProgress(parsed.argv) ||
-      renderCommandForProgress(parsed.args) ||
-      "";
+  for (const candidate of getCodexAuditCandidates(payload)) {
+    const direct = renderCommandForProgress(candidate.display_command) ||
+      renderCommandForProgress(candidate.command) ||
+      renderCommandForProgress(candidate.cmd) ||
+      renderCommandForProgress(candidate.invocation);
+    if (direct) return direct;
+
+    const raw = firstStringAtPaths(candidate, [["arguments"], ["input"], ["args"]]);
+    const parsed = parseJsonObjectLoose(raw);
+    if (parsed) {
+      const command = renderCommandForProgress(parsed.display_command) ||
+        renderCommandForProgress(parsed.cmd) ||
+        renderCommandForProgress(parsed.command) ||
+        renderCommandForProgress(parsed.argv) ||
+        renderCommandForProgress(parsed.args);
+      if (command) return command;
+    }
+    const fallback = renderCommandForProgress(raw);
+    if (fallback) return fallback;
   }
-  return renderCommandForProgress(raw);
+  return "";
+}
+
+function getCodexCallId(payload) {
+  for (const candidate of getCodexAuditCandidates(payload)) {
+    const id = firstStringAtPaths(candidate, [["call_id"], ["callId"]]);
+    if (id) return id;
+  }
+  return "";
+}
+
+function lookupCodexAuditCall(job, payload) {
+  const callId = getCodexCallId(payload);
+  if (!callId || !job || !job.codexAuditCallsById || typeof job.codexAuditCallsById !== "object") return null;
+  return job.codexAuditCallsById[callId] || null;
+}
+
+function rememberCodexAuditCall(job, type, payload) {
+  if (!job || !payload || typeof payload !== "object") return;
+  const subtype = getCodexItemSubtype(type, payload) || normalizeCodexEventType(payload.type || "");
+  if (!/^(?:function_call|custom_tool_call|tool_search_call)$/.test(subtype)) return;
+  const callId = getCodexCallId(payload);
+  if (!callId) return;
+  const name = renderToolCallName(payload);
+  const command = renderToolCallArguments(payload);
+  if (!name && !command) return;
+  const calls = job.codexAuditCallsById && typeof job.codexAuditCallsById === "object" ? job.codexAuditCallsById : {};
+  calls[callId] = { name, command, at: Date.now() };
+  const entries = Object.entries(calls);
+  if (entries.length > 200) {
+    entries
+      .sort((a, b) => Number(a[1]?.at || 0) - Number(b[1]?.at || 0))
+      .slice(0, entries.length - 200)
+      .forEach(([id]) => delete calls[id]);
+  }
+  job.codexAuditCallsById = calls;
+}
+
+function extractCodexExitCode(payload) {
+  for (const candidate of getCodexAuditCandidates(payload)) {
+    const code = Number(candidate.exit_code ?? candidate.exitCode ?? candidate.code);
+    if (Number.isFinite(code)) return code;
+    const output = firstStringAtPaths(candidate, [["output"], ["stdout"], ["stderr"], ["message"]]);
+    const match = output && String(output).match(/Process exited with code (-?\d+)/);
+    if (match) return Number(match[1]);
+  }
+  return NaN;
+}
+
+function summarizeCodexAuditPayload(type, payload, job = null) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  const subtype = getCodexItemSubtype(type, p);
+  const parts = [];
+  const callInfo = lookupCodexAuditCall(job, p);
+
+  if (subtype && subtype !== type) parts.push(subtype);
+
+  const model = firstStringAtPaths(p, [["model"], ["model_id"], ["settings", "model"], ["config", "model"]]);
+  if (model) parts.push(`model=${model}`);
+
+  const name = renderToolCallName(p) || callInfo?.name || "";
+  if (name) parts.push(`tool=${name}`);
+
+  const command = renderToolCallArguments(p) || callInfo?.command || "";
+  if (command) parts.push(`cmd=${truncateLine(command, 220)}`);
+
+  const server = firstStringAtPaths(p, [["server_name"], ["server"], ["mcp_server"], ["invocation", "server_name"]]);
+  if (server) parts.push(`server=${server}`);
+
+  const status = firstStringAtPaths(p, [["status"], ["state"], ["phase"]]);
+  if (status) parts.push(`status=${status}`);
+
+  const code = extractCodexExitCode(p);
+  if (Number.isFinite(code)) parts.push(`exit=${code}`);
+
+  const usage = p.usage || p.token_usage || p.total_token_usage || {};
+  const total = Number(usage.total_tokens || usage.total || 0);
+  if (total > 0) parts.push(`tokens=${total}`);
+
+  const files = summarizePatchChanges(p.changes) || summarizeCodexFileChanges(p);
+  if (files) parts.push(`files=${files}`);
+
+  const msg = firstStringAtPaths(p, [["message"], ["warning"], ["error", "message"], ["details"]]);
+  if (msg && !/^(agent_message|user_message|raw_response_item)/.test(type)) parts.push(truncateLine(msg, 220));
+
+  if (parts.length > 0) return parts.join(" | ");
+  if (/^(thread_settings|settings_applied|session_configured|token_count|turn_context|raw_response_item|session_meta|user_message)$/.test(type)) {
+    return "received";
+  }
+  return "";
+}
+
+function formatCodexTerminalAuditLine(type, payload, job = null) {
+  if (!type) return "";
+  const detail = summarizeCodexAuditPayload(type, payload, job);
+  return `Event: ${type}${detail ? ` | ${detail}` : ""}`;
+}
+
+function extractTextFromCodexValue(value) {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (Array.isArray(value)) return extractResponseContentText(value);
+  if (!value || typeof value !== "object") return "";
+  return firstStringAtPaths(value, [
+    ["delta"],
+    ["text"],
+    ["content"],
+    ["summary"],
+    ["message"],
+    ["value"],
+  ]) || extractResponseContentText(value.content) || extractResponseContentText(value.summary);
+}
+
+function codexReasoningProgressLabel(type, payload) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  const subtype = normalizeCodexEventType(p.type || "");
+  return /internal/.test(type) || /internal/.test(subtype) ? "Internal" : "Reasoning";
+}
+
+function isCodexReasoningProgressEvent(type, payload) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  const subtype = normalizeCodexEventType(p.type || "");
+  if (type === "response_item") return subtype === "reasoning" || subtype === "internal";
+  return /(^|_)(reasoning|internal)($|_)/.test(type);
+}
+
+function isCodexReasoningDeltaEvent(type, payload) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  return /(^|_)delta($|_)/.test(type) || Object.prototype.hasOwnProperty.call(p, "delta");
+}
+
+function extractCodexReasoningProgressText(payload) {
+  const p = payload && typeof payload === "object" ? payload : {};
+  if (typeof p.delta === "string") return p.delta;
+  if (typeof p.item?.delta === "string") return p.item.delta;
+  const direct = firstStringAtPaths(p, [
+    ["delta"],
+    ["text"],
+    ["content"],
+    ["summary"],
+    ["message"],
+    ["reasoning"],
+    ["internal"],
+    ["chunk"],
+    ["item", "delta"],
+    ["item", "text"],
+    ["item", "content"],
+    ["item", "summary"],
+    ["item", "message"],
+  ]);
+  if (direct) return direct;
+
+  for (const value of [
+    p.delta,
+    p.content,
+    p.summary,
+    p.reasoning,
+    p.internal,
+    p.item?.delta,
+    p.item?.content,
+    p.item?.summary,
+    p.item?.reasoning,
+    p.item?.internal,
+  ]) {
+    const text = extractTextFromCodexValue(value);
+    if (text) return text;
+  }
+  return "";
+}
+
+function sanitizeCodexReasoningProgressText(text) {
+  return oneLine(text).replace(/\\n/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function sanitizeCodexReasoningProgressDelta(text) {
+  return String(text || "").replace(/\r?\n/g, " ").replace(/\s+/g, " ");
+}
+
+function splitCodexProgressText(text, maxChars = CODEX_REASONING_PROGRESS_MAX_CHARS) {
+  const max = Math.max(80, Math.trunc(Number(maxChars) || 260));
+  const chunks = [];
+  let rest = String(text || "").trim();
+  while (rest.length > max) {
+    let idx = -1;
+    for (const re of [/[.!?;:]\s/g, /,\s/g, /\s/g]) {
+      let match;
+      while ((match = re.exec(rest.slice(0, max + 1))) !== null) idx = match.index + match[0].length;
+      if (idx >= Math.floor(max * 0.45)) break;
+      idx = -1;
+    }
+    if (idx < Math.floor(max * 0.45)) idx = max;
+    chunks.push(rest.slice(0, idx).trim());
+    rest = rest.slice(idx).trim();
+  }
+  if (rest) chunks.push(rest);
+  return chunks.filter(Boolean);
+}
+
+function flushCodexReasoningProgress(job, streamName = "stdout") {
+  const state = job?.codexReasoningProgress && typeof job.codexReasoningProgress === "object"
+    ? job.codexReasoningProgress
+    : null;
+  if (!state) return;
+  const text = sanitizeCodexReasoningProgressText(state.buffer || "");
+  job.codexReasoningProgress = null;
+  if (!text) return;
+  const label = state.label || "Reasoning";
+  for (const chunk of splitCodexProgressText(text)) {
+    emitCodexProgressLine(job, `${label}: ${chunk}`, streamName);
+  }
+}
+
+function maybeHandleCodexReasoningProgress(job, type, payload, streamName = "stdout") {
+  if (!isCodexReasoningProgressEvent(type, payload)) return false;
+  if (!CODEX_REASONING_PROGRESS) return true;
+
+  const text = extractCodexReasoningProgressText(payload);
+  if (!text) return true;
+  const isDelta = isCodexReasoningDeltaEvent(type, payload);
+  const clean = isDelta
+    ? sanitizeCodexReasoningProgressDelta(text)
+    : sanitizeCodexReasoningProgressText(text);
+  if (!clean) return true;
+
+  const label = codexReasoningProgressLabel(type, payload);
+  if (isDelta) {
+    const prev = job.codexReasoningProgress && typeof job.codexReasoningProgress === "object"
+      ? job.codexReasoningProgress
+      : { label, buffer: "" };
+    prev.label = label;
+    prev.buffer = appendTail(`${String(prev.buffer || "")}${clean}`, "", CODEX_REASONING_PROGRESS_MAX_CHARS * 4);
+    job.codexReasoningProgress = prev;
+    if (
+      prev.buffer.length >= CODEX_REASONING_PROGRESS_MAX_CHARS ||
+      /[.!?;:)]["']?\s*$/.test(prev.buffer)
+    ) {
+      flushCodexReasoningProgress(job, streamName);
+    }
+    return true;
+  }
+
+  flushCodexReasoningProgress(job, streamName);
+  for (const chunk of splitCodexProgressText(clean)) {
+    emitCodexProgressLine(job, `${label}: ${chunk}`, streamName);
+  }
+  return true;
 }
 
 function formatResponseItemProgress(payload) {
   const p = payload && typeof payload === "object" ? payload : {};
-  const subtype = normalizeCodexEventType(p.type || "");
+  const subtype = getCodexItemSubtype("response_item", p) || normalizeCodexEventType(p.type || "");
   if (!subtype) return "";
 
-  if (subtype === "reasoning") return "";
+  if (subtype === "reasoning" || subtype === "internal") return "";
 
   if (subtype === "function_call" || subtype === "custom_tool_call" || subtype === "tool_search_call") {
     const name = renderToolCallName(p);
@@ -3774,11 +4300,8 @@ function formatCodexJsonEventProgress(type, payload) {
   if (/^(thread_settings|settings_applied|session_configured|token_count|turn_context|raw_response_item|session_meta|user_message)$/.test(type)) {
     return "";
   }
-  if (type === "thread_started" || type === "conversation_started" || type === "task_started") {
-    return "AIDOLON: session started";
-  }
-  if (type === "turn_started") {
-    return "AIDOLON: turn started";
+  if (/^(?:thread|conversation|session|task|turn)_started$/.test(type)) {
+    return "";
   }
   if (type === "turn_complete" || type === "turn_completed" || type === "task_complete") {
     const usage = p.usage || p.token_usage || p.total_token_usage || {};
@@ -3839,9 +4362,8 @@ function formatCodexJsonEventProgress(type, payload) {
     const name = firstStringAtPaths(p, [["agent_nickname"], ["new_agent_nickname"], ["receiver_agent_nickname"]]);
     return `Subagent: ${name || "activity"}`;
   }
-  if (type === "response_item") return formatResponseItemProgress(p);
+  if (type === "response_item" || isCodexItemWrapperType(type)) return formatResponseItemProgress(p);
   if (type === "agent_message" || type === "agent_message_event") return "";
-  if (type === "agent_reasoning" || type === "agent_reasoning_content_delta") return "";
   return "";
 }
 
@@ -3878,6 +4400,23 @@ function emitCodexProgressLine(job, line, streamName = "stdout") {
   if (typeof job.onProgressChunk === "function") job.onProgressChunk(withNewline, streamName);
 }
 
+function emitCodexTerminalLine(job, line, streamName = "stdout") {
+  if (!CODEX_STREAM_OUTPUT_TO_TERMINAL) return;
+  const text = String(line || "").trim();
+  if (!text) return;
+  writeWorkerStreamChunk(`${text}\n`, { workerId: job?.workerId, stream: streamName });
+}
+
+function emitCodexTerminalAudit(job, type, payload, raw, streamName = "stdout") {
+  if (!CODEX_TERMINAL_EVENT_AUDIT && !CODEX_TERMINAL_RAW_JSON) return;
+  if (CODEX_TERMINAL_RAW_JSON) {
+    emitCodexTerminalLine(job, `JSONL: ${compactJsonForTerminal(raw || payload, 4000)}`, streamName);
+    return;
+  }
+  const line = formatCodexTerminalAuditLine(type, payload, job);
+  if (line) emitCodexTerminalLine(job, line, streamName);
+}
+
 function ingestCodexJsonLine(job, line, streamName = "stdout") {
   const raw = String(line || "").trim();
   if (!raw) return;
@@ -3897,10 +4436,14 @@ function ingestCodexJsonLine(job, line, streamName = "stdout") {
   if (sessionId) job.codexSessionId = sessionId;
 
   const { type, payload } = extractCodexEventPayload(parsed);
+  rememberCodexAuditCall(job, type, payload);
+  emitCodexTerminalAudit(job, type, payload, parsed, streamName);
   appendCodexMessageDelta(job, type, payload);
   const finalText = extractCodexFinalTextFromEvent(type, payload);
   if (finalText) job.codexFinalText = finalText;
 
+  if (maybeHandleCodexReasoningProgress(job, type, payload, streamName)) return;
+  flushCodexReasoningProgress(job, streamName);
   const progress = formatCodexJsonEventProgress(type, payload);
   if (progress) emitCodexProgressLine(job, progress, streamName);
 }
@@ -3927,6 +4470,7 @@ function flushCodexJsonRemainders(job) {
     job[key] = "";
     ingestCodexJsonLine(job, line, streamName);
   }
+  flushCodexReasoningProgress(job, "stdout");
 }
 
 function normalizeStructuredFinalAttachments(raw) {
@@ -3948,9 +4492,21 @@ function normalizeStructuredFinalAttachments(raw) {
   return out;
 }
 
-function parseCodexStructuredFinalText(text) {
+function shouldPreserveStructuredVoiceSections(job) {
+  const style = String(job?.replyStyle || "").trim().toLowerCase();
+  const source = String(job?.source || "").trim().toLowerCase();
+  return style === "voice" ||
+    style === "tts" ||
+    style === "spoken" ||
+    source === "voice" ||
+    source === "worldmonitor-monitor" ||
+    source === "worldmonitor-check";
+}
+
+function parseCodexStructuredFinalText(text, options = {}) {
   const raw = String(text || "").trim();
   if (!raw) return "";
+  const preserveVoiceSections = options?.preserveVoiceSections === true;
   let parsed;
   try {
     parsed = JSON.parse(raw);
@@ -3963,11 +4519,13 @@ function parseCodexStructuredFinalText(text) {
   const spoken = String(parsed.spoken || "").trim();
   const textOnly = String(parsed.text_only || parsed.textOnly || "").trim();
   const sections = [];
-  if (spoken) {
+  if (spoken && preserveVoiceSections) {
     sections.push(`SPOKEN:\n${spoken}`);
-    if (textOnly || main) sections.push(`TEXT_ONLY:\n${textOnly || main}`);
+    if (textOnly) sections.push(`TEXT_ONLY:\n${textOnly}`);
   } else {
-    sections.push(main || textOnly);
+    if (main) sections.push(main);
+    if (textOnly) sections.push(textOnly);
+    if (!main && !textOnly && spoken) sections.push(spoken);
   }
 
   for (const attachment of normalizeStructuredFinalAttachments(parsed.attachments)) {
@@ -4405,6 +4963,16 @@ function buildCodexExecSpec(job) {
   };
 }
 
+function formatTimeoutDuration(timeoutMs) {
+  const ms = Math.max(0, Math.round(Number(timeoutMs) || 0));
+  if (ms >= 1000) return `${Math.max(1, Math.round(ms / 1000))}s`;
+  return `${ms}ms`;
+}
+
+function isOwnAbortTimeout(controller, signal) {
+  return Boolean(controller?.signal?.aborted) && !(signal && signal.aborted);
+}
+
 async function telegramApi(method, { query = "", body = null, timeoutMs = TELEGRAM_API_TIMEOUT_MS, signal } = {}) {
   const url = `https://api.telegram.org/bot${TOKEN}/${method}${query ? `?${query}` : ""}`;
 
@@ -4428,6 +4996,13 @@ async function telegramApi(method, { query = "", body = null, timeoutMs = TELEGR
       throw new Error(`Telegram ${method} failed: ${res.status} ${desc}`);
     }
     return data.result;
+  } catch (err) {
+    if (useTimeout && isOwnAbortTimeout(controller, signal)) {
+      const timeoutErr = new Error(`Telegram ${method} timed out after ${formatTimeoutDuration(ms)}`);
+      timeoutErr.cause = err;
+      throw timeoutErr;
+    }
+    throw err;
   } finally {
     combined.cleanup();
     if (timer) clearTimeout(timer);
@@ -4455,6 +5030,13 @@ async function telegramApiMultipart(method, formData, timeoutMs = TELEGRAM_UPLOA
       throw new Error(`Telegram ${method} failed: ${res.status} ${desc}`);
     }
     return data.result;
+  } catch (err) {
+    if (useTimeout && isOwnAbortTimeout(controller, signal)) {
+      const timeoutErr = new Error(`Telegram ${method} timed out after ${formatTimeoutDuration(ms)}`);
+      timeoutErr.cause = err;
+      throw timeoutErr;
+    }
+    throw err;
   } finally {
     combined.cleanup();
     if (timer) clearTimeout(timer);
@@ -5065,18 +5647,23 @@ async function setTelegramCommands() {
   const commands = getTelegramCommandList();
 
   // Remove stale per-chat overrides so global command scopes stay authoritative.
-  for (const rawChatId of ALLOWED_CHAT_IDS) {
-    const chatId = String(rawChatId || "").trim();
-    if (!chatId) continue;
-    try {
-      await telegramApi("deleteMyCommands", {
-        body: {
-          scope: { type: "chat", chat_id: chatId },
-        },
-      });
-    } catch (err) {
-      log(`deleteMyCommands(chat:${chatId}) failed: ${redactError(err?.message || err)}`);
-    }
+  // This is optional because command overrides are cosmetic; boot should never
+  // wait on a slow deleteMyCommands request before it starts polling.
+  if (TELEGRAM_COMMAND_CLEANUP_CHAT_SCOPES) {
+    await Promise.all([...ALLOWED_CHAT_IDS].map(async (rawChatId) => {
+      const chatId = String(rawChatId || "").trim();
+      if (!chatId) return;
+      try {
+        await telegramApi("deleteMyCommands", {
+          body: {
+            scope: { type: "chat", chat_id: chatId },
+          },
+          timeoutMs: TELEGRAM_COMMAND_SYNC_TIMEOUT_MS,
+        });
+      } catch (err) {
+        log(`deleteMyCommands(chat:${chatId}) failed: ${redactError(err?.message || err)}`);
+      }
+    }));
   }
 
   const scopes = getTelegramCommandScopesForSync();
@@ -5085,7 +5672,10 @@ async function setTelegramCommands() {
     if (scope && scope !== "default") {
       body.scope = { type: scope };
     }
-    await telegramApi("setMyCommands", { body });
+    await telegramApi("setMyCommands", {
+      body,
+      timeoutMs: TELEGRAM_COMMAND_SYNC_TIMEOUT_MS,
+    });
   }
 }
 
@@ -5196,6 +5786,14 @@ async function sendMessage(chatId, text, options = {}) {
   return sent;
 }
 
+function assertReadableUploadFile(filePath) {
+  try {
+    fs.accessSync(filePath, fs.constants.R_OK);
+  } catch (err) {
+    throw new Error(`Upload file is not readable: ${String(err?.message || err)}`);
+  }
+}
+
 async function sendPhoto(chatId, filePath, options = {}) {
   const silent = options.silent === true;
   const caption = String(options.caption || "").trim();
@@ -5207,6 +5805,7 @@ async function sendPhoto(chatId, filePath, options = {}) {
   const timeoutMs = Number.isFinite(options.timeoutMs) ? Number(options.timeoutMs) : TELEGRAM_UPLOAD_TIMEOUT_MS;
   const signal = options.signal;
   const fileName = path.basename(filePath) || "image.png";
+  assertReadableUploadFile(filePath);
   let blob;
   try {
     blob = await fs.openAsBlob(filePath);
@@ -5267,6 +5866,7 @@ async function sendVoice(chatId, filePath, options = {}) {
   const signal = options.signal;
   const maxAttempts = toInt(options.maxAttempts, 3, 1, 10);
   const fileName = path.basename(filePath) || "voice.ogg";
+  assertReadableUploadFile(filePath);
   let blob;
   try {
     blob = await fs.openAsBlob(filePath);
@@ -5329,6 +5929,7 @@ async function sendDocument(chatId, filePath, options = {}) {
     ? Number(options.timeoutMs)
     : ATTACH_UPLOAD_TIMEOUT_MS;
   const signal = options.signal;
+  assertReadableUploadFile(filePath);
 
   let blob;
   try {
@@ -5625,22 +6226,395 @@ async function runProcessCapture(bin, args, { env = {}, timeoutMs = SCREENSHOT_C
   });
 }
 
+const LINUX_PORTAL_SCREENSHOT_SCRIPT = String.raw`
+import os
+import shutil
+import sys
+import urllib.parse
+
+try:
+    from gi.repository import Gio, GLib
+except Exception as exc:
+    print(f"PyGObject/Gio is not available: {exc}", file=sys.stderr)
+    sys.exit(2)
+
+target = os.path.abspath(sys.argv[1])
+timeout_ms = int(os.environ.get("AIDOLON_PORTAL_TIMEOUT_MS") or "20000")
+interactive = os.environ.get("AIDOLON_PORTAL_SCREENSHOT_INTERACTIVE", "0").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
+os.makedirs(os.path.dirname(target), exist_ok=True)
+
+bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+sender = bus.get_unique_name().lstrip(":").replace(".", "_")
+token = f"aidolon_{os.getpid()}"
+handle_path = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+loop = GLib.MainLoop()
+state = {"done": False, "error": ""}
+
+def finish(error=""):
+    if state["done"]:
+        return
+    state["done"] = True
+    state["error"] = str(error or "")
+    loop.quit()
+
+def on_timeout():
+    finish("portal screenshot timed out waiting for desktop approval")
+    return False
+
+def on_response(_conn, _sender_name, _object_path, _interface_name, _signal_name, parameters):
+    response, results = parameters.unpack()
+    if response != 0:
+        finish(f"portal screenshot was cancelled or denied (response {response})")
+        return
+    uri = results.get("uri")
+    if hasattr(uri, "unpack"):
+        uri = uri.unpack()
+    if not uri:
+        finish("portal screenshot did not return an image URI")
+        return
+    parsed = urllib.parse.urlparse(str(uri))
+    if parsed.scheme != "file":
+        finish(f"portal screenshot returned unsupported URI: {uri}")
+        return
+    src = urllib.parse.unquote(parsed.path)
+    try:
+        shutil.copyfile(src, target)
+    except Exception as exc:
+        finish(f"could not copy portal screenshot: {exc}")
+        return
+    finish()
+
+def on_call_done(conn, result, _user_data):
+    try:
+        conn.call_finish(result)
+    except Exception as exc:
+        finish(f"portal screenshot call failed: {exc}")
+
+bus.signal_subscribe(
+    "org.freedesktop.portal.Desktop",
+    "org.freedesktop.portal.Request",
+    "Response",
+    handle_path,
+    None,
+    Gio.DBusSignalFlags.NONE,
+    on_response,
+)
+
+options = {
+    "interactive": GLib.Variant("b", interactive),
+    "handle_token": GLib.Variant("s", token),
+    "target": GLib.Variant("u", 1),
+}
+bus.call(
+    "org.freedesktop.portal.Desktop",
+    "/org/freedesktop/portal/desktop",
+    "org.freedesktop.portal.Screenshot",
+    "Screenshot",
+    GLib.Variant("(sa{sv})", ("", options)),
+    GLib.VariantType.new("(o)"),
+    Gio.DBusCallFlags.NONE,
+    timeout_ms,
+    None,
+    on_call_done,
+    None,
+)
+
+GLib.timeout_add(max(1000, timeout_ms), on_timeout)
+loop.run()
+
+if state["error"]:
+    print(state["error"], file=sys.stderr)
+    sys.exit(1)
+if not os.path.isfile(target) or os.path.getsize(target) <= 0:
+    print("portal screenshot output file missing", file=sys.stderr)
+    sys.exit(1)
+`.trim();
+
+function buildLinuxScreenshotCandidates(target) {
+  const desktop = [
+    process.env.XDG_CURRENT_DESKTOP,
+    process.env.DESKTOP_SESSION,
+    process.env.GDMSESSION,
+  ].filter(Boolean).join(" ");
+  const isGnome = /gnome/i.test(desktop);
+  const isWayland = /wayland/i.test(process.env.XDG_SESSION_TYPE || "") || Boolean(process.env.WAYLAND_DISPLAY);
+  const portalScreenshotEnabled = [
+    "1",
+    "true",
+    "yes",
+    "on",
+  ].includes(LINUX_PORTAL_SCREENSHOT_MODE);
+  const candidates = [];
+  const gnomeShellTimeoutMs = SCREENSHOT_TOOL_TIMEOUT_MS > 0
+    ? Math.min(SCREENSHOT_TOOL_TIMEOUT_MS, 5_000)
+    : 0;
+  const portalTimeoutMs = SCREENSHOT_CAPTURE_TIMEOUT_MS > 0
+    ? Math.max(SCREENSHOT_CAPTURE_TIMEOUT_MS, 60_000)
+    : 0;
+  const trustedCaptureEnabled = LINUX_TRUSTED_CAPTURE_MODE !== "0" &&
+    LINUX_TRUSTED_CAPTURE_MODE !== "false" &&
+    LINUX_TRUSTED_CAPTURE_MODE !== "off";
+  const directCaptureEnabled = LINUX_DIRECT_CAPTURE_MODE !== "0" &&
+    LINUX_DIRECT_CAPTURE_MODE !== "false" &&
+    LINUX_DIRECT_CAPTURE_MODE !== "off";
+  const directCaptureAvailable = directCaptureEnabled &&
+    commandExists("python3") &&
+    fs.existsSync(LINUX_TRUSTED_CAPTURE_CLIENT);
+  const trustedCaptureAvailable = trustedCaptureEnabled &&
+    commandExists("python3") &&
+    fs.existsSync(LINUX_TRUSTED_CAPTURE_CLIENT) &&
+    (LINUX_TRUSTED_CAPTURE_MODE === "1" ||
+      LINUX_TRUSTED_CAPTURE_MODE === "true" ||
+      LINUX_TRUSTED_CAPTURE_MODE === "yes" ||
+      LINUX_TRUSTED_CAPTURE_MODE === "on" ||
+      (LINUX_TRUSTED_CAPTURE_MODE === "auto" && LINUX_TRUSTED_CAPTURE_SOCKET && fs.existsSync(LINUX_TRUSTED_CAPTURE_SOCKET)));
+  const mutterScreencastAvailable = isGnome &&
+    isWayland &&
+    commandExists("python3") &&
+    commandExists("gst-launch-1.0") &&
+    fs.existsSync(LINUX_MUTTER_SCREENCAST_CAPTURE);
+
+  if (mutterScreencastAvailable) {
+    candidates.push({
+      name: "mutter-screencast",
+      bin: "python3",
+      args: [LINUX_MUTTER_SCREENCAST_CAPTURE, target],
+      env: {
+        AIDOLON_MUTTER_SCREENCAST_TIMEOUT_SEC: String(Math.max(2, Math.ceil((SCREENSHOT_CAPTURE_TIMEOUT_MS || 12_000) / 1000))),
+      },
+      timeoutMs: SCREENSHOT_CAPTURE_TIMEOUT_MS,
+    });
+  }
+
+  if (directCaptureAvailable) {
+    candidates.push({
+      name: "aidolon-direct-capture",
+      bin: "python3",
+      args: [LINUX_TRUSTED_CAPTURE_CLIENT, target],
+      env: {
+        AIDOLON_CAPTURE_DIRECT: "1",
+        AIDOLON_CAPTURE_OUTPUT_ROOT: path.dirname(target),
+        AIDOLON_CAPTURE_ALLOWED_UID: typeof process.getuid === "function" ? String(process.getuid()) : "",
+        AIDOLON_CAPTURE_ALLOWED_GID: typeof process.getgid === "function" ? String(process.getgid()) : "",
+        AIDOLON_CAPTURE_CLIENT_TIMEOUT_SEC: String(Math.max(1, Math.ceil((SCREENSHOT_CAPTURE_TIMEOUT_MS || 12_000) / 1000))),
+      },
+      timeoutMs: SCREENSHOT_CAPTURE_TIMEOUT_MS,
+    });
+  }
+
+  if (trustedCaptureAvailable) {
+    candidates.push({
+      name: "aidolon-trusted-capture",
+      bin: "python3",
+      args: [LINUX_TRUSTED_CAPTURE_CLIENT, target],
+      env: {
+        AIDOLON_CAPTURE_SOCKET: LINUX_TRUSTED_CAPTURE_SOCKET,
+        AIDOLON_CAPTURE_CLIENT_TIMEOUT_SEC: String(Math.max(1, Math.ceil((SCREENSHOT_CAPTURE_TIMEOUT_MS || 12_000) / 1000))),
+      },
+      timeoutMs: SCREENSHOT_CAPTURE_TIMEOUT_MS,
+    });
+  }
+
+  if (isWayland && portalScreenshotEnabled && commandExists("python3")) {
+    candidates.push({
+      name: "xdg-desktop-portal",
+      bin: "python3",
+      args: ["-c", LINUX_PORTAL_SCREENSHOT_SCRIPT, target],
+      env: {
+        AIDOLON_PORTAL_TIMEOUT_MS: String(portalTimeoutMs || 20_000),
+        AIDOLON_PORTAL_SCREENSHOT_INTERACTIVE: "0",
+      },
+      timeoutMs: portalTimeoutMs,
+    });
+  }
+
+  if (isGnome && commandExists("gdbus")) {
+    candidates.push({
+      name: "gnome-shell-screenshot",
+      bin: "gdbus",
+      args: [
+        "call",
+        "--session",
+        "--dest",
+        "org.gnome.Shell.Screenshot",
+        "--object-path",
+        "/org/gnome/Shell/Screenshot",
+        "--method",
+        "org.gnome.Shell.Screenshot.Screenshot",
+        "false",
+        "false",
+        target,
+      ],
+      timeoutMs: gnomeShellTimeoutMs,
+    });
+  }
+
+  const common = [
+    { name: "grim", bin: "grim", args: [target] },
+    { name: "scrot", bin: "scrot", args: [target] },
+    { name: "maim", bin: "maim", args: [target] },
+    { name: "import", bin: "import", args: ["-window", "root", target] },
+    { name: "gnome-screenshot", bin: "gnome-screenshot", args: ["-f", target] },
+  ];
+  for (const item of common) {
+    if (isWayland && item.name === "gnome-screenshot" && !portalScreenshotEnabled) {
+      continue;
+    }
+    if (commandExists(item.bin)) {
+      candidates.push({
+        ...item,
+        timeoutMs: SCREENSHOT_TOOL_TIMEOUT_MS,
+      });
+    }
+  }
+
+  return candidates;
+}
+
+function formatLinuxScreenshotFailure(errors) {
+  const details = errors
+    .slice(0, 4)
+    .map((err) => truncateLine(String(err || "").replace(/\s+/g, " ").trim(), 700))
+    .join(" | ");
+  const session = [
+    process.env.XDG_SESSION_TYPE ? `session=${process.env.XDG_SESSION_TYPE}` : "",
+    process.env.XDG_CURRENT_DESKTOP ? `desktop=${process.env.XDG_CURRENT_DESKTOP}` : "",
+  ].filter(Boolean).join(", ");
+  const desktop = [
+    process.env.XDG_CURRENT_DESKTOP,
+    process.env.DESKTOP_SESSION,
+    process.env.GDMSESSION,
+  ].filter(Boolean).join(" ");
+  const isGnomeWayland = /gnome/i.test(desktop) &&
+    (/wayland/i.test(process.env.XDG_SESSION_TYPE || "") || Boolean(process.env.WAYLAND_DISPLAY));
+  const hint = session
+    ? isGnomeWayland
+      ? ` (${session}). GNOME Wayland blocks normal screenshot tools. The bot first tries Mutter ScreenCast through tools/linux_mutter_screencast_capture.py; install python3-gi, gst-launch-1.0, and gstreamer1.0-pipewire if that candidate is unavailable. Interactive portal screenshots are disabled by default for remote commands.`
+      : ` (${session}). Install or enable a non-interactive screenshot tool, or repair the AIDOLON trusted capture backend.`
+    : " Install a working Linux screenshot tool for the bot session.";
+  return `Linux screenshot failed.${details ? ` ${details}` : ""}${hint}`;
+}
+
+async function linuxGnomeScreensaverIsActive() {
+  if (!commandExists("gdbus")) return false;
+  try {
+    const result = await runProcessCapture("gdbus", [
+      "call",
+      "--session",
+      "--dest",
+      "org.gnome.ScreenSaver",
+      "--object-path",
+      "/org/gnome/ScreenSaver",
+      "--method",
+      "org.gnome.ScreenSaver.GetActive",
+    ], { timeoutMs: 2_000 });
+    return /\btrue\b/i.test(String(result?.stdout || ""));
+  } catch {
+    return false;
+  }
+}
+
+function linuxScreensaverLockEnabled() {
+  if (!commandExists("gsettings")) return true;
+  const probe = spawnSync("gsettings", [
+    "get",
+    "org.gnome.desktop.screensaver",
+    "lock-enabled",
+  ], {
+    encoding: "utf8",
+    timeout: 2_000,
+    windowsHide: true,
+  });
+  if (probe.error || probe.status !== 0) return true;
+  return /\btrue\b/i.test(String(probe.stdout || ""));
+}
+
+function linuxActiveSessionLocked() {
+  if (!commandExists("loginctl")) return true;
+  const sessionList = spawnSync("loginctl", ["list-sessions", "--no-legend"], {
+    encoding: "utf8",
+    timeout: 2_000,
+    windowsHide: true,
+  });
+  if (sessionList.error || sessionList.status !== 0) return true;
+  const uid = typeof process.getuid === "function" ? String(process.getuid()) : "";
+  const ids = String(sessionList.stdout || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim().split(/\s+/))
+    .filter((parts) => parts.length >= 2 && (!uid || parts[1] === uid))
+    .map((parts) => parts[0])
+    .filter(Boolean);
+
+  for (const id of ids) {
+    const info = spawnSync("loginctl", ["show-session", id, "-p", "Active", "-p", "LockedHint"], {
+      encoding: "utf8",
+      timeout: 2_000,
+      windowsHide: true,
+    });
+    if (info.error || info.status !== 0) continue;
+    const text = String(info.stdout || "");
+    if (!/^Active=yes$/m.test(text)) continue;
+    return !/^LockedHint=no$/m.test(text);
+  }
+  return true;
+}
+
+async function prepareLinuxScreenshotSession() {
+  if (LINUX_SCREENSAVER_WAKE_MODE === "0" ||
+    LINUX_SCREENSAVER_WAKE_MODE === "false" ||
+    LINUX_SCREENSAVER_WAKE_MODE === "off" ||
+    LINUX_SCREENSAVER_WAKE_MODE === "no") {
+    return;
+  }
+  const desktop = [
+    process.env.XDG_CURRENT_DESKTOP,
+    process.env.DESKTOP_SESSION,
+    process.env.GDMSESSION,
+  ].filter(Boolean).join(" ");
+  const isGnomeWayland = /gnome/i.test(desktop) &&
+    (/wayland/i.test(process.env.XDG_SESSION_TYPE || "") || Boolean(process.env.WAYLAND_DISPLAY));
+  if (!isGnomeWayland || !commandExists("gdbus")) return;
+  if (!await linuxGnomeScreensaverIsActive()) return;
+
+  if (linuxScreensaverLockEnabled() || linuxActiveSessionLocked()) {
+    log("Linux screenshot: GNOME screensaver is active; not clearing because the session may be locked.");
+    return;
+  }
+
+  try {
+    await runProcessCapture("gdbus", [
+      "call",
+      "--session",
+      "--dest",
+      "org.gnome.ScreenSaver",
+      "--object-path",
+      "/org/gnome/ScreenSaver",
+      "--method",
+      "org.gnome.ScreenSaver.SetActive",
+      "false",
+    ], { timeoutMs: 2_000 });
+    log("Linux screenshot: cleared GNOME screensaver before capture.");
+  } catch (err) {
+    log(`Linux screenshot: failed to clear GNOME screensaver (${redactError(err?.message || err)}).`);
+  }
+}
+
 async function captureLinuxScreenshot(filePath) {
   const target = String(filePath || "").trim();
   if (!target) {
     throw new Error("Screenshot output path is required.");
   }
   ensureDir(path.dirname(target));
+  await prepareLinuxScreenshotSession();
 
   const env = {};
   if (!env.DISPLAY && !process.env.DISPLAY) env.DISPLAY = ":0";
-  const candidates = [
-    { bin: "gnome-screenshot", args: ["-f", target] },
-    { bin: "grim", args: [target] },
-    { bin: "scrot", args: [target] },
-    { bin: "maim", args: [target] },
-    { bin: "import", args: ["-window", "root", target] },
-  ].filter((item) => commandExists(item.bin));
+  const candidates = buildLinuxScreenshotCandidates(target);
 
   if (candidates.length === 0) {
     throw new Error("No Linux screenshot tool found. Install gnome-screenshot, grim, scrot, maim, or ImageMagick import.");
@@ -5649,21 +6623,27 @@ async function captureLinuxScreenshot(filePath) {
   const errors = [];
   for (const candidate of candidates) {
     try {
-      await runProcessCapture(candidate.bin, candidate.args, { env });
+      await runProcessCapture(candidate.bin, candidate.args, {
+        env: { ...env, ...(candidate.env || {}) },
+        timeoutMs: candidate.timeoutMs,
+      });
       if (fs.existsSync(target) && fs.statSync(target).size > 0) return;
-      errors.push(`${candidate.bin}: output file missing`);
+      errors.push(`${candidate.name || candidate.bin}: output file missing`);
     } catch (err) {
-      errors.push(`${candidate.bin}: ${String(err?.message || err)}`);
+      errors.push(`${candidate.name || candidate.bin}: ${String(err?.message || err)}`);
     }
   }
 
-  throw new Error(`Linux screenshot failed. ${errors.join(" | ")}`);
+  throw new Error(formatLinuxScreenshotFailure(errors));
 }
 
 async function captureScreenshotsWithFallback(outputDir, prefix = "screenshot") {
   try {
     return await captureAllScreenshots(outputDir, prefix);
   } catch (err) {
+    if (process.platform !== "win32") {
+      throw err;
+    }
     const msg = redactError(err?.message || err);
     log(`captureAllScreenshots failed (${msg}); falling back to primary display.`);
     const dir = String(outputDir || "").trim();
@@ -11158,8 +12138,7 @@ function describeOpenMeteoWeatherCode(rawCode) {
   if (code === 77) return "Snow grains";
   if ([80, 81, 82].includes(code)) return "Rain showers";
   if ([85, 86].includes(code)) return "Snow showers";
-  if (code === 95) return "Thunderstorm";
-  if (code === 96 || code === 99) return "Thunderstorm with hail";
+  if (code === 95 || code === 96 || code === 99) return "Thunderstorm";
   return "Unknown conditions";
 }
 
@@ -11320,6 +12299,160 @@ function formatMm(value) {
   return `${rounded % 1 === 0 ? Math.trunc(rounded) : rounded} mm`;
 }
 
+const CWA_TAIWAN_COUNTIES = [
+  { id: "10017", name: "Keelung City", lat: 25.128, lon: 121.741, aliases: ["keelung", "keelung city"] },
+  { id: "63", name: "Taipei City", lat: 25.037, lon: 121.565, aliases: ["taipei", "taipei city"] },
+  { id: "65", name: "New Taipei City", lat: 25.012, lon: 121.465, aliases: ["new taipei", "new taipei city"] },
+  { id: "68", name: "Taoyuan City", lat: 24.993, lon: 121.301, aliases: ["taoyuan", "taoyuan city"] },
+  { id: "10018", name: "Hsinchu City", lat: 24.813, lon: 120.967, aliases: ["hsinchu city"] },
+  { id: "10004", name: "Hsinchu County", lat: 24.839, lon: 121.018, aliases: ["hsinchu county"] },
+  { id: "10005", name: "Miaoli County", lat: 24.56, lon: 120.821, aliases: ["miaoli", "miaoli county"] },
+  { id: "66", name: "Taichung City", lat: 24.147, lon: 120.674, aliases: ["taichung", "taichung city"] },
+  { id: "10007", name: "Changhua County", lat: 24.075, lon: 120.544, aliases: ["changhua", "changhua county"] },
+  { id: "10008", name: "Nantou County", lat: 23.96, lon: 120.971, aliases: ["nantou", "nantou county"] },
+  { id: "10009", name: "Yunlin County", lat: 23.709, lon: 120.431, aliases: ["yunlin", "yunlin county"] },
+  { id: "10020", name: "Chiayi City", lat: 23.48, lon: 120.449, aliases: ["chiayi city"] },
+  { id: "10010", name: "Chiayi County", lat: 23.451, lon: 120.255, aliases: ["chiayi county"] },
+  { id: "67", name: "Tainan City", lat: 22.999, lon: 120.227, aliases: ["tainan", "tainan city"] },
+  { id: "64", name: "Kaohsiung City", lat: 22.627, lon: 120.301, aliases: ["kaohsiung", "kaohsiung city"] },
+  { id: "10013", name: "Pingtung County", lat: 22.551, lon: 120.549, aliases: ["pingtung", "pingtung county"] },
+  { id: "10002", name: "Yilan County", lat: 24.702, lon: 121.738, aliases: ["yilan", "yilan county"] },
+  { id: "10015", name: "Hualien County", lat: 23.991, lon: 121.601, aliases: ["hualien", "hualien county"] },
+  { id: "10014", name: "Taitung County", lat: 22.755, lon: 121.15, aliases: ["taitung", "taitung county"] },
+  { id: "10016", name: "Penghu County", lat: 23.571, lon: 119.579, aliases: ["penghu", "penghu county"] },
+  { id: "09020", name: "Kinmen County", lat: 24.432, lon: 118.318, aliases: ["kinmen", "kinmen county"] },
+  { id: "09007", name: "Lienchiang County", lat: 26.16, lon: 119.951, aliases: ["lienchiang", "lienchiang county", "matsu"] },
+];
+
+function normalizeWeatherPlaceName(value) {
+  return String(value || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isRoughlyTaiwanCoordinate(latitude, longitude) {
+  const lat = Number(latitude);
+  const lon = Number(longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return false;
+  return lat >= 21.7 && lat <= 26.4 && lon >= 118.0 && lon <= 122.2;
+}
+
+function distanceSq(latitude, longitude, item) {
+  const lat = Number(latitude);
+  const lon = Number(longitude);
+  return Math.pow(lat - Number(item.lat), 2) + Math.pow(lon - Number(item.lon), 2);
+}
+
+function resolveCwaCountyForLocation(location) {
+  if (!location || typeof location !== "object") return null;
+  const haystack = normalizeWeatherPlaceName([
+    location.name,
+    location.admin1,
+    location.country,
+  ].filter(Boolean).join(" "));
+  for (const county of CWA_TAIWAN_COUNTIES) {
+    const names = [county.name, ...(county.aliases || [])].map(normalizeWeatherPlaceName).filter(Boolean);
+    if (names.some((name) => haystack.includes(name))) return county;
+  }
+
+  const latitude = Number(location.latitude);
+  const longitude = Number(location.longitude);
+  if (!isRoughlyTaiwanCoordinate(latitude, longitude)) return null;
+  return CWA_TAIWAN_COUNTIES
+    .slice()
+    .sort((a, b) => distanceSq(latitude, longitude, a) - distanceSq(latitude, longitude, b))[0] || null;
+}
+
+function parseCwaJavascriptVariable(scriptText, variableName) {
+  const script = String(scriptText || "");
+  const name = String(variableName || "").trim();
+  if (!script || !/^[A-Za-z_$][\w$]*$/.test(name)) return null;
+  const context = Object.create(null);
+  vm.createContext(context);
+  vm.runInContext(`${script}\n;this.__aidolonResult = ${name};`, context, {
+    timeout: 1000,
+    displayErrors: false,
+  });
+  return context.__aidolonResult || null;
+}
+
+function formatCwaIssuedTime(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  return raw.includes("/") ? `${new Date().getFullYear()}/${raw}` : raw;
+}
+
+function cwaPeriodLabel(entry, index) {
+  const type = String(entry?.Type || "").trim().toUpperCase();
+  if (type === "TD") return "Today daytime";
+  if (type === "TN") return "Tonight";
+  if (type === "TM") return "Tomorrow daytime";
+  return index === 0 ? "Next period" : `Period ${index + 1}`;
+}
+
+function buildCwaWeatherBriefing({ county, issuedTime, rows }) {
+  const forecastRows = Array.isArray(rows) ? rows.slice(0, 3) : [];
+  if (!county || forecastRows.length === 0) {
+    throw new Error("CWA forecast response is missing forecast rows.");
+  }
+
+  const issued = formatCwaIssuedTime(issuedTime);
+  const textLines = [
+    fmtBold(`${county.name} Weather`),
+    `Source: Taiwan Central Weather Administration${issued ? `. Issued: ${issued}` : ""}.`,
+  ];
+  const spokenLines = [
+    `${county.name} weather update from Taiwan Central Weather Administration.`,
+  ];
+
+  for (let i = 0; i < forecastRows.length; i += 1) {
+    const row = forecastRows[i] || {};
+    const label = cwaPeriodLabel(row, i);
+    const condition = String(row.Wx || "").trim() || "Forecast unavailable";
+    const low = formatCelsius(row.Temp?.C?.L);
+    const high = formatCelsius(row.Temp?.C?.H);
+    const pop = Number(row.PoP);
+    const pieces = [`${label}: ${condition}.`];
+    if (low && high) pieces.push(`Temperature ${low} to ${high}.`);
+    if (Number.isFinite(pop)) pieces.push(`Rain chance ${Math.max(0, Math.round(pop))}%.`);
+    const line = pieces.join(" ");
+    textLines.push(line);
+    spokenLines.push(line);
+  }
+
+  const firstRange = String(forecastRows[0]?.TimeRange || "").trim();
+  const firstDayMatch = firstRange.match(/^(\d{2})\/(\d{2})-/);
+  const year = new Date().getFullYear();
+  const dayKey = firstDayMatch
+    ? `${year}-${firstDayMatch[1].padStart(2, "0")}-${firstDayMatch[2].padStart(2, "0")}`
+    : "";
+  return {
+    text: textLines.join("\n"),
+    spoken: spokenLines.join(" "),
+    dayKey: isUtcDayKey(dayKey) ? dayKey : "",
+  };
+}
+
+async function fetchCwaTaiwanWeatherBriefing(location, options = {}) {
+  if (!WEATHER_TAIWAN_CWA_ENABLED) return null;
+  const county = resolveCwaCountyForLocation(location);
+  if (!county) return null;
+  const url = `https://www.cwa.gov.tw/Data/js/TableData_36hr_County_E.js?_=${Date.now()}`;
+  const response = await fetchTextUrl(url, {
+    headers: { Accept: "application/javascript,text/javascript,*/*" },
+    timeoutMs: WEATHER_FORECAST_TIMEOUT_MS,
+    signal: options?.signal,
+  });
+  const context = parseCwaJavascriptVariable(response.text, "TableData_36hr");
+  const rows = Array.isArray(context?.[county.id]) ? context[county.id] : [];
+  const issued = parseCwaJavascriptVariable(response.text, "IssuedTime_36hr");
+  return buildCwaWeatherBriefing({ county, issuedTime: issued, rows });
+}
+
 function buildWeatherBriefing(payload, { locationName = "Weather" } = {}) {
   const daily = payload && typeof payload.daily === "object" && payload.daily ? payload.daily : {};
   const dayKeys = Array.isArray(daily.time) ? daily.time : [];
@@ -11370,6 +12503,7 @@ function buildWeatherBriefing(payload, { locationName = "Weather" } = {}) {
 
   const textLines = [
     fmtBold(`${locationLabel} Weather`),
+    "Source: Open-Meteo global model forecast.",
     updatedAt
       ? `Updated: ${updatedAt}${timezone ? ` (${timezone})` : ""}`
       : timezone
@@ -11377,7 +12511,7 @@ function buildWeatherBriefing(payload, { locationName = "Weather" } = {}) {
         : "Timezone: local",
   ];
   const spokenLines = [
-    `${locationLabel} weather update.`,
+    `${locationLabel} weather update from Open-Meteo.`,
   ];
   if (currentTemp) {
     const nowLine = `Now: ${currentCondition}, ${currentTemp}.`;
@@ -11403,6 +12537,12 @@ async function fetchWeatherBriefing(location, options = {}) {
   const longitude = Number(location.longitude);
   if (!isValidWeatherCoordinates(latitude, longitude)) {
     throw new Error("Weather location is invalid.");
+  }
+  try {
+    const cwaBriefing = await fetchCwaTaiwanWeatherBriefing(location, options);
+    if (cwaBriefing) return cwaBriefing;
+  } catch (err) {
+    log(`Taiwan CWA weather forecast failed; falling back to Open-Meteo (${redactError(err?.message || err)}).`);
   }
   const timezone = String(location.timezone || "").trim() || "auto";
   const params = new URLSearchParams({
@@ -12699,7 +13839,9 @@ function getParsedCommandRouter() {
     sendModelPicker,
     VISION_ENABLED,
     getLastImageForChat,
+    getRecentImagesForChat,
     captureScreenshotsWithFallback,
+    OUT_DIR,
     IMAGE_DIR,
     setLastImageForChat,
     pathBasename: path.basename,
@@ -14877,7 +16019,7 @@ async function ensureTtsKeepaliveRunning(pyBin) {
       // Force-killing here causes restart thrash under load and defeats that recovery path.
       return;
     }
-    if (TTS_STREAM_OUTPUT_TO_TERMINAL) process.stderr.write(filteredChunk);
+    if (TTS_STREAM_OUTPUT_TO_TERMINAL) safeTerminalWrite(process.stderr, filteredChunk);
   });
 
   proc.on("error", (err) => {
@@ -15248,7 +16390,7 @@ async function runTtsJob(job, lane) {
         return;
       }
 
-      job.process = child;
+    job.process = child;
 
       const timeoutMs = minPositive([TTS_ENCODE_TIMEOUT_MS, hardTimeoutRemainingMs(job, TTS_HARD_TIMEOUT_MS)]);
       let timeoutForceFinish = null;
@@ -15274,13 +16416,13 @@ async function runTtsJob(job, lane) {
       child.stdout.on("data", (buf) => {
         const chunk = String(buf || "");
         stdout = appendTail(stdout, chunk, 50000);
-        if (TTS_STREAM_OUTPUT_TO_TERMINAL) process.stdout.write(chunk);
+        if (TTS_STREAM_OUTPUT_TO_TERMINAL) safeTerminalWrite(process.stdout, chunk);
         if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
       });
       child.stderr.on("data", (buf) => {
         const chunk = String(buf || "");
         stderr = appendTail(stderr, chunk, 50000);
-        if (TTS_STREAM_OUTPUT_TO_TERMINAL) process.stderr.write(chunk);
+        if (TTS_STREAM_OUTPUT_TO_TERMINAL) safeTerminalWrite(process.stderr, chunk);
         if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
       });
       child.on("error", (err) => {
@@ -15909,13 +17051,13 @@ async function runTtsBatchJob(job, lane) {
       child.stdout.on("data", (buf) => {
         const chunk = String(buf || "");
         stdout = appendTail(stdout, chunk, 50000);
-        if (TTS_STREAM_OUTPUT_TO_TERMINAL) process.stdout.write(chunk);
+        if (TTS_STREAM_OUTPUT_TO_TERMINAL) safeTerminalWrite(process.stdout, chunk);
         if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stdout");
       });
       child.stderr.on("data", (buf) => {
         const chunk = String(buf || "");
         stderr = appendTail(stderr, chunk, 50000);
-        if (TTS_STREAM_OUTPUT_TO_TERMINAL) process.stderr.write(chunk);
+        if (TTS_STREAM_OUTPUT_TO_TERMINAL) safeTerminalWrite(process.stderr, chunk);
         if (typeof job.onProgressChunk === "function") job.onProgressChunk(chunk, "stderr");
       });
       child.on("error", (err) => {
@@ -16173,6 +17315,8 @@ async function runCodexJob(job) {
     }
 
       job.process = child;
+    emitCodexTerminalLine(job, `AIDOLON exec: ${truncateLine([spec.bin, ...spec.args].join(" "), 700)}`);
+    emitCodexTerminalLine(job, `AIDOLON cwd: ${spec.cwd}`);
     if (typeof spec.stdinText === "string") {
       try {
         child.stdin.end(spec.stdinText);
@@ -16231,7 +17375,9 @@ async function runCodexJob(job) {
       let output = "";
       try {
         if (fs.existsSync(job.outputFile)) {
-          output = parseCodexStructuredFinalText(fs.readFileSync(job.outputFile, "utf8").trim());
+          output = parseCodexStructuredFinalText(fs.readFileSync(job.outputFile, "utf8").trim(), {
+            preserveVoiceSections: shouldPreserveStructuredVoiceSections(job),
+          });
         }
       } catch {
         // best effort
@@ -16239,7 +17385,9 @@ async function runCodexJob(job) {
 
       if (!output && job.stdoutTail.trim()) {
         output = spec.jsonEvents
-          ? parseCodexStructuredFinalText(String(job.codexFinalText || job.codexMessageDeltaTail || "").trim())
+          ? parseCodexStructuredFinalText(String(job.codexFinalText || job.codexMessageDeltaTail || "").trim(), {
+            preserveVoiceSections: shouldPreserveStructuredVoiceSections(job),
+          })
           : job.stdoutTail.trim();
       }
       const sessionId = String(job.codexSessionId || "").trim() || extractSessionIdFromText(
@@ -16600,7 +17748,7 @@ async function ensureWhisperKeepaliveRunning() {
   proc.stderr.on("data", (buf) => {
     const chunk = String(buf || "");
     whisperKeepalive.stderrTail = appendTail(whisperKeepalive.stderrTail, chunk, 50000);
-    if (WHISPER_STREAM_OUTPUT_TO_TERMINAL) process.stderr.write(chunk);
+    if (WHISPER_STREAM_OUTPUT_TO_TERMINAL) safeTerminalWrite(process.stderr, chunk);
   });
 
   proc.on("error", (err) => {
@@ -16758,12 +17906,12 @@ async function transcribeAudioWithWhisper(audioPath, { abortSignal, job } = {}) 
     py.stdout.on("data", (buf) => {
       const chunk = String(buf || "");
       stdout = appendTail(stdout, chunk, 20000);
-      if (WHISPER_STREAM_OUTPUT_TO_TERMINAL) process.stdout.write(chunk);
+      if (WHISPER_STREAM_OUTPUT_TO_TERMINAL) safeTerminalWrite(process.stdout, chunk);
     });
     py.stderr.on("data", (buf) => {
       const chunk = String(buf || "");
       stderr = appendTail(stderr, chunk, 20000);
-      if (WHISPER_STREAM_OUTPUT_TO_TERMINAL) process.stderr.write(chunk);
+      if (WHISPER_STREAM_OUTPUT_TO_TERMINAL) safeTerminalWrite(process.stderr, chunk);
     });
     py.on("error", (err) => {
       reject(new Error(`Whisper process error: ${err.message || err}`));
@@ -17450,11 +18598,13 @@ async function handleIncomingMessage(msg) {
   // treat it as a question about the last image (unless they explicitly used a slash command).
   const canAutoUseImageContext = !replyContext || isImageRelatedReplyContext(replyContext);
   if (VISION_ENABLED && canAutoUseImageContext) {
-    const img = getLastImageForChat(chatId);
-    const freshEnough = img && (VISION_AUTO_FOLLOWUP_SEC <= 0 || (Date.now() - Number(img.at || 0)) <= VISION_AUTO_FOLLOWUP_SEC * 1000);
-    if (img && freshEnough) {
+    const recentImages = getRecentImagesForChat(chatId);
+    const newestImageAt = recentImages.reduce((max, img) => Math.max(max, Number(img?.at || 0)), 0);
+    const freshEnough = newestImageAt > 0 &&
+      (VISION_AUTO_FOLLOWUP_SEC <= 0 || (Date.now() - newestImageAt) <= VISION_AUTO_FOLLOWUP_SEC * 1000);
+    if (recentImages.length > 0 && freshEnough) {
       await routeAndEnqueuePrompt(chatId, text, "image-followup", {
-        imagePaths: [img.path],
+        imagePaths: recentImages.map((img) => img.path),
         replyToMessageId,
         replyHintWorkerId,
         replyContext,
@@ -17632,14 +18782,14 @@ process.on("beforeExit", () => {
 
 process.on("uncaughtException", (err) => {
   const message = redactError(err?.stack || err?.message || String(err));
-  console.error(`[fatal] ${message}`);
+  safeTerminalError(`[fatal] ${message}`);
   logSystemEvent(`Fatal uncaught exception: ${message}`, "fatal");
   void shutdown(1, "fatal:uncaught_exception");
 });
 
 process.on("unhandledRejection", (err) => {
   const message = redactError(err?.stack || err?.message || String(err));
-  console.error(`[fatal] ${message}`);
+  safeTerminalError(`[fatal] ${message}`);
   logSystemEvent(`Fatal unhandled rejection: ${message}`, "fatal");
   void shutdown(1, "fatal:unhandled_rejection");
 });
@@ -17659,12 +18809,9 @@ process.on("unhandledRejection", (err) => {
       `Codex policy: full_access=${CODEX_DANGEROUS_FULL_ACCESS}, sandbox=${CODEX_SANDBOX}, approval=${CODEX_APPROVAL_POLICY}, mcp=${CODEX_DISABLE_MCP ? "disabled" : "inherited"}, search=${CODEX_SEARCH_ENABLED ? "enabled" : "default"}`,
     );
     if (TELEGRAM_SET_COMMANDS) {
-      try {
-        await setTelegramCommands();
-        log("Telegram bot commands updated (setMyCommands).");
-      } catch (err) {
-        log(`setMyCommands failed: ${redactError(err?.message || err)}`);
-      }
+      void setTelegramCommands()
+        .then(() => log("Telegram bot commands updated (setMyCommands)."))
+        .catch((err) => log(`Telegram bot command sync failed: ${redactError(err?.message || err)}`));
     }
     if (CODEX_DROPPED_EXTRA_ARGS.length > 0) {
       log(`Ignored unsupported AIDOLON extra args: ${CODEX_DROPPED_EXTRA_ARGS.join(" ")}`);
@@ -17767,7 +18914,7 @@ process.on("unhandledRejection", (err) => {
     await pollLoop();
   } catch (err) {
     const message = redactError(err?.stack || err?.message || err);
-    console.error(`[fatal] ${message}`);
+    safeTerminalError(`[fatal] ${message}`);
     logSystemEvent(`Fatal startup error: ${message}`, "fatal");
     await shutdown(1, "fatal:startup");
   }

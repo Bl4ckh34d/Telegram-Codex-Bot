@@ -35,7 +35,7 @@ This bot is built for local personal use. It long-polls Telegram and runs Codex 
 
 Notes:
 - Windows and Ubuntu Linux are supported runtimes.
-- Desktop screenshot capture works on Windows and Linux. On Ubuntu, install `gnome-screenshot` or another supported capture tool (`grim`, `scrot`, `maim`, or ImageMagick `import`).
+- Desktop screenshot capture works on Windows and Linux. On GNOME Wayland, AIDOLON first uses Mutter ScreenCast plus GStreamer for unattended screenshots. On other Linux desktops, install `gnome-screenshot` or another supported capture tool (`grim`, `scrot`, `maim`, or ImageMagick `import`).
 - Desktop UI automation has Windows and Linux entrypoints.
 - Whisper and TTS are optional and can be disabled in `.env`.
 
@@ -75,6 +75,7 @@ Optional setup scripts can also be run directly:
 ```bash
 ./setup-whisper-venv.sh
 ./setup-tts.sh
+./setup-linux-capture-backend.sh install
 ```
 
 ## Command Reference
@@ -256,8 +257,9 @@ Move behavior notes:
 Linux notes:
 - Required for UI mutation actions: `xdotool`.
 - Required for Linux ADB TV tools: `android-tools-adb`.
-- Recommended optional packages: `wmctrl`, `xclip` or `xsel`, `tesseract-ocr`, and `gnome-screenshot`.
+- Recommended optional packages: `wmctrl`, `xclip` or `xsel`, `tesseract-ocr`, `gnome-screenshot`, and `gstreamer1.0-pipewire`.
 - The Linux `click_text` action needs `tesseract`; without it, OCR calls return a JSON error.
+- GNOME Wayland can block normal screenshot tools and the desktop portal may open an interactive rectangle picker. The bot first uses `tools/linux_mutter_screencast_capture.py`, which captures one frame through Mutter ScreenCast and PipeWire without the picker. The legacy trusted framebuffer backend remains available with `AIDOLON_TRUSTED_CAPTURE_SETUP=1`. Interactive desktop portal screenshots are disabled by default; set `AIDOLON_PORTAL_SCREENSHOT_ENABLED=1` only when you intentionally want the local screenshot dialog.
 - Linux `highlight` is a lightweight cursor-position wait, not a drawn frame.
 - Linux `host` and `telemetry` keep the JSON protocol but do not persist adaptive telemetry yet.
 
@@ -301,7 +303,8 @@ Minimum required:
 High-impact bot settings:
 - `ALLOW_GROUP_CHAT`, `TELEGRAM_ALLOWED_CHAT_IDS`
 - `BOT_REQUIRE_TTY`
-- `TELEGRAM_SET_COMMANDS`, `TELEGRAM_COMMAND_SCOPE`
+- `TELEGRAM_SET_COMMANDS`, `TELEGRAM_COMMAND_SCOPE`, `TELEGRAM_COMMAND_SYNC_TIMEOUT_MS`
+- `TELEGRAM_COMMAND_CLEANUP_CHAT_SCOPES`
 - `STATE_WRITE_DEBOUNCE_MS`, `STATE_WRITE_MAX_DELAY_MS`
 - `CHAT_LOG_FLUSH_INTERVAL_MS`, `CHAT_LOG_BUFFER_MAX_LINES`
 
@@ -311,8 +314,11 @@ Codex execution:
 - `CODEX_REASONING_EFFORT`
 - `CODEX_SANDBOX`, `CODEX_APPROVAL_POLICY`, `CODEX_DANGEROUS_FULL_ACCESS`
 - `CODEX_DISABLE_MCP`, `CODEX_SEARCH_ENABLED`
-- `CODEX_EXEC_JSON`, `CODEX_OUTPUT_SCHEMA_ENABLED`, `CODEX_OUTPUT_SCHEMA_FILE`
+- `CODEX_EXEC_JSON`, `CODEX_REASONING_PROGRESS`, `CODEX_REASONING_PROGRESS_MAX_CHARS`
+- `CODEX_STREAM_OUTPUT_TO_TERMINAL`, `CODEX_TERMINAL_EVENT_AUDIT`, `CODEX_TERMINAL_RAW_JSON`
+- `CODEX_OUTPUT_SCHEMA_ENABLED`, `CODEX_OUTPUT_SCHEMA_FILE`
 - `CODEX_TIMEOUT_MS`
+- `SCREENSHOT_CAPTURE_TIMEOUT_MS`, `SCREENSHOT_TOOL_TIMEOUT_MS`, `SCREENSHOT_UPLOAD_TIMEOUT_MS`
 
 Orchestration:
 - `ORCH_MAX_CODEX_WORKERS`
@@ -371,7 +377,7 @@ Prompts:
 ## Native Codex integration
 
 - The bot launches Codex through `codex exec` and passes the configured sandbox and approval policy instead of forcing full bypass.
-- By default the bot adds `--json`, parses Codex JSONL events, and turns tool calls, MCP calls, hooks, web search, and turn completion into clean progress updates.
+- By default the bot adds `--json`, parses Codex JSONL events, and turns reasoning deltas, tool calls, MCP calls, hooks, web search, and turn completion into clean progress updates.
 - Normal Telegram replies use `schemas/aidolon-telegram-final.schema.json` with `--output-schema` when enabled; router calls stay plain text.
 - MCP servers and plugin-provided MCP servers from Codex config remain available by default. Set `CODEX_DISABLE_MCP=1` only when you intentionally want an isolated run.
 - Native Codex web search can be enabled with `CODEX_SEARCH_ENABLED=1`; this is separate from shell/network access in the sandbox.
@@ -398,6 +404,8 @@ This bot can run Codex with broad machine access depending on your config. Run i
   - Check firewall/proxy rules if failures persist.
 - Telegram command list not updating
   - Keep `TELEGRAM_SET_COMMANDS=1` and restart.
+  - If boot hangs on `deleteMyCommands`, keep `TELEGRAM_COMMAND_CLEANUP_CHAT_SCOPES=0`; that cleanup is optional.
+  - Command sync is best-effort during startup and uses `TELEGRAM_COMMAND_SYNC_TIMEOUT_MS`.
 - Unexpected CLI argument errors
   - Usually an older bot process is still running. Stop old process and restart.
 

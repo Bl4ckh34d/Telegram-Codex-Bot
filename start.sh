@@ -76,8 +76,10 @@ ensure_uv() {
 
 UV_ENABLED="$(env_value UV_ENABLED || true)"
 WHISPER_ENABLED="$(env_value WHISPER_ENABLED || true)"
+TRUSTED_CAPTURE_SETUP="$(env_value AIDOLON_TRUSTED_CAPTURE_SETUP || true)"
 UV_ENABLED="${UV_ENABLED:-auto}"
 WHISPER_ENABLED="${WHISPER_ENABLED:-1}"
+TRUSTED_CAPTURE_SETUP="${TRUSTED_CAPTURE_SETUP:-0}"
 
 if [[ "$UV_ENABLED" == "1" || "$UV_ENABLED" == "auto" ]]; then
   if ! ensure_uv; then
@@ -100,6 +102,10 @@ fi
 
 if is_enabled "$WHISPER_ENABLED" && [[ -f "./setup-whisper-venv.sh" ]]; then
   ./setup-whisper-venv.sh
+fi
+
+if [[ "$(uname -s 2>/dev/null || true)" == "Linux" ]] && is_enabled "$TRUSTED_CAPTURE_SETUP" && [[ -f "./setup-linux-capture-backend.sh" ]]; then
+  ./setup-linux-capture-backend.sh install
 fi
 
 if [[ -f "./setup-tts.sh" ]]; then
