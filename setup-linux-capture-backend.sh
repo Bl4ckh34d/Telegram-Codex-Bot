@@ -73,6 +73,11 @@ EnvironmentFile=$ENV_FILE
 ExecStart=/usr/bin/python3 $INSTALL_DIR/linux_trusted_capture_backend.py
 Restart=on-failure
 RestartSec=2
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/run
 
 [Install]
 WantedBy=multi-user.target

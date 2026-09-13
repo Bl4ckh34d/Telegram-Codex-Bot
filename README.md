@@ -30,7 +30,7 @@ This bot is built for local personal use. It long-polls Telegram and runs Codex 
 
 ## Requirements
 
-- Node.js 18+
+- Node.js 22.19+
 - Codex CLI installed and authenticated
 
 Notes:
@@ -58,6 +58,8 @@ cp .env.example .env
 ```
 
 `start.sh` mirrors the Windows launcher: it creates `.env` if needed, checks Node/Codex, bootstraps `uv` when allowed, prepares Whisper/TTS virtual environments when those features are enabled, and restarts the bot when `/restart` requests it.
+
+Once Whisper is installed, the launcher reuses the working virtual environment without contacting PyPI. Set `WHISPER_UPGRADE=1` in `.env` when you explicitly want it to check for and install a Whisper upgrade.
 
 Keep the launcher in the foreground shell you want to monitor. Restarts are handled by `node bot.js` exiting with code `75`, after which `start.sh`/`start.cmd` relaunches the bot in the same terminal. Do not restart by spawning a detached background copy of `start.sh`; that hides logs and can leave the shell showing a stale stopped instance.
 
@@ -412,3 +414,32 @@ This bot can run Codex with broad machine access depending on your config. Run i
 ## License
 
 Use the repo license. If you want a specific license added, add one explicitly.
+
+
+## Refaktor vom 7. September 2026
+
+- `/model` übernimmt verfügbare Modelle und Denkstufen aus dem lokalen Codex App Server; Astra unterstützt `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. Bei einem Katalogfehler greift die eingebaute Auswahl.
+- `/recover` listet unerledigte Eingaben/Aufträge und nicht zugestellte Ergebnisse. `/recover <id>` zeigt gespeicherte Jobausgabe, `/recover dismiss <id>` entfernt einen erledigten Wiederherstellungsfall. Aktionen werden nicht automatisch erneut ausgeführt.
+- `/compress` startet native Codex-Kontextkomprimierung. Normale Codex-Jobs laufen weiterhin über die CLI.
+- Gruppenbetrieb verlangt `TELEGRAM_ALLOWED_USER_IDS` zusätzlich zur Chatfreigabe; ohne Wert dient `TELEGRAM_CHAT_ID` als Senderfreigabe. Für Gruppen explizite persönliche Telegram-User-IDs eintragen.
+- Neue Voice-Eingaben stoppen ältere automatische TTS-Antworten. Bereits zugestellte Telegram-Audios bleiben beim Client. `TTS_BATCH_PIPELINED_MAX_CHUNKS=0` erzeugt Mehrteiler abschnittsweise; `TTS_UPGRADE=1` aktualisiert eine vorhandene TTS-Installation ausdrücklich.
+- Benötigt Node >=22.19. Installation: `npm ci --ignore-scripts`. Tests: `npm test` und `python3 -m unittest discover -s tests -p '*_test.py'`.
+
+Laufenden Bot mit `/restart` neu laden. Bei Nutzung des Linux-Capture-Dienstes vorher `./setup-linux-capture-backend.sh install` im Terminal ausführen: Dienst und Client verwenden ein neues Byte-Protokoll.
+
+[Audit und Umsetzungsstand](docs/codebase-audit-2026-09-07.md) · [Sprachmodelle und Gesprächsmodus](docs/voice-modernization-2026-09-07.md)
+
+## Companion Computers
+
+[AIDOLON Companion](companion/README.md) runs desktop tools and commands on a
+paired Windows or Linux laptop while Telegram and speech processing stay on the
+main machine. It has separate launchers and no npm or speech-model dependencies.
+
+### Windows-App-Chat per Telegram weiterführen
+
+Nach Einrichtung der [App-Brücke](companion/README.md) und `/restart`:
+`/app list` → `/app use <Nummer>`. Danach werden normale Text- und
+Sprachnachrichten an denselben Windows-Codex-App-Chat gesendet. Neue sichtbare
+Zwischenstände werden mit `starship-comms` vorgelesen, finale Antworten mit dem
+natürlichen Profil. `/app voice mute` schaltet Sprache aus; `/app off` trennt die
+Verbindung, ohne die Windows-Aufgabe anzuhalten. STT/TTS bleiben auf dem Hauptlaptop.

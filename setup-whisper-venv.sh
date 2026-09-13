@@ -28,8 +28,10 @@ env_value() {
 
 UV_ENABLED="$(env_value UV_ENABLED || true)"
 WHISPER_VENV_PATH="$(env_value WHISPER_VENV_PATH || true)"
+WHISPER_UPGRADE="$(env_value WHISPER_UPGRADE || true)"
 UV_ENABLED="${UV_ENABLED:-auto}"
 WHISPER_VENV_PATH="${WHISPER_VENV_PATH:-.venv}"
+WHISPER_UPGRADE="${WHISPER_UPGRADE:-0}"
 
 VENV_DIR="$(realpath -m "$WHISPER_VENV_PATH")"
 HAS_UV=0
@@ -71,6 +73,14 @@ fi
 
 if ! command -v ffmpeg >/dev/null 2>&1; then
   echo "Warning: ffmpeg not found on PATH. Whisper transcription will fail without ffmpeg." >&2
+fi
+
+if [[ "$WHISPER_UPGRADE" != "1" ]] && "$VENV_DIR/bin/python" -c 'import whisper' >/dev/null 2>&1; then
+  echo "OpenAI Whisper is already installed; skipping network install."
+  echo "Set WHISPER_UPGRADE=1 in .env to check PyPI for an upgrade."
+  echo "Whisper venv setup complete."
+  echo "Python: $VENV_DIR/bin/python"
+  exit 0
 fi
 
 echo "Installing OpenAI Whisper into \"$VENV_DIR\"..."

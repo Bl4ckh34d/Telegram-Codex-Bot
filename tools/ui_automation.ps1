@@ -362,7 +362,32 @@ function Invoke-SafetyGate {
   return @{ mode = $mode; pass = $true }
 }
 
+function Ensure-PerMonitorDpi {
+  if (-not ("Aidolon.DpiNative" -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace Aidolon {
+  public static class DpiNative {
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+  }
+}
+"@
+  }
+  # Set the current thread before WinForms caches monitor bounds or GDI captures.
+  # This keeps screen bounds, cursor coordinates and bitmap pixels in one space.
+  $previous = [Aidolon.DpiNative]::SetThreadDpiAwarenessContext([IntPtr](-4))
+  if ($previous -eq [IntPtr]::Zero) {
+    $previous = [Aidolon.DpiNative]::SetThreadDpiAwarenessContext([IntPtr](-3))
+  }
+  if ($previous -eq [IntPtr]::Zero) {
+    throw "Per-monitor DPI awareness could not be enabled; refusing a scaled/cropped capture."
+  }
+}
+
 function Ensure-UiTypes {
+  Ensure-PerMonitorDpi
   if (-not ("Aidolon.UiNative" -as [type])) {
     Add-Type -TypeDefinition @"
 using System;
@@ -411,6 +436,7 @@ function Ensure-SendKeysTypes {
 }
 
 function Ensure-DrawingTypes {
+  Ensure-PerMonitorDpi
   Add-Type -AssemblyName System.Drawing
   Add-Type -AssemblyName System.Windows.Forms
 }
@@ -970,6 +996,44 @@ function Intersect-Rectangles {
   return [System.Drawing.Rectangle]::new($left, $top, $right - $left, $bottom - $top)
 }
 
+function Test-BlackCapture {
+  param([System.Drawing.Bitmap]$Bitmap)
+  # Sparse sampling avoids copying multi-megapixel images back into PowerShell.
+  $lit = 0
+  for ($y = 0; $y -lt 24; $y++) {
+    for ($x = 0; $x -lt 32; $x++) {
+      $px = [Math]::Min($Bitmap.Width - 1, [int](($x + 0.5) * $Bitmap.Width / 32))
+      $py = [Math]::Min($Bitmap.Height - 1, [int](($y + 0.5) * $Bitmap.Height / 24))
+      $color = $Bitmap.GetPixel($px, $py)
+      if ([Math]::Max($color.R, [Math]::Max($color.G, $color.B)) -gt 12) {
+        $lit++
+        if ($lit -ge 4) { return $false }
+      }
+    }
+  }
+  return $true
+}
+
+function Request-CaptureDisplayWake {
+  if (-not ("Aidolon.CapturePower" -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace Aidolon {
+  public static class CapturePower {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint SetThreadExecutionState(uint flags);
+  }
+}
+"@
+  }
+  # ES_DISPLAY_REQUIRED resets display idle once; no input injection, power-plan
+  # changes, permanent wake lock or attempt to unlock the user's desktop.
+  if ([Aidolon.CapturePower]::SetThreadExecutionState(2) -eq 0) {
+    throw "Windows could not wake the display for capture."
+  }
+}
+
 function Capture-Screen {
   param(
     [System.Windows.Forms.Screen]$Screen,
@@ -979,7 +1043,17 @@ function Capture-Screen {
   $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
   $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
   try {
-    $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+    $displayWakeRequested = $false
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+      $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+      if (-not (Test-BlackCapture -Bitmap $bitmap)) { break }
+      if ($attempt -eq 2) {
+        throw "Screenshot remains black after display wake. The desktop may be locked, disconnected or unavailable; unlock/check the Windows session. No black image was sent."
+      }
+      Request-CaptureDisplayWake
+      $displayWakeRequested = $true
+      Start-Sleep -Milliseconds 900
+    }
     Ensure-ParentDirectory -FilePath $FilePath
     $bitmap.Save($FilePath, [System.Drawing.Imaging.ImageFormat]::Png)
   } finally {
@@ -994,6 +1068,7 @@ function Capture-Screen {
     left = $bounds.Left
     top = $bounds.Top
     primary = $Screen.Primary
+    display_wake_requested = $displayWakeRequested
   }
 }
 

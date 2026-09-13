@@ -96,8 +96,16 @@ if [[ "$UV_ENABLED" == "1" || "$UV_ENABLED" == "auto" ]]; then
 fi
 
 if ! command -v node >/dev/null 2>&1; then
-  echo "Node.js not found in PATH. Install Node.js 18+ and retry." >&2
+  echo "Node.js not found in PATH. Install Node.js 22.19+ and retry." >&2
   exit 1
+fi
+
+if ! node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a>22 || (a===22 && b>=19) ? 0 : 1)'; then
+  echo "Node.js 22.19+ is required." >&2
+  exit 1
+fi
+if [[ ! -d node_modules/undici || ! -d node_modules/acorn ]]; then
+  npm ci --ignore-scripts
 fi
 
 if ! command -v codex >/dev/null 2>&1; then

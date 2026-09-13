@@ -1,0 +1,11 @@
+{
+  "name": "aidolon-companion",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Windows and Linux desktop companion for AIDOLON",
+  "engines": { "node": ">=22.19.0" },
+  "scripts": {
+    "start": "node init.js && node server.js",
+    "test": "node --test server.test.js"
+  }
+}

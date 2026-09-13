@@ -113,6 +113,13 @@ if [[ ! -x "$VENV_PY" ]]; then
   exit 1
 fi
 
+TTS_UPGRADE="${TTS_UPGRADE:-$(env_value TTS_UPGRADE || true)}"
+if ! is_enabled "$TTS_UPGRADE" && "$VENV_PY" -c 'import numpy, onnxruntime; from mira.model import MiraTTS; assert int(numpy.__version__.split(".")[0]) < 2' >/dev/null 2>&1; then
+  echo "MiraTTS is already installed; reusing the environment without package changes."
+  echo "Set TTS_UPGRADE=1 for an explicit upgrade or repair."
+  exit 0
+fi
+
 echo "Installing MiraTTS dependencies into \"$VENV_DIR\"..."
 TORCH_CUDA_PACKAGES=(torch==2.8.0+cu128 torchvision==0.23.0+cu128 torchaudio==2.8.0+cu128)
 TORCH_CPU_PACKAGES=(torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0)
@@ -166,7 +173,6 @@ pip_install "git+https://github.com/ysharma3501/MiraTTS.git"
 
 echo "Using CPU ONNX Runtime for MiraTTS decoder compatibility..."
 pip_uninstall onnxruntime-gpu
-pip_install --upgrade --force-reinstall onnxruntime
-pip_install "numpy<2"
+pip_install --upgrade onnxruntime "numpy<2"
 
 "$VENV_PY" -c "from mira.model import MiraTTS; print('MiraTTS import ok')"

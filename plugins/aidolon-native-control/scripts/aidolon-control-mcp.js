@@ -3,7 +3,6 @@
 
 const fs = require("fs");
 const path = require("path");
-const { spawn } = require("child_process");
 const readline = require("readline");
 
 const MAX_OUTPUT_CHARS = 12000;
@@ -75,11 +74,13 @@ function asStringArray(value) {
 }
 
 function runProcess(command, args, options = {}) {
+  const { spawn, terminateChildTree } = require(path.join(findRepoRoot(), "lib/process_lifecycle.js"));
   const timeoutMs = Number(options.timeoutMs || DEFAULT_TIMEOUT_MS);
   return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let timedOut = false;
     const child = spawn(command, args, {
       cwd: options.cwd || findRepoRoot(),
       windowsHide: true,
@@ -93,16 +94,10 @@ function runProcess(command, args, options = {}) {
       resolve(result);
     };
 
-    const timer = setTimeout(() => {
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        // best effort
-      }
-      finish({
-        ok: false,
-        text: `Timed out after ${Math.round(timeoutMs / 1000)}s.`,
-      });
+    const timer = setTimeout(async () => {
+      timedOut = true;
+      await terminateChildTree(child, { forceAfterMs: 1000 });
+      finish({ ok: false, text: `Timed out after ${Math.round(timeoutMs / 1000)}s.` });
     }, timeoutMs);
 
     child.stdout.on("data", (buf) => {
@@ -115,6 +110,7 @@ function runProcess(command, args, options = {}) {
       finish({ ok: false, text: String(err?.message || err) });
     });
     child.on("close", (code, signal) => {
+      if (timedOut) return;
       const output = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n\n");
       if (code === 0) {
         finish({ ok: true, text: output || "Completed." });

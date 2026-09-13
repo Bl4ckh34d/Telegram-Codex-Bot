@@ -9,6 +9,7 @@ with ffmpeg, and writes screenshots only under the configured output root.
 from __future__ import annotations
 
 import json
+import base64
 import os
 from pathlib import Path
 import signal
@@ -399,6 +400,7 @@ def capture_framebuffer(target: Path) -> dict[str, Any]:
 
 
 def handle_client(conn: socket.socket) -> None:
+    conn.settimeout(10)
     pid, uid, gid = peer_credentials(conn)
     if ALLOWED_UID >= 0 and uid != ALLOWED_UID:
         send_json(conn, {"ok": False, "error": f"unauthorized uid {uid}"})
@@ -416,22 +418,28 @@ def handle_client(conn: socket.socket) -> None:
 
     try:
         request = json.loads(data.decode("utf-8"))
-        target = sanitize_target(request.get("output"))
-        result = capture_framebuffer(target)
-        send_json(conn, {"ok": True, **result, "pid": pid})
+        if request.get("format") != "png-base64":
+            raise ValueError("capture client must request png-base64; update the client")
+        # The privileged service never writes into a caller-controlled directory.
+        # TemporaryDirectory is private to the service; the client owns delivery.
+        with tempfile.TemporaryDirectory(prefix="aidolon-capture-") as temp_dir:
+            target = Path(temp_dir) / "capture.png"
+            result = capture_framebuffer(target)
+            image = target.read_bytes()
+            if len(image) > 32 * 1024 * 1024:
+                raise ValueError("capture exceeds maximum image size")
+            send_json(conn, {"ok": True, "image_base64": base64.b64encode(image).decode("ascii"),
+                             "bytes": len(image), "method": result["method"], "relaxed": result["relaxed"]})
     except Exception as exc:
         send_json(conn, {"ok": False, "error": str(exc)})
 
 
 def main() -> int:
-    if not OUTPUT_ROOT:
-        fail("AIDOLON_CAPTURE_OUTPUT_ROOT is required")
     if ALLOWED_UID < 0:
         fail("AIDOLON_CAPTURE_ALLOWED_UID is required")
     if not discover_drm_devices() and not Path(FB_DEVICE).exists():
         fail(f"no DRM devices or framebuffer device found (fb={FB_DEVICE})")
 
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
     try:
         SOCKET_PATH.unlink()

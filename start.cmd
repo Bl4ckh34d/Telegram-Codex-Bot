@@ -55,6 +55,15 @@ if errorlevel 1 (
   )
 )
 
+node -e "const [a,b]=process.versions.node.split('.').map(Number); process.exit(a>22 || (a===22 && b>=19) ? 0 : 1)"
+if errorlevel 1 (
+  echo Node.js 22.19+ is required.
+  exit /b 1
+)
+if not exist "node_modules\undici" call npm ci --ignore-scripts
+if not exist "node_modules\acorn" call npm ci --ignore-scripts
+if errorlevel 1 exit /b 1
+
 where codex >nul 2>&1
 if errorlevel 1 (
   powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0ensure-codex-path.ps1" >nul 2>&1
@@ -129,4 +138,3 @@ if exist "%D%\uv.exe" (
   set "PATH=%D%;%PATH%"
 )
 exit /b 0
-

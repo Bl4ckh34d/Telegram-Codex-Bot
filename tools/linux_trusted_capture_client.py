@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import base64
+import tempfile
 import os
 from pathlib import Path
 import socket
@@ -99,19 +101,38 @@ def main() -> int:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
                 conn.settimeout(timeout)
                 conn.connect(socket_path)
-                conn.sendall((json.dumps({"output": output}) + "\n").encode("utf-8"))
-                data = b""
-                while not data.endswith(b"\n") and len(data) < 8192:
-                    chunk = conn.recv(1024)
+                conn.sendall((json.dumps({"format": "png-base64"}) + "\n").encode("utf-8"))
+                chunks = []
+                size = 0
+                while size < 45 * 1024 * 1024:
+                    chunk = conn.recv(65536)
                     if not chunk:
                         break
-                    data += chunk
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if chunk.endswith(b"\n"):
+                        break
+                data = b"".join(chunks)
         except Exception as exc:
             print(f"trusted capture backend unavailable: {exc}", file=sys.stderr)
             return 1
 
         try:
             response = json.loads(data.decode("utf-8"))
+            if response.get("ok"):
+                image = base64.b64decode(response["image_base64"], validate=True)
+                if not image.startswith(b"\x89PNG\r\n\x1a\n") or len(image) > 32 * 1024 * 1024:
+                    raise ValueError("invalid PNG capture")
+                output_path = Path(output)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                fd, temp_path = tempfile.mkstemp(prefix=".capture-", dir=output_path.parent)
+                try:
+                    with os.fdopen(fd, "wb") as stream:
+                        stream.write(image)
+                    os.replace(temp_path, output_path)
+                finally:
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
         except Exception as exc:
             print(f"trusted capture backend returned invalid response: {exc}", file=sys.stderr)
             return 1

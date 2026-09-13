@@ -30,6 +30,7 @@ for /f "usebackq eol=# tokens=1* delims==" %%A in (".env") do (
   if /i "!K!"=="TTS_REFERENCE_AUDIO" set "TTS_REFERENCE_AUDIO=!V!"
   if /i "!K!"=="TTS_FFMPEG_BIN" set "TTS_FFMPEG_BIN=!V!"
   if /i "!K!"=="UV_ENABLED" set "UV_ENABLED=!V!"
+  if /i "!K!"=="TTS_UPGRADE" set "TTS_UPGRADE=!V!"
 )
 
 set "DO_TTS="
@@ -116,6 +117,15 @@ if not exist "%VENV_DIR%\\Scripts\\python.exe" (
 
 echo Installing MiraTTS dependencies into "%VENV_DIR%"...
 set "VENV_PY=%VENV_DIR%\\Scripts\\python.exe"
+
+if not "%TTS_UPGRADE%"=="1" (
+  "%VENV_PY%" -c "import numpy, onnxruntime; from mira.model import MiraTTS; assert int(numpy.__version__.split('.')[0]) < 2" >nul 2>&1
+  if not errorlevel 1 (
+    echo MiraTTS is already installed; reusing the environment without package changes.
+    echo Set TTS_UPGRADE=1 for an explicit upgrade or repair.
+    exit /b 0
+  )
+)
 
 set "TORCH_CUDA_PACKAGES=torch==2.8.0+cu128 torchvision==0.23.0+cu128 torchaudio==2.8.0+cu128"
 set "TORCH_CPU_PACKAGES=torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0"

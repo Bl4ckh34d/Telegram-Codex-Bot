@@ -2,12 +2,30 @@
 "use strict";
 
 const fs = require("fs");
+const { splitRoute, conversationKey, routeBody, routeMultipart } = require("./lib/telegram_topics");
+const { addVoiceAtmosphere } = require("./lib/voice_atmosphere");
+const { createVoiceFxVariation } = require("./lib/voice_fx_variation");
+const { normalizeSpeechSymbols, speechPlaceholders } = require("./lib/tts_pronunciation");
+const { detectTtsLanguage, resolveTtsModel, createSerialTtsRequests } = require("./lib/tts_language");
+const serializeTtsRequest = createSerialTtsRequests();
 const dns = require("dns");
 const os = require("os");
 const path = require("path");
-const vm = require("vm");
-const { Agent: UndiciAgent } = require("undici");
-const { spawn, spawnSync } = require("child_process");
+const { readDataVariable } = require("./lib/data_literals");
+const { byteLimit, readTextLimited } = require("./lib/network_limits");
+const { Agent: UndiciAgent, fetch: telegramFetch, FormData } = require("undici");
+const { spawnSync } = require("child_process");
+const { spawn, terminateChildTree, terminateAllChildren } = require("./lib/process_lifecycle");
+const { readAllowedFile } = require("./lib/file_access");
+const { createJobJournal } = require("./lib/job_journal");
+const { createTelegramInbox } = require("./lib/telegram_inbox");
+const { withCodexRpc } = require("./lib/codex_rpc");
+const { createConversationState } = require("./lib/conversation_state");
+const conversationState = createConversationState();
+const { createAppTransport } = require("./lib/companion_app_transport");
+const { createAppScreenshotSender } = require("./lib/companion_screenshot");
+const { createAppChatBridge } = require("./lib/app_chat_bridge");
+let appChatBridge = null;
 const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
 
@@ -22,14 +40,6 @@ const TTS_DIR = path.join(RUNTIME_DIR, "tts");
 const STATE_PATH = path.join(RUNTIME_DIR, "state.json");
 const LOCK_PATH = path.join(RUNTIME_DIR, "bot.lock");
 const CHAT_LOG_PATH = path.join(RUNTIME_DIR, "chat.log");
-const WORKFLOW_CATALOG_PATH = (() => {
-  const configured = String(process.env.ORCH_WORKFLOW_CATALOG_PATH || "").trim();
-  if (configured) {
-    return path.isAbsolute(configured) ? configured : path.resolve(ROOT, configured);
-  }
-  const baseDir = String(process.env.APPDATA || "").trim() || path.join(os.homedir(), ".aidolon");
-  return path.join(baseDir, "workflow-catalog.json");
-})();
 const WORLDMONITOR_NATIVE_STORE_PATH = path.join(RUNTIME_DIR, "worldmonitor-native-store.json");
 const WORLDMONITOR_NATIVE_SIGNALS_PATH = path.join(RUNTIME_DIR, "worldmonitor-native-signals.json");
 const RESTART_REASON_PATH = path.join(RUNTIME_DIR, "restart.reason");
@@ -494,50 +504,6 @@ function redactError(text) {
   return String(text || "").replace(/bot\d+:[A-Za-z0-9_-]+/g, "bot<redacted>");
 }
 
-function terminateChildTree(child, { forceAfterMs = 2000 } = {}) {
-  const pid = Number(child?.pid || 0);
-  if (!Number.isFinite(pid) || pid <= 0) return;
-
-  if (process.platform === "win32") {
-    // On Windows, killing a shell-wrapped process often leaves the actual worker alive.
-    // taskkill /T terminates the whole process tree.
-    try {
-      spawn("taskkill.exe", ["/PID", String(pid), "/T"], {
-        windowsHide: true,
-        stdio: "ignore",
-      });
-    } catch {
-      // best effort
-    }
-
-    setTimeout(() => {
-      try {
-        spawn("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
-          windowsHide: true,
-          stdio: "ignore",
-        });
-      } catch {
-        // best effort
-      }
-    }, Math.max(0, Number(forceAfterMs) || 0));
-    return;
-  }
-
-  try {
-    child.kill("SIGTERM");
-  } catch {
-    // best effort
-  }
-
-  setTimeout(() => {
-    try {
-      child.kill("SIGKILL");
-    } catch {
-      // best effort
-    }
-  }, Math.max(0, Number(forceAfterMs) || 0));
-}
-
 function nowIso(input = null) {
   const d = input instanceof Date ? input : (input === null ? new Date() : new Date(input));
   if (!Number.isFinite(d.getTime())) return nowIso(Date.now());
@@ -719,7 +685,9 @@ function createTelegramFetchDispatcher(resultOrder) {
     connect: {
       lookup(hostname, options, callback) {
         dns.lookup(hostname, { family, all: false }, (err, address, resolvedFamily) => {
-          callback(err, err ? undefined : [{ address, family: resolvedFamily }]);
+          if (err) return callback(err);
+          if (options?.all) callback(null, [{ address, family: resolvedFamily }]);
+          else callback(null, address, resolvedFamily);
         });
       },
     },
@@ -727,6 +695,15 @@ function createTelegramFetchDispatcher(resultOrder) {
 }
 
 loadEnv(ENV_PATH);
+const WORKFLOW_CATALOG_PATH = (() => {
+  const configured = String(process.env.ORCH_WORKFLOW_CATALOG_PATH || "").trim();
+  if (configured) {
+    return path.isAbsolute(configured) ? configured : path.resolve(ROOT, configured);
+  }
+  const baseDir = String(process.env.APPDATA || "").trim() || path.join(os.homedir(), ".aidolon");
+  return path.join(baseDir, "workflow-catalog.json");
+})();
+
 const requiredStartupDirsReady = [
   ensureDirSafe(RUNTIME_DIR, { label: "runtime", required: true }),
   ensureDirSafe(OUT_DIR, { label: "output", required: true }),
@@ -743,6 +720,7 @@ const TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || "").trim();
 const PRIMARY_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || "").trim();
 const EXTRA_ALLOWED = parseList(process.env.TELEGRAM_ALLOWED_CHAT_IDS);
 const ALLOWED_CHAT_IDS = new Set([PRIMARY_CHAT_ID, ...EXTRA_ALLOWED].filter(Boolean));
+const ALLOWED_USER_IDS = new Set(parseList(process.env.TELEGRAM_ALLOWED_USER_IDS || PRIMARY_CHAT_ID).filter(id => /^\d+$/.test(id)));
 const ALLOW_GROUP_CHAT = toBool(process.env.ALLOW_GROUP_CHAT, false);
 const POLL_TIMEOUT_SEC = toInt(process.env.TELEGRAM_POLL_TIMEOUT_SEC, 20);
 // Telegram API request timeouts: 0 disables abort-based timeouts entirely.
@@ -805,13 +783,14 @@ function normalizeCodexModelName(value) {
   return model;
 }
 
-const CODEX_MODEL = normalizeCodexModelName(process.env.CODEX_MODEL || "gpt-5.4");
+const CODEX_MODEL = normalizeCodexModelName(process.env.CODEX_MODEL || "gpt-5.5");
 const CODEX_MODEL_CHOICES = parseList(process.env.CODEX_MODEL_CHOICES || "")
   .map((model) => normalizeCodexModelName(model))
   .filter(Boolean);
-const CODEX_REASONING_EFFORT = String(process.env.CODEX_REASONING_EFFORT || "xhigh").trim();
+const CODEX_REASONING_EFFORT = String(process.env.CODEX_REASONING_EFFORT || "medium").trim();
 const CODEX_REASONING_EFFORT_CHOICES = parseList(process.env.CODEX_REASONING_EFFORT_CHOICES || "");
 const CODEX_DEFAULT_MODEL_CHOICES = Object.freeze([
+  "gpt-6-astra",
   "gpt-5.5",
   "gpt-5.4",
   "gpt-5.3-codex",
@@ -819,6 +798,7 @@ const CODEX_DEFAULT_MODEL_CHOICES = Object.freeze([
   "gpt-5.1-codex",
 ]);
 const CODEX_REASONING_EFFORTS_BY_MODEL = Object.freeze({
+  "gpt-6-astra": ["low", "medium", "high", "xhigh", "max", "ultra"],
   "gpt-5.5": ["low", "medium", "high", "xhigh"],
   "gpt-5.4": ["low", "medium", "high", "xhigh"],
   "gpt-5.3-codex": ["low", "medium", "high", "xhigh"],
@@ -924,13 +904,15 @@ const TTS_UPLOAD_RETRIES = toInt(process.env.TTS_UPLOAD_RETRIES, 0, 0, 10);
 const TTS_BATCH_PIPELINED = toBool(process.env.TTS_BATCH_PIPELINED, true);
 // When pipelined batch mode is enabled, use it only up to this many chunks.
 // 0 = always use pipelined mode; larger values switch long replies to all-at-once keepalive batch synthesis.
-const TTS_BATCH_PIPELINED_MAX_CHUNKS = toInt(process.env.TTS_BATCH_PIPELINED_MAX_CHUNKS, 2, 0, 1000);
+const TTS_BATCH_PIPELINED_MAX_CHUNKS = toInt(process.env.TTS_BATCH_PIPELINED_MAX_CHUNKS, 0, 0, 1000);
 const TTS_RETRY_BASE_DELAY_MS = toInt(process.env.TTS_RETRY_BASE_DELAY_MS, 300, 50, 30_000);
 const TTS_RETRY_MAX_DELAY_MS = toInt(process.env.TTS_RETRY_MAX_DELAY_MS, 4000, 100, 120_000);
 const KEEPALIVE_RESTART_BASE_DELAY_MS = toInt(process.env.KEEPALIVE_RESTART_BASE_DELAY_MS, 1500, 200, 120_000);
 const KEEPALIVE_RESTART_MAX_DELAY_MS = toInt(process.env.KEEPALIVE_RESTART_MAX_DELAY_MS, 30_000, 1000, 300_000);
 const TTS_VENV_PATH = resolveMaybeRelativePath(process.env.TTS_VENV_PATH || path.join(ROOT, ".tts-venv"));
 const TTS_MODEL = String(process.env.TTS_MODEL || "").trim();
+const TTS_MODEL_DE = String(process.env.TTS_MODEL_DE || "").trim();
+const TTS_DEFAULT_LANGUAGE = String(process.env.TTS_DEFAULT_LANGUAGE || "en").trim();
 const TTS_REFERENCE_AUDIO = resolveMaybeRelativePath(process.env.TTS_REFERENCE_AUDIO || "");
 const TTS_REFERENCE_AUDIO_ZH_TW = resolveMaybeRelativePath(process.env.TTS_REFERENCE_AUDIO_ZH_TW || "");
 const TTS_SAMPLE_RATE = toInt(process.env.TTS_SAMPLE_RATE, 48000);
@@ -1037,7 +1019,7 @@ const PROGRESS_UPDATE_INTERVAL_SEC = toInt(process.env.PROGRESS_UPDATE_INTERVAL_
 const ORCH_MAX_CODEX_WORKERS = toInt(process.env.ORCH_MAX_CODEX_WORKERS, 5, 1, 20);
 const ORCH_ROUTER_ENABLED = toBool(process.env.ORCH_ROUTER_ENABLED, true);
 const ORCH_ROUTER_MAX_CONCURRENCY = toInt(process.env.ORCH_ROUTER_MAX_CONCURRENCY, 2, 1, 10);
-const ORCH_ROUTER_TIMEOUT_MS = toTimeoutMs(process.env.ORCH_ROUTER_TIMEOUT_MS, 0, 0, MAX_TIMEOUT_MS);
+const ORCH_ROUTER_TIMEOUT_MS = toTimeoutMs(process.env.ORCH_ROUTER_TIMEOUT_MS, 20_000, 0, MAX_TIMEOUT_MS) || 20_000;
 const ORCH_ROUTER_MODEL = String(process.env.ORCH_ROUTER_MODEL || "").trim();
 const ORCH_ROUTER_REASONING_EFFORT = String(process.env.ORCH_ROUTER_REASONING_EFFORT || "low").trim();
 const ORCH_SPLIT_ENABLED = toBool(process.env.ORCH_SPLIT_ENABLED, true);
@@ -1891,6 +1873,8 @@ let codexTopCommandsCache = {
   commands: [],
 };
 const ttsKeepalive = {
+  model: TTS_MODEL,
+  stopping: null,
   proc: null,
   startPromise: null,
   startTimer: null,
@@ -2780,6 +2764,7 @@ function clearSessionForChatWorker(chatId, workerId) {
   const key = String(chatId || "").trim();
   const wid = String(workerId || "").trim();
   if (!key || !wid) return;
+  conversationState.resetSession(key, wid);
   const prev = orchSessionByChatWorker[key];
   if (!prev || typeof prev !== "object") return;
   if (!(wid in prev)) return;
@@ -2792,6 +2777,7 @@ function clearSessionForChatWorker(chatId, workerId) {
 function clearAllSessionsForChat(chatId) {
   const key = String(chatId || "").trim();
   if (!key) return;
+  for (const worker of listCodexWorkers()) conversationState.resetSession(key, worker.id);
   if (!(key in orchSessionByChatWorker)) return;
   delete orchSessionByChatWorker[key];
   persistState();
@@ -2933,7 +2919,10 @@ function initOrchLanes() {
   orchLaneRegistryRuntime.initOrchLanes();
 }
 
+const jobJournal = createJobJournal(path.join(RUNTIME_DIR, "jobs.json"));
+
 const orchQueueRuntime = createOrchQueueRuntime({
+  jobJournal,
   lanes,
   fs,
   RESTART_REASON_PATH,
@@ -2959,6 +2948,8 @@ const orchQueueRuntime = createOrchQueueRuntime({
 });
 
 const orchLaneRuntime = createOrchLaneRuntime({
+  jobJournal,
+  conversationState,
   path,
   OUT_DIR,
   ORCH_GENERAL_WORKER_ID,
@@ -3094,6 +3085,7 @@ async function maybeTriggerPendingRestart(reason = "") {
 }
 
 async function requestRestartWhenIdle(chatId, { forceNow = false } = {}) {
+  if (telegramInbox.counts() > 0 || backgroundCommandChainByChat.size > 0) { await sendMessage(chatId, "Restart blocked: incoming messages are still being processed."); return; }
   return await orchQueueRuntime.requestRestartWhenIdle(chatId, { forceNow });
 }
 
@@ -3402,6 +3394,7 @@ function clearRedditDigestCursorForChat(chatId) {
 
 function setActiveSessionForChat(chatId, sessionId, workerId = "") {
   const wid = String(workerId || "").trim() || getActiveWorkerForChat(chatId);
+  conversationState.resetSession(chatId, wid);
   setSessionForChatWorker(chatId, wid, sessionId);
 }
 
@@ -3822,29 +3815,11 @@ function firstStringAtPaths(obj, paths) {
   return "";
 }
 
-function findSessionIdDeep(value, depth = 0) {
-  if (depth > 5 || value === null || value === undefined) return "";
-  if (typeof value === "string") {
-    return extractSessionIdFromText(value);
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const found = findSessionIdDeep(item, depth + 1);
-      if (found) return found;
-    }
-    return "";
-  }
-  if (typeof value !== "object") return "";
-  for (const [key, item] of Object.entries(value)) {
-    if (/(^|_)(thread|session|conversation)_?id$/i.test(key) && isSessionId(item)) {
-      return String(item).trim();
-    }
-  }
-  for (const item of Object.values(value)) {
-    const found = findSessionIdDeep(item, depth + 1);
-    if (found) return found;
-  }
-  return "";
+function getCodexSessionIdFromEvent(event, streamName = "stdout") {
+  // Only the outer CLI lifecycle event owns this run's session. Tool output,
+  // nested agent events and model text can contain unrelated machine/thread IDs.
+  if (streamName !== "stdout" || !event || event.type !== "thread.started") return "";
+  return isSessionId(event.thread_id) ? String(event.thread_id).trim() : "";
 }
 
 function normalizeCodexEventType(raw) {
@@ -4308,9 +4283,7 @@ function formatCodexJsonEventProgress(type, payload) {
     return "";
   }
   if (type === "turn_complete" || type === "turn_completed" || type === "task_complete") {
-    const usage = p.usage || p.token_usage || p.total_token_usage || {};
-    const total = Number(usage.total_tokens || usage.total || 0);
-    return total > 0 ? `AIDOLON: turn completed (${total} tokens)` : "AIDOLON: turn completed";
+    return "";
   }
   if (type === "turn_aborted") {
     return `AIDOLON: turn aborted${p.reason ? ` (${oneLine(p.reason)})` : ""}`;
@@ -4436,10 +4409,11 @@ function ingestCodexJsonLine(job, line, streamName = "stdout") {
     return;
   }
 
-  const sessionId = findSessionIdDeep(parsed);
-  if (sessionId) job.codexSessionId = sessionId;
+  const sessionId = getCodexSessionIdFromEvent(parsed, streamName);
+  if (sessionId && !job.codexSessionId) job.codexSessionId = sessionId;
 
   const { type, payload } = extractCodexEventPayload(parsed);
+  if (/^(turn|task)_started$/.test(type)) job.codexTurnStarted = true;
   rememberCodexAuditCall(job, type, payload);
   emitCodexTerminalAudit(job, type, payload, parsed, streamName);
   appendCodexMessageDelta(job, type, payload);
@@ -4519,9 +4493,29 @@ function parseCodexStructuredFinalText(text, options = {}) {
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return raw;
 
-  const main = String(parsed.text || parsed.final || parsed.message || "").trim();
-  const spoken = String(parsed.spoken || "").trim();
-  const textOnly = String(parsed.text_only || parsed.textOnly || "").trim();
+  let main = String(parsed.text || parsed.final || parsed.message || "").trim();
+  let spoken = String(parsed.spoken || "").trim();
+  let textOnly = String(parsed.text_only || parsed.textOnly || "").trim();
+
+  // Some callers incorrectly pack the voice envelope into `text` instead of the
+  // dedicated `spoken` / `text_only` fields. Normalize that so text replies do
+  // not leak the section labels back to Telegram.
+  if (main && (!spoken || !textOnly)) {
+    const embeddedVoice = splitVoiceReplyParts(main);
+    const embeddedSpoken = String(embeddedVoice?.spoken || "").trim();
+    const embeddedTextOnly = String(embeddedVoice?.textOnly || "").trim();
+    const hasEmbeddedMarkers = Boolean(embeddedTextOnly) || /^\s*SPOKEN\s*:/i.test(main);
+    if (hasEmbeddedMarkers) {
+      if (!spoken && embeddedSpoken) spoken = embeddedSpoken;
+      if (!textOnly && embeddedTextOnly) textOnly = embeddedTextOnly;
+      if (!preserveVoiceSections && spoken) {
+        main = spoken;
+      } else if (!preserveVoiceSections && textOnly) {
+        main = "";
+      }
+    }
+  }
+
   const sections = [];
   if (spoken && preserveVoiceSections) {
     sections.push(`SPOKEN:\n${spoken}`);
@@ -4540,6 +4534,7 @@ function parseCodexStructuredFinalText(text, options = {}) {
 }
 
 function shouldUseCodexOutputSchema(job) {
+  if (job?.omitOutputSchema === true) return false;
   if (!CODEX_OUTPUT_SCHEMA_ENABLED) return false;
   if (!CODEX_OUTPUT_SCHEMA_FILE || !fs.existsSync(CODEX_OUTPUT_SCHEMA_FILE)) return false;
   const style = String(job?.replyStyle || "").trim().toLowerCase();
@@ -4978,6 +4973,7 @@ function isOwnAbortTimeout(controller, signal) {
 }
 
 async function telegramApi(method, { query = "", body = null, timeoutMs = TELEGRAM_API_TIMEOUT_MS, signal } = {}) {
+  body = routeBody(method, body);
   const url = `https://api.telegram.org/bot${TOKEN}/${method}${query ? `?${query}` : ""}`;
 
   const controller = new AbortController();
@@ -4986,7 +4982,7 @@ async function telegramApi(method, { query = "", body = null, timeoutMs = TELEGR
   const timer = useTimeout ? setTimeout(() => controller.abort(), ms) : null;
   const combined = combineAbortSignals([controller.signal, signal]);
   try {
-    const res = await fetch(url, {
+    const res = await telegramFetch(url, {
       method: body ? "POST" : "GET",
       headers: body ? { "Content-Type": "application/json" } : undefined,
       body: body ? JSON.stringify(body) : undefined,
@@ -5014,6 +5010,7 @@ async function telegramApi(method, { query = "", body = null, timeoutMs = TELEGR
 }
 
 async function telegramApiMultipart(method, formData, timeoutMs = TELEGRAM_UPLOAD_TIMEOUT_MS, { signal } = {}) {
+  routeMultipart(method, formData);
   const url = `https://api.telegram.org/bot${TOKEN}/${method}`;
   const controller = new AbortController();
   const ms = Number(timeoutMs);
@@ -5021,7 +5018,7 @@ async function telegramApiMultipart(method, formData, timeoutMs = TELEGRAM_UPLOA
   const timer = useTimeout ? setTimeout(() => controller.abort(), ms) : null;
   const combined = combineAbortSignals([controller.signal, signal]);
   try {
-    const res = await fetch(url, {
+    const res = await telegramFetch(url, {
       method: "POST",
       body: formData,
       signal: combined.signal,
@@ -5621,6 +5618,8 @@ function getTelegramCommandList() {
     { command: "voice", description: "pick/set live TTS voice preset" },
     { command: "tts", description: "speak text as a Telegram voice message" },
     { command: "abtest", description: "A/B test all voice presets" },
+    { command: "app", description: "connect a Windows Codex app chat with Telegram" },
+    { command: "recover", description: "inspect unfinished work and undelivered results" },
     { command: "restart", description: "restart only when all workers are idle" },
   ];
 }
@@ -5809,16 +5808,9 @@ async function sendPhoto(chatId, filePath, options = {}) {
   const timeoutMs = Number.isFinite(options.timeoutMs) ? Number(options.timeoutMs) : TELEGRAM_UPLOAD_TIMEOUT_MS;
   const signal = options.signal;
   const fileName = path.basename(filePath) || "image.png";
-  assertReadableUploadFile(filePath);
-  let blob;
-  try {
-    blob = await fs.openAsBlob(filePath);
-    // Ensure a stable content-type for Telegram uploads.
-    blob = new Blob([blob], { type: "image/png" });
-  } catch {
-    const imageBytes = fs.readFileSync(filePath);
-    blob = new Blob([imageBytes], { type: "image/png" });
-  }
+  const blob = options.fileBytes
+    ? new Blob([options.fileBytes], { type: "image/png" })
+    : new Blob([fs.readFileSync(filePath)], { type: "image/png" });
 
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
@@ -5933,17 +5925,9 @@ async function sendDocument(chatId, filePath, options = {}) {
     ? Number(options.timeoutMs)
     : ATTACH_UPLOAD_TIMEOUT_MS;
   const signal = options.signal;
-  assertReadableUploadFile(filePath);
-
-  let blob;
-  try {
-    blob = await fs.openAsBlob(filePath);
-    // Telegram infers type from file name; keep a stable binary content-type.
-    blob = new Blob([blob], { type: "application/octet-stream" });
-  } catch {
-    const bytes = fs.readFileSync(filePath);
-    blob = new Blob([bytes], { type: "application/octet-stream" });
-  }
+  const blob = options.fileBytes
+    ? new Blob([options.fileBytes], { type: "application/octet-stream" })
+    : new Blob([fs.readFileSync(filePath)], { type: "application/octet-stream" });
 
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
@@ -6828,6 +6812,9 @@ const BACKGROUND_LOCAL_COMMANDS = new Set([
   // in-order command responses instead of delayed background output.
   // /news can take longer when a feed refresh runs, so process it in background.
   "/news",
+  "/model",
+  "/compress",
+  "/resume",
 ]);
 
 function shouldRunCommandInBackground(parsed) {
@@ -6889,15 +6876,15 @@ async function sendHelp(chatId) {
     "- /newsreport [force|raw] - WorldMonitor AI check (global + Taiwan)",
     "- Say \"give me the news\" - runs the same /newsreport check flow",
     "- /newsstatus - show WorldMonitor monitor state and last alerts",
-    "- /cancel - stop current AIDOLON run",
+    "- /cancel or /stop - stop current AIDOLON run",
     "- /clear - clear queued prompts",
     "- /prune - prune runtime artifacts (keeps chat context and chat log)",
     "- /wipe - wipe runtime artifacts and reset this chat context (keeps chat log)",
     "",
     fmtBold("CLI flow"),
     "- /cmd <args> - stage a raw AIDOLON CLI command",
-    "- /confirm - run staged /cmd command",
-    "- /reject - cancel staged /cmd command",
+    "- /confirm or /run - run staged /cmd command",
+    "- /reject, /deny or /cancelcmd - cancel staged /cmd command",
     "",
     fmtBold("Workspaces"),
     "- /spawn <path> [title] - create a new repo workspace",
@@ -6908,6 +6895,23 @@ async function sendHelp(chatId) {
     "- /resume <session_id> [text] - resume a session",
     "- /new - clear active resumed session",
     "- /compress [hint] - summarize/compress active session context",
+    "",
+    fmtBold("Codex app / companion hosts"),
+    "- /app or /app list [host-id] - list app chats grouped by repository",
+    "- /app hosts - list companion computers",
+    "- /app use <number> - connect an app chat from the last list",
+    "- /app status - show the connected chat and output settings",
+    "- /app output [text|voice|both] - choose text, voice or both (alias: /app mode)",
+    "- /app voice [preset|mute] - choose the voice for intermediate replies",
+    "- /app topics [Host-ID] - create separate group topics for Codex chats (repeat to add new chats)",
+    "- /app topic <number> - create a topic for one chat from /app list",
+    "- /app screenshots [on|off] - current companion screenshot at each intermediate reply",
+    "- /app off - disconnect; the app keeps working",
+    "",
+    fmtBold("Recovery"),
+    "- /recover - list unfinished work and undelivered results",
+    "- /recover <id> - inspect a saved result without rerunning actions",
+    "- /recover dismiss <id> - dismiss a recovery record",
     "",
     fmtBold("Media"),
     "- /screenshot - capture and send screenshot(s) (all monitors when available)",
@@ -6923,7 +6927,8 @@ async function sendHelp(chatId) {
     "- /codex or /commands - show AIDOLON command menu",
     "- /model - pick the model + reasoning effort for this chat",
     "- /restart - restart only when all workers are idle and queue is empty",
-    "- /help - show this help",
+    "- /start - reset local sessions, select the general workspace and show help",
+    "- /help - show this help without resetting sessions",
   ];
   await sendMessage(chatId, lines.join("\n"));
 }
@@ -7278,7 +7283,10 @@ function parseNaturalSafeCommandIntent(text) {
     consider("/help", 0.85);
   }
 
-  if (/^(?:status|bot status|system status|worker status|current status)$/.test(candidate)) {
+  if (/^(?:status|status check|bot status|system status|worker status|current status)$/.test(candidate)) {
+    consider("/status", 0.97);
+  }
+  if (/^(?:bitte\s+)?(?:gib|zeig|zeige)\s+mir\s+(?:bitte\s+)?(?:mal\s+)?(?:den\s+)?(?:aktuellen\s+)?status(?:\s*check)?(?:\s+bitte)?$/.test(candidate)) {
     consider("/status", 0.97);
   }
   if (/^(?:show|check|get|display)\s+(?:me\s+)?(?:the\s+)?(?:bot\s+|system\s+|worker\s+)?status$/.test(candidate)) {
@@ -7665,7 +7673,7 @@ async function fetchTextUrl(url, { headers = {}, timeoutMs = 0, signal } = {}) {
       headers,
       signal: combined.signal,
     });
-    const text = await res.text().catch(() => "");
+    const text = await readTextLimited(res);
     if (!res.ok) {
       throw new Error(`${res.status} ${String(res.statusText || "request failed").trim()}`.trim());
     }
@@ -12372,16 +12380,7 @@ function resolveCwaCountyForLocation(location) {
 }
 
 function parseCwaJavascriptVariable(scriptText, variableName) {
-  const script = String(scriptText || "");
-  const name = String(variableName || "").trim();
-  if (!script || !/^[A-Za-z_$][\w$]*$/.test(name)) return null;
-  const context = Object.create(null);
-  vm.createContext(context);
-  vm.runInContext(`${script}\n;this.__aidolonResult = ${name};`, context, {
-    timeout: 1000,
-    displayErrors: false,
-  });
-  return context.__aidolonResult || null;
+  return readDataVariable(String(scriptText || ""), String(variableName || ""));
 }
 
 function formatCwaIssuedTime(value) {
@@ -12592,7 +12591,7 @@ async function promptForWeatherLocationShare(chatId) {
 }
 
 async function handleWeatherLocationMessage(msg) {
-  const chatId = String(msg?.chat?.id || "").trim();
+  const chatId = conversationKey(msg);
   if (!chatId) return false;
   if (!pendingWeatherLocationByChat.has(chatId)) return false;
 
@@ -13138,6 +13137,58 @@ async function sendCapabilities(chatId) {
   await sendMessage(chatId, lines.join("\n"));
 }
 
+let nativeModelCatalog = [];
+let nativeModelCatalogAt = 0;
+let nativeModelCatalogPending = null;
+
+function buildCodexRpcSpec() {
+  if (codexMode.mode === "wsl") {
+    const command = [codexMode.codexPath || "codex", "app-server"].map(shQuote).join(" ");
+    return { bin: "wsl.exe", args: ["-e", "bash", "-lic", command], cwd: ROOT };
+  }
+  return { bin: codexMode.bin, args: ["app-server"], shell: codexMode.shell, cwd: ROOT };
+}
+
+async function refreshNativeModelCatalog() {
+  if (nativeModelCatalogAt && Date.now() - nativeModelCatalogAt < 300_000) return;
+  if (nativeModelCatalogPending) return nativeModelCatalogPending;
+  nativeModelCatalogPending = withCodexRpc(buildCodexRpcSpec(), async ({ request }) => {
+    const entries = [];
+    let cursor;
+    do {
+      const page = await request("model/list", { limit: 100, includeHidden: false, ...(cursor ? { cursor } : {}) });
+      entries.push(...(Array.isArray(page?.data) ? page.data : []));
+      cursor = page?.nextCursor;
+    } while (cursor && entries.length < 500);
+    nativeModelCatalog = entries.filter(x => x && typeof x.model === "string");
+    nativeModelCatalogAt = Date.now();
+  }).catch(err => {
+    nativeModelCatalogAt = Date.now();
+    log(`Model discovery unavailable; retaining fallback catalog: ${redactError(err.message || err)}`);
+  }).finally(() => { nativeModelCatalogPending = null; });
+  return nativeModelCatalogPending;
+}
+
+async function compactCodexSession(chatId, sessionId) {
+  if (listActiveJobsForChat(chatId).some(x => x.job?.kind === "codex")) {
+    await sendMessage(chatId, "Wait for the active Codex task to finish before compacting."); return;
+  }
+  await withCodexRpc(buildCodexRpcSpec(), async ({ request, listeners }) => {
+    const resumed = await request("thread/resume", { threadId: sessionId });
+    if (resumed.thread?.status?.type === "active") throw new Error("This thread has an active turn; compact after it finishes.");
+    let done;
+    const complete = new Promise(resolve => { done = resolve; });
+    const listener = event => {
+      if (event.method === "item/completed" && event.params?.threadId === sessionId
+        && event.params?.item?.type === "contextCompaction") done();
+    };
+    listeners.add(listener);
+    try { await request("thread/compact/start", { threadId: sessionId }); await complete; }
+    finally { listeners.delete(listener); }
+  }, { timeoutMs: 120_000 });
+  await sendMessage(chatId, "Codex context compaction completed.");
+}
+
 function getEffectiveModelChoices() {
   const out = [];
   const seen = new Set();
@@ -13150,7 +13201,7 @@ function getEffectiveModelChoices() {
     out.push(s);
   };
   add(CODEX_MODEL);
-  for (const m of CODEX_DEFAULT_MODEL_CHOICES) add(m);
+  for (const m of nativeModelCatalog.length ? nativeModelCatalog.map(x => x.model) : CODEX_DEFAULT_MODEL_CHOICES) add(m);
   for (const m of CODEX_MODEL_CHOICES) add(m);
   return out.length > 0 ? out.slice(0, 12) : [];
 }
@@ -13174,7 +13225,9 @@ function getEffectiveReasoningChoices() {
 
 function getEffectiveReasoningChoicesForModel(model) {
   const cleanModel = normalizeCodexModelName(model).toLowerCase();
-  const modelSpecific = Array.isArray(CODEX_REASONING_EFFORTS_BY_MODEL[cleanModel])
+  const native = nativeModelCatalog.find(x => x.model.toLowerCase() === cleanModel);
+  const nativeEfforts = (native?.supportedReasoningEfforts || []).map(x => x.reasoningEffort).filter(Boolean);
+  const modelSpecific = nativeEfforts.length ? nativeEfforts : Array.isArray(CODEX_REASONING_EFFORTS_BY_MODEL[cleanModel])
     ? CODEX_REASONING_EFFORTS_BY_MODEL[cleanModel]
     : [];
   const out = [];
@@ -13255,6 +13308,7 @@ function buildModelPickerPayload(chatId) {
 }
 
 async function sendModelPicker(chatId) {
+  await refreshNativeModelCatalog();
   const payload = buildModelPickerPayload(chatId);
   await sendMessage(chatId, payload.text, {
     replyMarkup: payload.replyMarkup,
@@ -13839,6 +13893,7 @@ function getParsedCommandRouter() {
     clearPendingCommandForChat,
     clearActiveSessionForChat,
     sendResumePicker,
+    compactCodexSession,
     resolveResumeSessionId,
     setActiveSessionForChat,
     shortSessionId,
@@ -13874,6 +13929,31 @@ function getParsedCommandRouter() {
 async function handleCommand(chatId, text) {
   const parsed = parseCommand(text) || parseNaturalCommand(text);
   if (!parsed) return false;
+  if (parsed.cmd === "/app") {
+    if (!appChatBridge) { await sendMessage(chatId, "App bridge is not configured (APP_COMPANION_CONFIG)."); return true; }
+    try { await appChatBridge.command(chatId, parsed.arg || ""); }
+    catch (err) { await sendMessage(chatId, String(err.message || err)); }
+    return true;
+  }
+  if (parsed.cmd === "/recover") {
+    const tokens = String(parsed.arg || "").trim().split(/\s+/);
+    if (tokens[0] === "dismiss" && tokens[1]) {
+      const active = [...listActiveJobsForChat(chatId), ...listQueuedJobsForChat(chatId)].some(x => x.job?.journalId === tokens[1]);
+      if (active) { await sendMessage(chatId, "This job is still running or queued. Use /cancel or /clear first."); return true; }
+      const dismissed = jobJournal.dismiss(tokens[1], chatId) || telegramInbox.dismiss(tokens[1], chatId);
+      await sendMessage(chatId, dismissed ? "Recovery record dismissed." : "Recovery record not found."); return true;
+    }
+    const entries = jobJournal.pending(chatId);
+    const entry = tokens[0] ? entries.find(x => x.id === tokens[0]) : null;
+    if (entry) {
+      await sendMessage(chatId, `Recovery ${entry.id} (${entry.status})\n${entry.result?.text || entry.prompt || '[media request]'}\n\nNo actions were replayed.`);
+    } else {
+      const rows = entries.slice(-15).map(x => `${x.id}: ${x.status} — ${String(x.prompt || x.kind).slice(0, 100)}`);
+      rows.push(...telegramInbox.pending(chatId).map(([id, x]) => `${id}: input ${x.status} — ${String(x.update.message?.text || '[media]').slice(0, 100)}`));
+      await sendMessage(chatId, rows.length ? `Unfinished work / delivery:\n${rows.join("\n")}\n\n/recover <id> shows stored output. /recover dismiss <id> clears a record. Actions are never replayed automatically.` : "No unfinished recovery records.");
+    }
+    return true;
+  }
 
   clearPendingNaturalNewsFollowup(chatId);
 
@@ -13945,22 +14025,14 @@ const TTS_PRESET_ALIAS_MAP = Object.freeze({
 
 const TTS_PRESET_DESCRIPTIONS = Object.freeze({
   off: "No post-processing.",
-  "hologram-ai": "Brighter, louder hologram sheen with layered modulation.",
+  "hologram-ai": "Soft, bright and ethereal, with brief octave shimmer.",
   "starship-comms": "Bridge comms with start/end beeps, radio grit, and short interference bursts.",
-  "cyber-oracle": "Low-pitched oracle tone with slow steady pitch drift and synthetic space.",
-  "alien-terminal": "Layered alien machine timbre with moderate modulation.",
-  anonymous: "Legacy chain (kept for A/B comparisons; strong down-pitch).",
+  "cyber-oracle": "Deep, unhurried and dark, with a restrained sub-octave shadow.",
+  "alien-terminal": "Metallic cyberpunk voice with brief, controlled pitch jumps.",
+  anonymous: "Low, dry and imposing, without echo or modulation.",
   custom: "Use raw ffmpeg filtergraph from env.",
 });
 
-// Per-preset output gain calibration from /abtest loudness feedback (100 = target).
-const TTS_PRESET_OUTPUT_GAINS = Object.freeze({
-  "hologram-ai": 2.6,
-  "starship-comms": 0.95,
-  "cyber-oracle": 3.8,
-  "alien-terminal": 3.1,
-  anonymous: 6.5,
-});
 const TTS_WORKER_PRESET_AUTO_ORDER = Object.freeze([
   "hologram-ai",
   "starship-comms",
@@ -13984,13 +14056,6 @@ function normalizeTtsPresetName(name, { allowDefault = false } = {}) {
   const key = raw.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "").replace(/[_\s]+/g, "-");
   if (allowDefault && ["default", "auto", "bot", "env"].includes(key)) return "default";
   return TTS_PRESET_ALIAS_MAP[key] || "";
-}
-
-function getTtsPresetOutputGain(name) {
-  const key = normalizeTtsPresetName(name);
-  const gain = Number(TTS_PRESET_OUTPUT_GAINS[key]);
-  if (!Number.isFinite(gain) || gain <= 0) return 1;
-  return gain;
 }
 
 function getAvailableTtsPresetNames() {
@@ -14595,6 +14660,9 @@ function applyCommonTtsPronunciationFixes(text) {
   let out = String(text || "");
   if (!out) return "";
   out = out.normalize("NFKC");
+  const language = detectTtsLanguage(out, TTS_DEFAULT_LANGUAGE);
+  out = normalizeSpeechSymbols(out, language);
+  if (language !== "en") return out;
 
   // Normalize apostrophe variants (including escaped forms) before expansion.
   out = out.replace(/\\+([`´‘’‚‛ʼʻʹʽʾʿ′＇ꞌ'])/g, "$1");
@@ -14646,7 +14714,7 @@ function applyCommonTtsPronunciationFixes(text) {
     return `${prefix}${spoken}`;
   });
 
-  return out;
+  return normalizeSpeechSymbols(out, language);
 }
 
 function splitVoiceReplyParts(text) {
@@ -14838,7 +14906,8 @@ function resolveAttachPath(inputPath, options = {}) {
     if (Number.isFinite(maxBytes) && st.size > maxBytes) {
       throw new Error(`file too large (${Math.round(st.size / (1024 * 1024))}MB > ${ATTACH_MAX_FILE_MB}MB)`);
     }
-    return resolved;
+    const fileBytes = readAllowedFile(resolved, allowedRoots.filter(root => fs.existsSync(root)), maxBytes);
+    return options.readBytes ? { path: resolved, fileBytes } : resolved;
   }
 
   if (!hadAllowedCandidate) {
@@ -14896,14 +14965,19 @@ async function sendAttachments(chatId, attachments, options = {}) {
   const routeTaskId = Number(options.routeTaskId || 0);
   const routeSessionId = String(options.routeSessionId || "").trim();
   const sent = [];
+  const failures = [];
   for (const item of list) {
     const rawPath = String(item?.path || "").trim();
     if (!rawPath) continue;
     let resolved;
+    let fileBytes;
     try {
-      resolved = resolveAttachPath(rawPath, { workerId: routeWorkerId });
+      const attachment = resolveAttachPath(rawPath, { workerId: routeWorkerId, readBytes: true });
+      resolved = attachment.path;
+      fileBytes = attachment.fileBytes;
     } catch (err) {
       const msg = String(err?.message || err);
+      failures.push(msg);
       const hint = (msg === "file does not exist" || msg === "path is outside allowed attachment roots")
         ? ` (Tip: use a path relative to ${ATTACH_ROOTS_HINT}; don't prefix the root twice.)`
         : "";
@@ -14919,6 +14993,7 @@ async function sendAttachments(chatId, attachments, options = {}) {
       const msg = preferPhoto
         ? await sendPhoto(chatId, resolved, {
           caption,
+          fileBytes,
           timeoutMs: ATTACH_UPLOAD_TIMEOUT_MS,
           replyToMessageId,
           routeWorkerId,
@@ -14927,6 +15002,7 @@ async function sendAttachments(chatId, attachments, options = {}) {
         })
         : await sendDocument(chatId, resolved, {
           caption,
+          fileBytes,
           fileName,
           timeoutMs: ATTACH_UPLOAD_TIMEOUT_MS,
           replyToMessageId,
@@ -14936,9 +15012,11 @@ async function sendAttachments(chatId, attachments, options = {}) {
         });
       if (msg && typeof msg === "object") sent.push(msg);
     } catch (err) {
+      failures.push(String(err?.message || err));
       await sendMessage(chatId, `Failed to send attachment ${fileName}: ${String(err?.message || err)}`);
     }
   }
+  if (failures.length) throw new Error(`${failures.length} attachment(s) could not be delivered: ${failures.join("; ")}`);
   return sent;
 }
 
@@ -14997,6 +15075,7 @@ function makeSpeakableTextForTts(text) {
   // Prefer the model following the voice prompt, but strip common formatting just in case.
   let out = String(text || "").trim();
   if (!out) return "";
+  const placeholders = speechPlaceholders(detectTtsLanguage(out, TTS_DEFAULT_LANGUAGE));
 
   // If the model accidentally includes the voice format markers in the spoken part, strip them.
   // Don't require line breaks; models sometimes inline them ("... TEXT_ONLY:").
@@ -15013,11 +15092,11 @@ function makeSpeakableTextForTts(text) {
   out = out.replace(/!?\[([^\]]+?)\]\([^\)]+\)/g, "$1");
 
   // Bare URLs.
-  out = out.replace(/\bhttps?:\/\/\S+\b/gi, "a link");
+  out = out.replace(/\bhttps?:\/\/\S+\b/gi, placeholders.link);
 
   // Windows and Unix-like file paths (best-effort; avoid over-matching normal text like "and/or").
-  out = out.replace(/\b[a-zA-Z]:\\[^\s]+/g, "a file path");
-  out = out.replace(/(?:^|\s)~?\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)+/g, " a file path");
+  out = out.replace(/\b[a-zA-Z]:\\[^\s]+/g, placeholders.path);
+  out = out.replace(/(?:^|\s)~?\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)+/g, ` ${placeholders.path}`);
 
   // Headings / bullets.
   out = out.replace(/^\s{0,3}#{1,6}\s+/gm, "");
@@ -15310,6 +15389,14 @@ function splitSpeakableTextIntoVoiceChunks(text) {
   return { chunks: kept, overflowText };
 }
 
+async function enqueueAppChatSpeech(chatId, text, preset, audioVersion) {
+  const { chunks, overflowText } = splitSpeakableTextIntoVoiceChunks(text);
+  if (!chunks.length) return false;
+  return await enqueueTtsBatch(chatId, chunks, "voice-reply", {
+    ttsPreset: preset, audioVersion, skipResultText: true, afterText: overflowText || "",
+  });
+}
+
 async function enqueueTts(chatId, inputText, source, options = {}) {
   return await orchLaneRuntime.enqueueTts(chatId, inputText, source, options);
 }
@@ -15493,7 +15580,7 @@ function escapeFfmpegFilterPath(value) {
     .replace(/'/g, "\\'");
 }
 
-function buildStarshipCommsComplexSpec(audioFilters) {
+function buildStarshipCommsComplexSpec(audioFilters, variation = createVoiceFxVariation()) {
   const requiredFilters = [
     "amovie",
     "anoisesrc",
@@ -15527,11 +15614,11 @@ function buildStarshipCommsComplexSpec(audioFilters) {
   const endBeepPath = escapeFfmpegFilterPath(TTS_STARSHIP_BEEP_END);
 
   const radioChain = [
-    "highpass=f=260",
-    "lowpass=f=3300",
-    "acompressor=threshold=-30dB:ratio=5.4:attack=1.5:release=92:makeup=7.4",
+    "highpass=f=480",
+    "lowpass=f=2800",
+    "acompressor=threshold=-30dB:ratio=5.4:attack=1.5:release=92:makeup=2",
   ];
-  if (audioFilters.has("acrusher")) radioChain.push("acrusher=bits=8:mode=log:mix=0.28");
+  if (audioFilters.has("acrusher")) radioChain.push("acrusher=bits=7:mode=log:mix=0.35");
 
   const graphParts = [
     "[0:a]aresample=48000[voice_src]",
@@ -15542,23 +15629,18 @@ function buildStarshipCommsComplexSpec(audioFilters) {
     "anoisesrc=color=white:amplitude=0.052:r=48000:d=1.8,highpass=f=1500,lowpass=f=5300,atrim=0:0.06,afade=t=in:st=0:d=0.006,afade=t=out:st=0.045:d=0.015,adelay=1040|1040[burst2]",
     "anoisesrc=color=white:amplitude=0.058:r=48000:d=2.8,highpass=f=1350,lowpass=f=5000,atrim=0:0.07,afade=t=in:st=0:d=0.008,afade=t=out:st=0.053:d=0.017,adelay=1920|1920[burst3]",
     "[radio][burst1][burst2][burst3]amix=inputs=4:normalize=0[radio_dirty]",
-    "[beep_start][radio_dirty][beep_end]concat=n=3:v=0:a=1[comms]",
   ];
 
+  const radioLabel = appendTtsStutterLayer(graphParts, "radio_dirty", "radio_glitch", audioFilters, {gain:0.3 * variation.gain,repeatCount:1,slots:variation.slots});
+  graphParts.push(`[beep_start][${radioLabel}][beep_end]concat=n=3:v=0:a=1[comms]`);
   let outputLabel = "comms";
-  if (audioFilters.has("asoftclip")) {
-    graphParts.push(`[${outputLabel}]asoftclip=type=tanh:threshold=0.76[comms_clip]`);
-    outputLabel = "comms_clip";
+  if (audioFilters.has("loudnorm")) {
+    graphParts.push(`[${outputLabel}]loudnorm=I=-18:TP=-2:LRA=7,aresample=48000[comms_normalized]`);
+    outputLabel = "comms_normalized";
   }
   if (audioFilters.has("alimiter")) {
-    graphParts.push(`[${outputLabel}]alimiter=limit=0.86[comms_limited]`);
+    graphParts.push(`[${outputLabel}]alimiter=limit=0.89:level=false[comms_limited]`);
     outputLabel = "comms_limited";
-  }
-
-  const outputGain = getTtsPresetOutputGain("starship-comms");
-  if (audioFilters.has("volume") && Math.abs(outputGain - 1) > 1e-4) {
-    graphParts.push(`[${outputLabel}]volume=${fmtFloat(outputGain, 4)}[comms_gain]`);
-    outputLabel = "comms_gain";
   }
 
   return { graph: graphParts.join(";"), outputLabel };
@@ -15581,134 +15663,177 @@ function buildTtsPresetFiltergraph(preset, audioFilters) {
       parts.push(`rubberband=pitch=${fmtFloat(pitchRatio, 8)}`);
       return;
     }
-    if (TTS_POSTPROCESS_DEBUG) {
-      log(`TTS postprocess (${presetName || "preset"}): ffmpeg filter 'rubberband' not available; skipping pitch shift.`);
-    }
-  };
-  const addPresetOutputGain = (presetName = key) => {
-    const gain = getTtsPresetOutputGain(presetName);
-    if (Math.abs(gain - 1) <= 1e-4) return;
-    add("volume", `volume=${fmtFloat(gain, 4)}`);
-  };
-
-  if (key === "hologram-ai") {
-    add("aresample", "aresample=48000");
-    add("highpass", "highpass=f=140");
-    add("lowpass", "lowpass=f=7800");
-    addPitchShift(2.1, "hologram-ai");
-    add("aphaser", "aphaser=speed=1.9:decay=0.42:delay=2.2");
-    add("chorus", "chorus=0.35:0.75:28|42:0.2|0.16:0.35|0.27:1.4|2.1");
-    add("aecho", "aecho=0.72:0.4:26|52:0.24|0.12");
-    add("acompressor", "acompressor=threshold=-27dB:ratio=3.3:attack=4:release=150:makeup=7.4");
-    add("volume", "volume=1.72");
-    addPresetOutputGain("hologram-ai");
-    add("alimiter", "alimiter=limit=0.94");
-    return parts.join(",");
-  }
-
-  if (key === "starship-comms") {
-    if (TTS_POSTPROCESS_DEBUG) {
-      log("TTS postprocess (starship-comms): complex beep pipeline unavailable; using fallback chain.");
-    }
-    add("aresample", "aresample=48000");
-    add("highpass", "highpass=f=260");
-    add("lowpass", "lowpass=f=3300");
-    add("acompressor", "acompressor=threshold=-30dB:ratio=5.2:attack=1.5:release=90:makeup=6.8");
-    add("acrusher", "acrusher=bits=8:mode=log:mix=0.25");
-    add("tremolo", "tremolo=f=8.5:d=0.045");
-    add("asoftclip", "asoftclip=type=tanh:threshold=0.78");
-    addPresetOutputGain("starship-comms");
-    add("alimiter", "alimiter=limit=0.85");
-    return parts.join(",");
-  }
-
-  if (key === "cyber-oracle") {
-    add("aresample", "aresample=48000");
-    add("highpass", "highpass=f=100");
-    add("lowpass", "lowpass=f=7000");
-    addPitchShift(-3.2, "cyber-oracle");
-    // ffmpeg lacks stable random pitch drift in this chain; use slow LFO wobble instead.
-    add("vibrato", "vibrato=f=1.05:d=0.09");
-    add("aphaser", "aphaser=speed=0.34:decay=0.6:delay=3.1");
-    add("chorus", "chorus=0.36:0.7:34|50|66:0.22|0.17|0.1:0.24|0.36|0.5:1.7|2.4|3.1");
-    add("aecho", "aecho=0.6:0.38:78|166:0.22|0.13");
-    add("acompressor", "acompressor=threshold=-27dB:ratio=3.1:attack=7:release=220:makeup=5.9");
-    add("volume", "volume=1.38");
-    addPresetOutputGain("cyber-oracle");
-    add("alimiter", "alimiter=limit=0.93");
-    return parts.join(",");
-  }
-
-  if (key === "alien-terminal") {
-    add("aresample", "aresample=48000");
-    add("highpass", "highpass=f=170");
-    add("lowpass", "lowpass=f=5100");
-    addPitchShift(-2.1, "alien-terminal");
-    add("acrusher", "acrusher=bits=7:mode=log:mix=0.34");
-    add("vibrato", "vibrato=f=5.4:d=0.055");
-    add("aphaser", "aphaser=speed=0.62:decay=0.54:delay=2.4");
-    add("chorus", "chorus=0.33:0.72:22|38:0.18|0.13:0.22|0.33:1.15|1.75");
-    add("acompressor", "acompressor=threshold=-28dB:ratio=3.9:attack=3:release=155:makeup=4.2");
-    add("asoftclip", "asoftclip=type=tanh:threshold=0.72");
-    add("volume", "volume=0.98");
-    addPresetOutputGain("alien-terminal");
-    add("alimiter", "alimiter=limit=0.88");
-    return parts.join(",");
-  }
-
-  if (key === "anonymous") {
-    // Legacy Audacity-like stack kept as an explicit preset for A/B tests.
-    add("aresample", "aresample=48000");
-    const distortionAmount = 60;
-    const outputLevel = 30;
-    const pregain = 1 + (distortionAmount / 100) * 3.0;
-    const threshold = 1 - (distortionAmount / 100) * 0.5;
-    const outVol = outputLevel / 100;
-    add("volume", `volume=${fmtFloat(pregain, 4)}`);
-    add("asoftclip", `asoftclip=type=tanh:threshold=${fmtFloat(clamp01(threshold), 4)}`);
-    add("volume", `volume=${fmtFloat(clamp01(outVol), 4)}`);
-    add("aphaser", `aphaser=speed=${fmtFloat(2.0, 3)}:decay=${fmtFloat(0.2, 3)}:delay=${fmtFloat(3.0, 3)}`);
-    add("atempo", `atempo=${fmtFloat(1 / 1.1, 6)}`);
-    const pitchRatio = Math.pow(2, -5.69 / 12);
-    if (audioFilters.has("rubberband")) {
-      parts.push(`rubberband=pitch=${fmtFloat(pitchRatio, 8)}`);
+    if (audioFilters.has("asetrate") && audioFilters.has("aresample") && audioFilters.has("atempo")) {
+      const ratio = Math.pow(2, semitonesNum / 12);
+      parts.push(`asetrate=${Math.round(48000 * ratio)},aresample=48000,atempo=${fmtFloat(1 / ratio, 8)}`);
     } else if (TTS_POSTPROCESS_DEBUG) {
-      log("TTS postprocess: ffmpeg filter 'rubberband' not available; skipping pitch shift.");
+      log(`TTS postprocess (${presetName}): no pitch-shift backend available.`);
     }
-    add("atempo", `atempo=${fmtFloat(1.1, 6)}`);
-    addPresetOutputGain("anonymous");
-    add("alimiter", "alimiter=limit=0.92");
+  };
+  const finish = () => {
+    add("loudnorm", "loudnorm=I=-18:TP=-2:LRA=7");
+    add("aresample", "aresample=48000");
+    add("alimiter", "alimiter=limit=0.89:level=false");
     return parts.join(",");
-  }
+  };
 
+  add("aresample", "aresample=48000");
+  if (key === "hologram-ai") {
+    add("highpass", "highpass=f=180");
+    addPitchShift(3.2, key);
+    add("equalizer", "equalizer=f=3200:t=q:w=0.8:g=1.5");
+    add("chorus", "chorus=0.7:0.8:18|29:0.16|0.1:0.7|1.1:0.5|0.7");
+    add("lowpass", "lowpass=f=9500");
+    return finish();
+  }
+  if (key === "starship-comms") {
+    add("highpass", "highpass=f=480");
+    add("lowpass", "lowpass=f=2800");
+    add("acompressor", "acompressor=threshold=-24dB:ratio=5:attack=2:release=85:makeup=2");
+    add("acrusher", "acrusher=bits=7:mode=log:mix=0.35");
+    add("asoftclip", "asoftclip=type=tanh:threshold=0.8");
+    return finish();
+  }
+  if (key === "cyber-oracle") {
+    addPitchShift(-5, key);
+    add("highpass", "highpass=f=65");
+    add("equalizer", "equalizer=f=180:t=q:w=0.8:g=1.5");
+    add("lowpass", "lowpass=f=6200");
+    add("aecho", "aecho=0.8:0.85:95|185:0.17|0.08");
+    return finish();
+  }
+  if (key === "alien-terminal") {
+    addPitchShift(1, key);
+    add("highpass", "highpass=f=230");
+    add("lowpass", "lowpass=f=5800");
+    // Fast amplitude modulation gives a metallic buzz, not another chorus voice.
+    add("tremolo", "tremolo=f=43:d=0.18");
+    add("aphaser", "aphaser=speed=0.45:decay=0.3:delay=1.7");
+    add("acrusher", "acrusher=bits=12:mode=log:mix=0.08");
+    return finish();
+  }
+  if (key === "anonymous") {
+    addPitchShift(-7, key);
+    add("highpass", "highpass=f=150");
+    add("lowpass", "lowpass=f=3700");
+    add("acompressor", "acompressor=threshold=-24dB:ratio=3:attack=5:release=120:makeup=2");
+    return finish();
+  }
   return "";
 }
 
-function buildTtsPostprocessConfig(ffmpegBin, presetName = "") {
+function appendTtsStutterLayer(parts, inputLabel, outputLabel, audioFilters, { gain = 0.5, repeatCount = 2, slots = [{start:1.05,length:0.07},{start:4.45,length:0.085}] } = {}) {
+  const needed = ["asplit", "atrim", "asetpts", "afade", "aloop", "adelay", "volume", "amix"];
+  if (!needed.every(name => audioFilters.has(name))) return inputLabel;
+  // Repeat captured audio, not text: token stuttering makes neural TTS unstable.
+  // Two bounded micro-loops per voice chunk; the continuous voice remains audible.
+  const prefix = outputLabel;
+  parts.push(`[${inputLabel}]asplit=3[${prefix}_dry][${prefix}_src0][${prefix}_src1]`);
+  slots.forEach(({start,length},i) => {
+    const samples = Math.round(length * 48000);
+    const delay = Math.round((start + length) * 1000);
+    const chain = [
+      `atrim=start=${start}:end=${start+length}`, "asetpts=PTS-STARTPTS",
+      "afade=t=in:st=0:d=0.004", `afade=t=out:st=${length-0.004}:d=0.004`,
+      `aloop=loop=${repeatCount}:size=${samples}`, `adelay=${delay}:all=1`, `volume=${gain}`,
+    ];
+    parts.push(`[${prefix}_src${i}]${chain.join(",")}[${prefix}_loop${i}]`);
+  });
+  parts.push(`[${prefix}_dry][${prefix}_loop0][${prefix}_loop1]amix=inputs=3:normalize=0:duration=first[${outputLabel}]`);
+  return outputLabel;
+}
+
+function buildSciFiVoiceComplexSpec(preset, audioFilters, variation = createVoiceFxVariation()) {
+  if (!["hologram-ai", "cyber-oracle", "alien-terminal"].includes(preset)) return null;
+  if (!["asplit", "amix", "volume", "aresample", "rubberband"].every(name => audioFilters.has(name))) return null;
+  // Keep intelligible speech continuous. Only the parallel effect layer jumps.
+  const base = buildTtsPresetFiltergraph(preset, audioFilters)
+    .replace(/,?loudnorm=[^,]+/g, "").replace(/,?alimiter=[^,]+/g, "");
+  const spec = {
+    "hologram-ai": { pitch: 2, period: 3.1, offset: 0.7, width: 0.18, gain: 0.2 },
+    "cyber-oracle": { pitch: 0.5, period: 4.3, offset: 1.1, width: 0.38, gain: 0.2 },
+    "alien-terminal": { pitch: 1.498307, period: 1.9, offset: 0.65, width: 0.14, gain: 0.3 },
+  }[preset];
+  spec.period = Math.round(spec.period * variation.period * 1000) / 1000;
+  spec.offset += variation.offset;
+  spec.gain *= variation.gain;
+  const fx = [`rubberband=pitch=${spec.pitch * variation.pitch}`];
+  if (preset === "alien-terminal") {
+    if (audioFilters.has("tremolo")) fx.push("tremolo=f=67:d=0.85");
+    if (audioFilters.has("acrusher")) fx.push("acrusher=bits=8:mode=log:mix=0.35");
+  }
+  // Triangular windows avoid hard cuts/clicks at the pitch-jump edges.
+  fx.push(`volume='if(isnan(t),0,${spec.gain}*max(0,1-abs(mod(t+${spec.offset},${spec.period})-${spec.width})/${spec.width}))':eval=frame`);
+  const shadow = ["hologram-ai", "alien-terminal"].includes(preset)
+    && ["adelay", "lowpass", "highpass"].every(name => audioFilters.has(name));
+  const parts = [
+    `[0:a]${base},asplit=${shadow ? 3 : 2}[voice][fx_source]${shadow ? "[shadow_source]" : ""}`,
+    `[fx_source]${fx.join(",")}[fx]`,
+  ];
+  if (shadow) {
+    const ethereal = preset === "hologram-ai";
+    const layer = [
+      `rubberband=pitch=${ethereal ? 1.059463 : 0.749154}`,
+      "highpass=f=280", `lowpass=f=${ethereal ? 6500 : 3800}`,
+      `adelay=${(ethereal ? 115 : 175) + variation.shadowDelay}:all=1`,
+    ];
+    if (audioFilters.has("aecho")) layer.push("aecho=0.8:0.9:145:0.18");
+    layer.push(`volume=${ethereal ? 0.14 : 0.16}`);
+    parts.push(`[shadow_source]${layer.join(",")}[shadow]`);
+  }
+  parts.push(`[voice][fx]${shadow ? "[shadow]" : ""}amix=inputs=${shadow ? 3 : 2}:normalize=0:duration=longest[mix]`);
+  const mixedLabel = preset === "alien-terminal"
+    ? appendTtsStutterLayer(parts, "mix", "glitch_mix", audioFilters, {gain:0.5 * variation.gain,repeatCount:2,slots:variation.slots}) : "mix";
+  const finish = [];
+  if (audioFilters.has("loudnorm")) finish.push("loudnorm=I=-18:TP=-2:LRA=7");
+  finish.push("aresample=48000");
+  if (audioFilters.has("alimiter")) finish.push("alimiter=limit=0.89:level=false");
+  parts.push(`[${mixedLabel}]${finish.join(",")}[scifi_out]`);
+  return { graph: parts.join(";"), outputLabel: "scifi_out" };
+}
+
+function buildTtsPostprocessConfig(ffmpegBin, presetName = "", variationSeed) {
+  const variation = createVoiceFxVariation(variationSeed);
   let preset = normalizeTtsPresetName(presetName, { allowDefault: true });
   if (!preset || preset === "default") preset = getDefaultTtsPresetName();
+  const audioFilters = getFfmpegAudioFilterSet(ffmpegBin) || new Set();
+  const speed = ({ "hologram-ai": 1.5, "starship-comms": 1.2, "cyber-oracle": 1.1,
+    "alien-terminal": 1.2, off: 1.2, anonymous: 1.25 })[preset || "off"] || 1;
+  const withSpeed = config => {
+    if (speed === 1 || !audioFilters.has("atempo")) return config;
+    if (config.mode === "complex") return { ...config,
+      graph: `[0:a]atempo=${speed}[tts_speed_input];${config.graph.replaceAll("[0:a]", "[tts_speed_input]")}` };
+    return { mode: "af", graph: `atempo=${speed}${config.graph ? "," + config.graph : ""}`, mapLabel: "" };
+  };
   if (!preset || preset === "off") {
-    if (TTS_POSTPROCESS_DEBUG) log("TTS postprocess disabled (preset=off).");
-    return { mode: "none", graph: "", mapLabel: "" };
+    return withSpeed({ mode: "none", graph: "", mapLabel: "" });
   }
   if (preset === "custom" && !TTS_POSTPROCESS_FFMPEG_AF) {
     if (TTS_POSTPROCESS_DEBUG) log("TTS postprocess preset 'custom' requested but no raw filtergraph is configured.");
     return { mode: "none", graph: "", mapLabel: "" };
   }
 
-  const audioFilters = getFfmpegAudioFilterSet(ffmpegBin) || new Set();
+  const withAtmosphere = config => addVoiceAtmosphere(withSpeed(config), preset, audioFilters, {
+    enabled: toBool(process.env.TTS_AMBIENCE_ENABLED, true),
+    level: process.env.TTS_AMBIENCE_LEVEL === undefined ? 1 : Number(process.env.TTS_AMBIENCE_LEVEL),
+    offset: variation.offset,
+    seed: variationSeed,
+  });
   if (preset === "starship-comms") {
-    const complexSpec = buildStarshipCommsComplexSpec(audioFilters);
+    const complexSpec = buildStarshipCommsComplexSpec(audioFilters, variation);
     if (complexSpec && complexSpec.graph) {
       if (TTS_POSTPROCESS_DEBUG) log(`TTS postprocess preset=${preset} -filter_complex: ${complexSpec.graph}`);
-      return { mode: "complex", graph: complexSpec.graph, mapLabel: complexSpec.outputLabel || "" };
+      return withAtmosphere({ mode: "complex", graph: complexSpec.graph, mapLabel: complexSpec.outputLabel || "" });
     }
   }
+
+  const sciFiSpec = buildSciFiVoiceComplexSpec(preset, audioFilters, variation);
+  if (sciFiSpec) return withAtmosphere({ mode: "complex", graph: sciFiSpec.graph, mapLabel: sciFiSpec.outputLabel });
 
   const graph = buildTtsPresetFiltergraph(preset, audioFilters);
   if (TTS_POSTPROCESS_DEBUG) log(`TTS postprocess preset=${preset} -af: ${graph || "(none)"}`);
   if (!graph) return { mode: "none", graph: "", mapLabel: "" };
-  return { mode: "af", graph, mapLabel: "" };
+  return withAtmosphere({ mode: "af", graph, mapLabel: "" });
 }
 
 function buildTtsPostprocessFfmpegArgs(config) {
@@ -15855,6 +15980,18 @@ function resolveTtsKeepaliveStart() {
 
 function stopTtsKeepalive(reason = "", { allowAutoRestart = true, preserveStopReason = false } = {}) {
   const proc = ttsKeepalive.proc;
+  if (proc && !proc._ttsClosed && !ttsKeepalive.stopping) {
+    const closing = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("Previous TTS worker did not exit.")), 10000);
+      proc.once("close", () => {
+        clearTimeout(timer);
+        if (ttsKeepalive.stopping === closing) ttsKeepalive.stopping = null;
+        resolve();
+      });
+    });
+    closing.catch(() => {});
+    ttsKeepalive.stopping = closing;
+  }
   ttsKeepalive.proc = null;
   ttsKeepalive.ready = false;
   ttsKeepalive.stdoutBuf = "";
@@ -15935,7 +16072,27 @@ function handleTtsKeepaliveLine(rawLine) {
   pending.reject(new Error(err));
 }
 
-async function ensureTtsKeepaliveRunning(pyBin) {
+async function ensureTtsKeepaliveRunning(pyBin, model = ttsKeepalive.model || TTS_MODEL) {
+  if (ttsKeepalive.stopping) await ttsKeepalive.stopping;
+  if (ttsKeepalive.startPromise) await ttsKeepalive.startPromise;
+  if (ttsKeepalive.model !== model) {
+    if (ttsKeepalive.pending) throw new Error("TTS keepalive is busy.");
+    const oldProc = ttsKeepalive.proc;
+    ttsKeepalive.model = model;
+    clearTtsKeepaliveRestartTimer();
+    if (oldProc) {
+      const closed = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("Previous TTS worker did not exit; refusing overlapping GPU models.")), 10000);
+        oldProc.once("close", () => { clearTimeout(timer); resolve(); });
+      });
+      ttsKeepalive.stopping = closed;
+      stopTtsKeepalive("TTS language model switch", { allowAutoRestart: false });
+      // Keep a rejected stopping promise: never load another model if release failed.
+      await closed;
+      ttsKeepalive.stopping = null;
+    }
+    log(`TTS language model: ${model}`);
+  }
   if (!fs.existsSync(AIDOLON_TTS_SERVER_SCRIPT_PATH)) return null;
   if (!pyBin) return null;
 
@@ -15963,7 +16120,7 @@ async function ensureTtsKeepaliveRunning(pyBin) {
     proc = spawn(pyBin, [
       AIDOLON_TTS_SERVER_SCRIPT_PATH,
       "--model",
-      TTS_MODEL,
+      model,
       "--reference-audio",
       TTS_REFERENCE_AUDIO,
       "--sample-rate",
@@ -15999,6 +16156,7 @@ async function ensureTtsKeepaliveRunning(pyBin) {
   }
 
   proc.stdout.on("data", (buf) => {
+    if (ttsKeepalive.proc !== proc) return;
     const chunk = String(buf || "");
     ttsKeepalive.stdoutBuf = appendTail(ttsKeepalive.stdoutBuf, chunk, 24000);
     let src = ttsKeepalive.stdoutBuf;
@@ -16012,6 +16170,7 @@ async function ensureTtsKeepaliveRunning(pyBin) {
   });
 
   proc.stderr.on("data", (buf) => {
+    if (ttsKeepalive.proc !== proc) return;
     const chunk = String(buf || "");
     const noise = stripTtsBackendNoise(chunk, ttsKeepalive.stderrNoiseCarry);
     ttsKeepalive.stderrNoiseCarry = noise.carry;
@@ -16032,6 +16191,7 @@ async function ensureTtsKeepaliveRunning(pyBin) {
   });
 
   proc.on("error", (err) => {
+    if (ttsKeepalive.proc !== proc) return;
     const msg = `TTS keepalive process error: ${err?.message || err}`;
     noteTtsKeepaliveError(msg);
     if (ttsKeepalive.startReject) {
@@ -16041,6 +16201,8 @@ async function ensureTtsKeepaliveRunning(pyBin) {
   });
 
   proc.on("close", (code, signal) => {
+    proc._ttsClosed = true;
+    if (ttsKeepalive.proc !== proc) return;
     const codeText = typeof code === "number" ? `exit ${code}` : "exit";
     const sigText = signal ? ` (${signal})` : "";
     const tail = oneLine(ttsKeepalive.stderrTail || "");
@@ -16058,9 +16220,18 @@ async function ensureTtsKeepaliveRunning(pyBin) {
   return await startupPromise;
 }
 
-async function requestTtsKeepalive(payload, { abortSignal, timeoutMs = 0, job } = {}) {
+function requestTtsKeepalive(payload, options = {}) {
+  return serializeTtsRequest(() => requestTtsKeepaliveSerial(payload, options));
+}
+
+async function requestTtsKeepaliveSerial(payload, { abortSignal, timeoutMs = 0, job } = {}) {
+  abortSignal?.throwIfAborted();
   const pyBin = resolveTtsPythonBin();
-  const proc = await ensureTtsKeepaliveRunning(pyBin);
+  const model = resolveTtsModel(job?.ttsLanguageText || payload.text || (payload.texts || []).join(" "), {
+    baseModel: TTS_MODEL, germanModel: TTS_MODEL_DE, defaultLanguage: TTS_DEFAULT_LANGUAGE,
+  });
+  const proc = await ensureTtsKeepaliveRunning(pyBin, model);
+  abortSignal?.throwIfAborted();
   if (!proc) throw new Error("TTS keepalive is unavailable.");
 
   if (ttsKeepalive.pending) {
@@ -16216,7 +16387,8 @@ async function runTtsJob(job, lane) {
   if (!text) {
     return { ok: false, text: formatFailureText("Empty TTS text."), afterText, attachments };
   }
-  const referenceAudioPath = resolveTtsReferenceAudioForText(text);
+  job.ttsLanguageText ||= text;
+  const referenceAudioPath = resolveTtsReferenceAudioForText(job.ttsLanguageText);
 
   const maxStageAttempts = Math.max(1, 1 + Math.max(0, Number(TTS_TIMEOUT_RETRIES) || 0));
   const resetTimeoutState = () => {
@@ -16352,7 +16524,8 @@ async function runTtsJob(job, lane) {
     job.onProgressChunk("TTS: encoding voice message...\n", "stderr");
   }
 
-  const ttsFxConfig = buildTtsPostprocessConfig(ffmpegBin, job?.ttsPreset);
+  job.ttsFxSeed ||= require("node:crypto").randomUUID();
+  const ttsFxConfig = buildTtsPostprocessConfig(ffmpegBin, job?.ttsPreset, `${job.ttsFxSeed}:${job.ttsChunkIndex || 0}`);
   const runEncodeOnce = async (inWavPath, outOggPath) => {
     const ffArgs = [
       "-y",
@@ -16657,6 +16830,7 @@ async function runTtsBatchJobPipelined(job, lane) {
     text: job.text,
     source: job.source,
     ttsPreset: job.ttsPreset,
+    ttsChunkIndex: job.ttsChunkIndex,
     afterText: job.afterText,
     attachments: job.attachments,
     skipResultText: job.skipResultText,
@@ -16684,6 +16858,8 @@ async function runTtsBatchJobPipelined(job, lane) {
       if (!chunkText) continue;
 
       job.kind = "tts";
+      job.ttsPreset = original.ttsPreset;
+      job.ttsChunkIndex = idx;
       job.text = chunkText;
       job.source = idx === 0 ? original.source : (isVoiceReply ? "tts-batch-chunk" : original.source);
       job.afterText = "";
@@ -16699,6 +16875,7 @@ async function runTtsBatchJobPipelined(job, lane) {
 
       const startedAt = Date.now();
       const chunkResult = await runTtsJob(job, lane);
+      if (job.cancelRequested) return { ok: false, text: "TTS canceled.", skipSendMessage: Boolean(job.superseded) };
       const elapsedMs = Date.now() - startedAt;
 
       if (chunkResult?.ok) {
@@ -16777,6 +16954,7 @@ async function runTtsBatchJobPipelined(job, lane) {
     job.text = original.text;
     job.source = original.source;
     job.ttsPreset = original.ttsPreset;
+    job.ttsChunkIndex = original.ttsChunkIndex;
     job.afterText = original.afterText;
     job.attachments = original.attachments;
     job.skipResultText = original.skipResultText;
@@ -16805,6 +16983,7 @@ function shouldUsePipelinedTtsBatch(job) {
 }
 
 async function runTtsBatchJob(job, lane) {
+  job.ttsLanguageText = (Array.isArray(job?.texts) ? job.texts : []).join(" ");
   if (shouldUsePipelinedTtsBatch(job)) {
     return await runTtsBatchJobPipelined(job, lane);
   }
@@ -16849,6 +17028,7 @@ async function runTtsBatchJob(job, lane) {
   if (texts.length === 0) {
     return { ok: false, text: formatFailureText("Empty TTS text."), afterText, attachments };
   }
+  job.ttsLanguageText = fullText;
   const referenceAudioPath = resolveTtsReferenceAudioForText(fullText);
 
   const pad3 = (n) => String(n).padStart(3, "0");
@@ -16987,7 +17167,8 @@ async function runTtsBatchJob(job, lane) {
     job.onProgressChunk("TTS: encoding voice messages...\n", "stderr");
   }
 
-  const ttsFxConfig = buildTtsPostprocessConfig(ffmpegBin, job?.ttsPreset);
+  job.ttsFxSeed ||= require("node:crypto").randomUUID();
+  const ttsFxConfig = buildTtsPostprocessConfig(ffmpegBin, job?.ttsPreset, `${job.ttsFxSeed}:${job.ttsChunkIndex || 0}`);
   const runEncodeOnce = async (inWavPath, outOggPath) => {
     const ffArgs = [
       "-y",
@@ -17285,6 +17466,35 @@ function isProgressNoiseLine(line) {
 }
 
 async function runCodexJob(job) {
+  // Explicit local repair records are separate from model output and never
+  // inferred from text. Re-read to avoid a live state's stale session winning.
+  const repairs = readJson(path.join(RUNTIME_DIR, "session-repairs.json"), {});
+  const repaired = repairs[String(job.resumeSessionId || "")];
+  if (isSessionId(repaired)) job.resumeSessionId = repaired;
+  const result = await runCodexJobAttempt(job);
+  if (!result?.inputSchemaRejected || !job?.resumeSessionId || !shouldUseCodexOutputSchema(job)
+    || job.cancelRequested || job.timedOut || job.codexTurnStarted) return result;
+
+  // Codex explicitly rejected the input before submission. A single retry without
+  // our output override can join an active turn created without that schema.
+  // Never retry an accepted turn, a tool failure, a cancellation or a timeout.
+  emitCodexTerminalLine(job, "Resume input rejected due to active-turn output schema; retrying once without the output override.");
+  const previousOmit = job.omitOutputSchema;
+  job.omitOutputSchema = true;
+  job.stdoutTail = "";
+  job.stderrTail = "";
+  for (const key of Object.keys(job)) {
+    if (key.startsWith("codex")) delete job[key];
+  }
+  try {
+    return await runCodexJobAttempt(job);
+  } finally {
+    if (previousOmit === undefined) delete job.omitOutputSchema;
+    else job.omitOutputSchema = previousOmit;
+  }
+}
+
+async function runCodexJobAttempt(job) {
   let spec;
   try {
     spec = buildCodexExecSpec(job);
@@ -17399,9 +17609,9 @@ async function runCodexJob(job) {
           })
           : job.stdoutTail.trim();
       }
-      const sessionId = String(job.codexSessionId || "").trim() || extractSessionIdFromText(
-        `${job.stderrTail || ""}\n${job.stdoutTail || ""}\n${output || ""}`,
-      );
+      const sessionId = String(job.codexSessionId || "").trim() || (spec.jsonEvents
+        ? String(job.resumeSessionId || "").trim()
+        : extractSessionIdFromText(String(job.stderrTail || "")));
 
       if (job.cancelRequested) {
         finish({ ok: false, text: `Job #${job.id} canceled.`, sessionId });
@@ -17418,8 +17628,12 @@ async function runCodexJob(job) {
         return;
       }
 
-      if (typeof code === "number" && code !== 0) {
+      if (code !== 0 || signal) {
         const errText = String(job.codexEventTail || "").trim() || String(job.codexMalformedJsonTail || "").trim() || job.stderrTail.trim() || job.stdoutTail.trim();
+        const inputSchemaRejected = spec.jsonEvents && !output && !signal && !job.codexTurnStarted
+          && /failed to submit turn input:\s*ActiveTurnOutputSchemaMismatch\b/.test(
+            `${job.stderrTail || ""}\n${job.codexMalformedJsonTail || ""}\n${job.codexEventTail || ""}`,
+          );
         const staleProcessHint = /unexpected argument ['"]?-a['"]? found/i.test(errText)
           ? `\n\nHint: this usually means an older bot process is still running. Stop all old bot windows/processes, then restart with ${process.platform === "win32" ? "start.cmd" : "./start.sh"}.`
           : "";
@@ -17432,6 +17646,7 @@ async function runCodexJob(job) {
         } else {
           finish({
             ok: false,
+            inputSchemaRejected,
             sessionId,
             text: `AIDOLON failed (exit ${code}${signal ? `, signal ${signal}` : ""}).${errText ? `\n\n${errText}` : ""}${staleProcessHint}`,
           });
@@ -17485,12 +17700,13 @@ async function getTelegramFileMeta(fileId, { signal } = {}) {
   throw new Error("Telegram getFile failed.");
 }
 
-async function downloadTelegramFile(filePath, destinationPath, { signal } = {}) {
+async function downloadTelegramFile(filePath, destinationPath, { signal, maxBytes = 20 * 1024 * 1024 } = {}) {
+  signal = AbortSignal.any([signal, AbortSignal.timeout(60_000)].filter(Boolean));
   const url = `https://api.telegram.org/file/bot${TOKEN}/${filePath}`;
   const maxAttempts = 3;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      const res = await fetch(url, {
+      const res = await telegramFetch(url, {
         signal,
         dispatcher: TELEGRAM_FETCH_DISPATCHER || undefined,
       });
@@ -17509,7 +17725,7 @@ async function downloadTelegramFile(filePath, destinationPath, { signal } = {}) 
         throw new Error("File download failed: empty body");
       }
 
-      await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(destinationPath));
+      await pipeline(Readable.fromWeb(res.body), byteLimit(maxBytes), fs.createWriteStream(destinationPath, { mode: 0o600 }), { signal });
       return fs.statSync(destinationPath).size;
     } catch (err) {
       const isAbort = String(err?.name || "").trim() === "AbortError";
@@ -17569,7 +17785,9 @@ function scheduleWhisperKeepaliveRestart(reason = "") {
     if (shuttingDown || !WHISPER_KEEPALIVE || !WHISPER_KEEPALIVE_AUTO_RESTART) return;
     if (whisperKeepalive.proc || whisperKeepalive.startPromise) return;
     try {
-      const proc = await ensureWhisperKeepaliveRunning();
+      abortSignal?.throwIfAborted();
+  const proc = await ensureWhisperKeepaliveRunning();
+  abortSignal?.throwIfAborted();
       if (!proc || !whisperKeepalive.ready) {
         scheduleWhisperKeepaliveRestart("not ready");
       }
@@ -17783,7 +18001,9 @@ async function ensureWhisperKeepaliveRunning() {
 }
 
 async function transcribeAudioWithWhisperKeepalive(audioPath, { abortSignal, job } = {}) {
+  abortSignal?.throwIfAborted();
   const proc = await ensureWhisperKeepaliveRunning();
+  abortSignal?.throwIfAborted();
   if (!proc) throw new Error("Whisper keepalive is unavailable.");
   if (whisperKeepalive.pending) throw new Error("Whisper keepalive is busy.");
 
@@ -18040,7 +18260,7 @@ async function runWhisperJob(job) {
       `voice-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`,
     );
 
-    await downloadTelegramFile(remotePath, localPath, { signal: abortSignal });
+    await downloadTelegramFile(remotePath, localPath, { signal: abortSignal, maxBytes: WHISPER_MAX_FILE_MB > 0 ? WHISPER_MAX_FILE_MB * 1024 * 1024 : Infinity });
 
     const transcript = String(await transcribeAudioWithWhisper(localPath, { abortSignal, job })).trim();
     if (job.cancelRequested) {
@@ -18071,6 +18291,9 @@ async function runWhisperJob(job) {
       excludeMessageIds: [userMessageId, ...replyThreadIds],
     });
 
+    if (job.appTarget && appChatBridge && await appChatBridge.route(chatId, transcript, job.appTarget)) {
+      return { ok: true, text: "", skipSendMessage: true };
+    }
     const newsHandled = await maybeHandleNaturalNewsRequest(chatId, transcript, { replyToMessageId });
     if (newsHandled) {
       return { ok: true, text: "", skipSendMessage: true };
@@ -18088,6 +18311,7 @@ async function runWhisperJob(job) {
 
     await routeAndEnqueuePrompt(chatId, transcript, "voice", {
       replyStyle: TTS_REPLY_TO_VOICE && TTS_ENABLED ? "voice" : "",
+      audioVersion: job.audioVersion,
       replyToMessageId,
       replyHintWorkerId,
       replyContext,
@@ -18118,8 +18342,24 @@ async function runWhisperJob(job) {
   }
 }
 
+function interruptVoiceReplies(chatId) {
+  const version = conversationState.interruptAudio(chatId);
+  const lane = ensureTtsLane();
+  const matches = job => String(job?.chatId) === String(chatId) && job?.autoVoiceReply === true;
+  for (const job of lane.queue.filter(matches)) jobJournal.canceled(job);
+  lane.queue = lane.queue.filter(job => !matches(job));
+  if (matches(lane.currentJob)) {
+    const job = lane.currentJob;
+    job.cancelRequested = true;
+    job.superseded = true;
+    job.abortController?.abort();
+    if (job.process) void terminateChildTree(job.process);
+  }
+  return version;
+}
+
 async function handleVoiceMessage(msg, context = {}) {
-  const chatId = String(msg?.chat?.id || "");
+  const chatId = conversationKey(msg);
   if (!chatId) return;
   const user = senderLabel(msg);
   const incomingMessageId = Number(msg?.message_id || 0);
@@ -18165,6 +18405,8 @@ async function handleVoiceMessage(msg, context = {}) {
     id: nextJobId++,
     chatId,
     kind: "whisper",
+    appTarget: appChatBridge?.target(chatId) ? { ...appChatBridge.target(chatId) } : null,
+    audioVersion: msg.audioVersion ?? conversationState.audioVersion(chatId),
     source: "whisper",
     workerId: routeWorkerId,
     fileId,
@@ -18192,12 +18434,13 @@ async function handleVoiceMessage(msg, context = {}) {
     return;
   }
 
+  jobJournal.queued(job);
   lane.queue.push(job);
-  void processLane(lane.id);
+  void processLane(lane.id).catch(err => log(redactError(err.message || err)));
 }
 
 async function handlePhotoOrImageDocument(msg, context = {}) {
-  const chatId = String(msg?.chat?.id || "");
+  const chatId = conversationKey(msg);
   if (!chatId) return;
   const user = senderLabel(msg);
   const incomingMessageId = Number(msg?.message_id || 0);
@@ -18276,13 +18519,13 @@ async function handlePhotoOrImageDocument(msg, context = {}) {
     }
 
     const remoteExt = path.extname(remotePath) || ext || ".jpg";
-    const safeExt = remoteExt.toLowerCase().match(/^\\.(png|jpe?g|webp|gif)$/) ? remoteExt.toLowerCase() : ".img";
+    const safeExt = remoteExt.toLowerCase().match(/^\.(png|jpe?g|webp|gif)$/) ? remoteExt.toLowerCase() : ".img";
     localPath = path.join(
       IMAGE_DIR,
       `img-${Date.now()}-${Math.random().toString(36).slice(2)}${safeExt}`,
     );
 
-    const downloadedBytes = await downloadTelegramFile(remotePath, localPath);
+    const downloadedBytes = await downloadTelegramFile(remotePath, localPath, { maxBytes });
     if (Number.isFinite(maxBytes) && downloadedBytes > maxBytes) {
       await sendMessage(chatId, `Downloaded image too large (${Math.round(downloadedBytes / (1024 * 1024))}MB).`);
       return;
@@ -18329,9 +18572,9 @@ async function handlePhotoOrImageDocument(msg, context = {}) {
 }
 
 function isAllowedMessage(msg) {
-  const chatId = String(msg?.chat?.id || "");
+  const chatId = splitRoute(msg?.chat?.id).chatId;
   if (!chatId || !ALLOWED_CHAT_IDS.has(chatId)) return false;
-  if (!ALLOW_GROUP_CHAT && String(msg?.chat?.type || "") !== "private") return false;
+  if (String(msg?.chat?.type || "") !== "private" && (!ALLOW_GROUP_CHAT || !ALLOWED_USER_IDS.has(String(msg?.from?.id || "")))) return false;
   return true;
 }
 
@@ -18348,7 +18591,7 @@ function describeTelegramChatForLog(msg) {
 }
 
 function logDroppedTelegramMessage(msg, reason) {
-  const chatId = String(msg?.chat?.id || "");
+  const chatId = conversationKey(msg);
   const user = senderLabel(msg);
   const messageId = Number(msg?.message_id || 0);
   const text = String(msg?.text || msg?.caption || "").trim();
@@ -18387,13 +18630,24 @@ async function answerCallbackQuery(callbackQueryId, text = "") {
 async function handleCallbackQuery(cb) {
   const id = String(cb?.id || "").trim();
   const data = String(cb?.data || "").trim();
-  const chatId = String(cb?.message?.chat?.id || "");
+  const chatId = conversationKey(cb?.message);
   const chatType = String(cb?.message?.chat?.type || "");
 
   if (!id || !data || !chatId) return;
-  const pseudoMsg = { chat: { id: chatId, type: chatType } };
+  const pseudoMsg = { chat: { id: chatId, type: chatType }, from: cb.from };
   if (!isAllowedMessage(pseudoMsg)) {
     await answerCallbackQuery(id, "Not allowed");
+    return;
+  }
+
+  if (data.startsWith("app_voice:") || data.startsWith("app_output:")) {
+    const [kind, bindingId, value] = data.split(":");
+    if (!appChatBridge || appChatBridge.target(chatId)?.bindingId !== bindingId) {
+      await answerCallbackQuery(id, "Abgelaufen – Menü erneut öffnen"); return;
+    }
+    await answerCallbackQuery(id, "Auswahl übernehmen");
+    try { await appChatBridge.command(chatId, `${kind === "app_output" ? "output" : "voice"} ${value}`); }
+    catch (err) { await sendMessage(chatId, String(err.message || err)); }
     return;
   }
 
@@ -18568,7 +18822,7 @@ async function handleCallbackQuery(cb) {
 }
 
 async function handleIncomingMessage(msg) {
-  const chatId = String(msg?.chat?.id || "");
+  const chatId = conversationKey(msg);
   const user = senderLabel(msg);
   const replyContext = buildReplyContextFromIncomingMessage(msg);
   if (!isAllowedMessage(msg)) {
@@ -18621,6 +18875,8 @@ async function handleIncomingMessage(msg) {
     const handled = await handleCommand(chatId, text);
     if (handled) return;
   }
+
+  if (appChatBridge && await appChatBridge.route(chatId, text)) return;
 
   const newsHandled = await maybeHandleNaturalNewsRequest(chatId, text, { replyToMessageId });
   if (newsHandled) return;
@@ -18708,7 +18964,7 @@ async function skipStaleUpdates() {
     const isOlderThanThisProcess = messageDateMs > 0 && messageDateMs < PROCESS_STARTED_AT_MS;
     if (!isOlderThanThisProcess) {
       retained += 1;
-      continue;
+      break;
     }
     if (id > lastUpdateId) lastUpdateId = id;
     skipped += 1;
@@ -18722,7 +18978,17 @@ async function skipStaleUpdates() {
   }
 }
 
+const telegramInbox = createTelegramInbox({
+  filePath: path.join(RUNTIME_DIR, "inbox.json"),
+  handle: update => handleIncomingMessage(update.message),
+  onError: async (err, update) => {
+    logSystemEvent(`Inbox handler failed: ${redactError(err.message || err)}`, "telegram:error");
+    try { await sendMessage(conversationKey(update.message), "Input could not finish. Use /recover to inspect it."); } catch {}
+  },
+});
+
 async function pollLoop() {
+  telegramInbox.resume();
   const maxUpdateRetries = 3;
 
   for (;;) {
@@ -18736,7 +19002,17 @@ async function pollLoop() {
         try {
           const msg = upd.message || null;
           if (msg) {
-            await handleIncomingMessage(msg);
+            const parsedControl = parseCommand(String(msg.text || ""));
+            const naturalControl = parseNaturalSafeCommandIntent(String(msg.text || ""));
+            const command = parsedControl?.cmd || (naturalControl.confidence >= NATURAL_SAFE_COMMAND_INTENT_THRESHOLD ? naturalControl.cmd : "");
+            if (["/cancel", "/stop", "/clear", "/status", "/queue", "/model", "/recover", "/restart", "/new", "/start"].includes(command)) {
+              await handleIncomingMessage(msg);
+            } else if (isAllowedMessage(msg)) {
+              if (msg.voice || msg.audio) msg.audioVersion = interruptVoiceReplies(conversationKey(msg));
+              telegramInbox.enqueue(upd);
+            } else {
+              logDroppedTelegramMessage(msg, "unauthorized");
+            }
           } else {
             const cb = upd.callback_query || null;
             if (cb) {
@@ -18815,6 +19091,7 @@ async function shutdown(code = 0, reason = "") {
         // best effort
       }
     }
+    appChatBridge?.stop();
     stopTtsKeepalive("Bot shutdown.", { allowAutoRestart: false });
     stopWhisperKeepalive("Bot shutdown.", { allowAutoRestart: false });
     stopWorldMonitorMonitorLoop();
@@ -18824,6 +19101,7 @@ async function shutdown(code = 0, reason = "") {
     // best effort
   }
 
+  await terminateAllChildren();
   flushChatLogBufferSync();
   persistState({ immediate: true });
   flushStatePersistence();
@@ -18979,6 +19257,38 @@ process.on("unhandledRejection", (err) => {
       await sendMessage(PRIMARY_CHAT_ID, `${fmtBold("AIDOLON")} online. Use /help.`);
     }
 
+    const appConfig = String(process.env.APP_COMPANION_CONFIG || "").trim();
+    if (appConfig) {
+      const appTransport = createAppTransport(resolveMaybeRelativePath(appConfig, ROOT));
+      appChatBridge = createAppChatBridge({
+        filePath: path.join(RUNTIME_DIR, "app-chat-bindings.json"),
+        request: appTransport,
+        migrateFromChat: String(process.env.APP_TOPIC_MIGRATE_FROM_CHAT_ID || "").trim(),
+        createTopic: async (route, name) => {
+          const { chatId } = splitRoute(route);
+          const chat = await telegramApi("getChat", { body: { chat_id: chatId } });
+          if (!chat.is_forum) throw new Error("Bitte in einer Gruppe mit aktivierten Themen verwenden.");
+          const topic = await telegramApi("createForumTopic", { body: { chat_id: chatId, name: name.slice(0, 128) } });
+          return `${chatId}~${topic.message_thread_id}`;
+        },
+        sendScreenshot: createAppScreenshotSender({ request: appTransport, outDir: OUT_DIR, sendPhoto }),
+        sendText: (chat, text, options) => sendMessage(chat, text, options),
+        speak: enqueueAppChatSpeech,
+        speechVersion: chat => conversationState.audioVersion(chat),
+        interruptSpeech: interruptVoiceReplies,
+        validPreset: name => getAvailableTtsPresetNames().includes(name),
+        voiceChoices: () => getAvailableTtsPresetNames().map(id => ({
+          id, label: id === "off" ? "Natürlich" : id,
+          description: ({ off: "Ohne Stimmverfremdung", "hologram-ai": "Weich, hell und ätherisch mit kurzem Oktavschimmer", "starship-comms": "Funkstimme mit kurzen Signaltönen", "cyber-oracle": "Dunkel und bedrohlich mit dezenter tiefer Doppelstimme", "alien-terminal": "Cyberpunk-Klang mit dosierten Alien-Pitchsprüngen", anonymous: "Stark abgesenkte, verfremdete Stimme", custom: "Eigenes konfiguriertes Effektprofil" })[id] || id,
+        })),
+      });
+      const topicGroup = String(process.env.APP_TOPIC_GROUP_ID || "").trim();
+      if (topicGroup && ALLOWED_CHAT_IDS.has(topicGroup)) {
+        try { await appChatBridge.command(topicGroup, "topics"); }
+        catch (err) { await sendMessage(topicGroup, `Themen-Einrichtung: ${redactError(err.message || err)}\nMit /app topics erneut versuchen, nachdem die Ursache behoben ist.`).catch(() => {}); }
+      }
+      appChatBridge.start();
+    }
     await pollLoop();
   } catch (err) {
     const message = redactError(err?.stack || err?.message || err);
