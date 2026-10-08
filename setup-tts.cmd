@@ -119,7 +119,7 @@ echo Installing MiraTTS dependencies into "%VENV_DIR%"...
 set "VENV_PY=%VENV_DIR%\\Scripts\\python.exe"
 
 if not "%TTS_UPGRADE%"=="1" (
-  "%VENV_PY%" -c "import numpy, onnxruntime; from mira.model import MiraTTS; assert int(numpy.__version__.split('.')[0]) < 2" >nul 2>&1
+  "%VENV_PY%" -c "import numpy, onnxruntime; from tts_runtime import prepare_cuda; prepare_cuda(); from mira.model import MiraTTS; import lmdeploy.turbomind; assert int(numpy.__version__.split('.')[0]) < 2" >nul 2>&1
   if not errorlevel 1 (
     echo MiraTTS is already installed; reusing the environment without package changes.
     echo Set TTS_UPGRADE=1 for an explicit upgrade or repair.
@@ -181,7 +181,7 @@ if defined HAS_UV (
 )
 if errorlevel 1 exit /b 1
 
-"%VENV_PY%" -c "from mira.model import MiraTTS; print('MiraTTS import ok')"
+"%VENV_PY%" -c "from tts_runtime import prepare_cuda; prepare_cuda(); from mira.model import MiraTTS; import lmdeploy.turbomind; print('MiraTTS CUDA import ok')"
 if errorlevel 1 (
   echo TTS setup failed: MiraTTS import failed.
   exit /b 1

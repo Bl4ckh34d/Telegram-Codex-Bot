@@ -14,6 +14,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from whisper_runtime import load_model, use_fp16, translate_to_english
 
 DEFAULT_ALLOWED_LANGUAGES = ("en", "de", "zh")
 
@@ -105,15 +106,13 @@ def main() -> int:
         return 3
 
     try:
-        model = whisper.load_model(
-            args.model,
-            download_root=(args.cache_dir or None),
-        )
+        model = load_model(whisper, args.model, args.cache_dir)
+        fp16 = use_fp16(model)
     except Exception as exc:
         print(f"Whisper server model load failed: {exc}", file=sys.stderr)
         return 4
 
-    _emit({"type": "ready"})
+    _emit({"type": "ready", "device": str(model.device), "fp16": fp16, "model": args.model})
 
     for raw in sys.stdin:
         line = (raw or "").strip()
@@ -150,7 +149,7 @@ def main() -> int:
             allowed_languages,
         )
 
-        kwargs: dict = {"fp16": False}
+        kwargs: dict = {"fp16": fp16}
         if language:
             kwargs["language"] = language
 
@@ -160,7 +159,7 @@ def main() -> int:
             if not language:
                 detected_language = _normalize_language_code(result.get("language") or "")
                 if detected_language and detected_language not in allowed_languages:
-                    translated = model.transcribe(str(audio_path), fp16=False, task="translate")
+                    translated = translate_to_english(whisper, model, str(audio_path), args.model, args.cache_dir, fp16)
                     text = str(translated.get("text") or "").strip()
             _result(request_id, True, text=text)
         except Exception as exc:

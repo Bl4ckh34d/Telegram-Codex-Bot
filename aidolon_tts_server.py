@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from tts_runtime import create_tts
 import re
 import sys
 import unicodedata
@@ -125,7 +126,7 @@ def _reload_tts_runtime(state: dict) -> None:
         raise RuntimeError("Cannot reload TTS runtime: missing model")
     if not isinstance(ref_path, Path):
         raise RuntimeError("Cannot reload TTS runtime: missing reference audio path")
-    tts = state.get("tts_factory")(model)
+    tts = create_tts(state.get("tts_factory"), model)
     state["tts"] = tts
     state["ctx_cache"] = {}
     _get_ctx_for_ref_path(state, ref_path)

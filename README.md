@@ -50,6 +50,9 @@ start.cmd
 
 `start.cmd` can bootstrap Whisper and TTS dependencies when those features are enabled.
 
+For CUDA speech setup, migration from another PC, and a measured RTX 4070 SUPER
+profile, see [Windows speech with 12 GB VRAM](docs/windows-12gb.md).
+
 Ubuntu Linux:
 
 ```bash

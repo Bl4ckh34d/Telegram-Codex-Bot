@@ -2,6 +2,9 @@
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
+rem An optional portable runtime keeps this bot independent of the system Node version.
+if exist "%~dp0runtime\node\node.exe" set "PATH=%~dp0runtime\node;%PATH%"
+
 if not exist ".env" (
   copy /Y ".env.example" ".env" >nul
   echo Created .env from .env.example. Fill TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.

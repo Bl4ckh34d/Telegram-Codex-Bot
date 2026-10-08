@@ -117,6 +117,22 @@ test('Astra picker supports six efforts; switching models filters incompatible e
   assert.equal(c.pickDefaultReasoningForModel('gpt-5.5'), 'medium');
 });
 
+test('configured models survive a large native catalog and use native reasoning constraints', () => {
+  const catalog = Array.from({length: 20}, (_, i) => ({model: `native-${i}`}));
+  catalog.push({model: 'gpt-6.1-sol', supportedReasoningEfforts: [{reasoningEffort:'low'}, {reasoningEffort:'high'}]});
+  const c = vm.createContext({ nativeModelCatalog: catalog, CODEX_MODEL: 'gpt-6.1-sol',
+    CODEX_MODEL_CHOICES: ['gpt-6-astra'], CODEX_REASONING_EFFORT: 'medium', CODEX_REASONING_EFFORT_CHOICES: [],
+    normalizeCodexModelName: v => String(v || '').trim() });
+  vm.runInContext(section('const CODEX_DEFAULT_MODEL_CHOICES', 'const CODEX_STREAM_OUTPUT_TO_TERMINAL')
+    + section('function getEffectiveModelChoices()', 'function buildModelPickerPayload('), c);
+  assert(c.getEffectiveModelChoices().includes('gpt-6-astra'));
+  assert.equal(c.normalizeReasoningForModel('gpt-6.1-sol', 'max'), '');
+  assert.equal(c.normalizeReasoningForModel('gpt-6.1-sol', 'high'), 'high');
+  c.nativeModelCatalog = [];
+  assert.equal(c.normalizeReasoningForModel('gpt-6.1-sol', 'max'), 'max');
+  assert.equal(c.normalizeReasoningForModel('gpt-6-luna', 'ultra'), '');
+});
+
 
 test('only an outer stdout thread.started event can select the session', () => {
   const c = vm.createContext({ isSessionId: x => /^[0-9a-f-]{36}$/.test(String(x)) });

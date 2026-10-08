@@ -18,9 +18,13 @@ test('attachments reject outside targets, parent symlinks, directories and overs
   fs.writeFileSync(path.join(root, 'private'), 'secret'); fs.writeFileSync(path.join(allowed, 'ok'), 'hello');
   assert.equal(readAllowedFile(path.join(allowed, 'ok'), [allowed], 5).toString(), 'hello');
   assert.throws(() => readAllowedFile(path.join(allowed, 'ok'), [allowed], 4), /limit/);
-  fs.symlinkSync(path.join(root, 'private'), path.join(allowed, 'escape'));
-  fs.symlinkSync(root, path.join(allowed, 'parent'));
-  for (const file of ['escape', 'parent/private']) assert.throws(() => readAllowedFile(path.join(allowed, file), [allowed], 99), /outside/);
+  // Junctions exercise a real redirected parent without Windows Developer Mode.
+  if (process.platform !== 'win32') {
+    fs.symlinkSync(path.join(root, 'private'), path.join(allowed, 'escape'));
+    assert.throws(() => readAllowedFile(path.join(allowed, 'escape'), [allowed], 99), /outside/);
+  }
+  fs.symlinkSync(root, path.join(allowed, 'parent'), process.platform === 'win32' ? 'junction' : 'dir');
+  assert.throws(() => readAllowedFile(path.join(allowed, 'parent/private'), [allowed], 99), /outside/);
   assert.throws(() => readAllowedFile(allowed, [allowed], 99), /regular/);
 });
 test('weather parser reads literals but rejects executable code and prototype keys', () => {
@@ -37,7 +41,7 @@ test('job journal survives restart, isolates chats and preserves undelivered out
   assert.equal(journal.pending('a')[0].result.text, 'answer'); assert.equal(journal.pending('b').length, 0);
   assert.equal(journal.dismiss(job.journalId, 'b'), false);
   journal.delivered(job); assert.equal(createJobJournal(file).pending('a').length, 0);
-  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  if (process.platform !== 'win32') assert.equal(fs.statSync(file).mode & 0o777, 0o600);
 });
 test('inbox persists immediately, serializes a chat and lets other chats advance', async t => {
   const filePath = path.join(temp(t), 'inbox.json'); const seen=[]; let release;

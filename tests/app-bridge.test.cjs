@@ -24,7 +24,7 @@ const result=parseRolloutMessages(row('assistant','commentary','progress')+row('
 assert.deepEqual(result.map(x=>x.text),['progress','done']);
 });
 test('pipe protocol accepts fragmented frames and reports host errors',async t=>{
-const net=require('node:net');const dir=fs.mkdtempSync(path.join(os.tmpdir(),'app-pipe-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));const socket=path.join(dir,'sock');
+const net=require('node:net');const dir=fs.mkdtempSync(path.join(os.tmpdir(),'app-pipe-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));const socket=process.platform==='win32'?`\\\\.\\pipe\\aidolon-test-${path.basename(dir)}`:path.join(dir,'sock');
 const server=net.createServer(s=>s.once('data',()=>{const b=Buffer.from(JSON.stringify({jsonrpc:'2.0',id:1,result:{ok:true}})),h=Buffer.alloc(4);h.writeUInt32LE(b.length);s.write(h.subarray(0,2));setImmediate(()=>s.end(Buffer.concat([h.subarray(2),b])));}));await new Promise(r=>server.listen(socket,r));t.after(()=>new Promise(r=>server.close(r)));assert.deepEqual(await pipeRequest(socket,'tools/list',{}),{ok:true});
 });
 test('bot speech adapter passes chunk array and interruption version to the TTS queue',async()=>{

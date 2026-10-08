@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from whisper_runtime import load_model, use_fp16, translate_to_english
 
 DEFAULT_ALLOWED_LANGUAGES = ("en", "de", "zh")
 
@@ -77,10 +78,8 @@ def main() -> int:
         return 3
 
     try:
-        model = whisper.load_model(
-            args.model,
-            download_root=(args.cache_dir or None),
-        )
+        model = load_model(whisper, args.model, args.cache_dir)
+        fp16 = use_fp16(model)
         allowed_languages = parse_allowed_languages(args.allowed_languages)
 
         requested_language = normalize_language_code(args.language)
@@ -88,7 +87,7 @@ def main() -> int:
         if requested_language and requested_language != "auto" and requested_language in allowed_languages:
             explicit_language = requested_language
 
-        kwargs = {"fp16": False}
+        kwargs = {"fp16": fp16}
         if explicit_language:
             kwargs["language"] = explicit_language
         result = model.transcribe(args.audio, **kwargs)
@@ -98,7 +97,7 @@ def main() -> int:
         if not explicit_language:
             detected_language = normalize_language_code(result.get("language") or "")
             if detected_language and detected_language not in allowed_languages:
-                translated = model.transcribe(args.audio, fp16=False, task="translate")
+                translated = translate_to_english(whisper, model, args.audio, args.model, args.cache_dir, fp16)
                 text = str(translated.get("text") or "").strip()
 
         print(text)

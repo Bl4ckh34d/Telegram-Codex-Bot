@@ -783,14 +783,20 @@ function normalizeCodexModelName(value) {
   return model;
 }
 
-const CODEX_MODEL = normalizeCodexModelName(process.env.CODEX_MODEL || "gpt-5.5");
+const CODEX_MODEL = normalizeCodexModelName(process.env.CODEX_MODEL || "gpt-6.1-sol");
 const CODEX_MODEL_CHOICES = parseList(process.env.CODEX_MODEL_CHOICES || "")
   .map((model) => normalizeCodexModelName(model))
   .filter(Boolean);
 const CODEX_REASONING_EFFORT = String(process.env.CODEX_REASONING_EFFORT || "medium").trim();
 const CODEX_REASONING_EFFORT_CHOICES = parseList(process.env.CODEX_REASONING_EFFORT_CHOICES || "");
 const CODEX_DEFAULT_MODEL_CHOICES = Object.freeze([
+  "gpt-6.1-sol",
   "gpt-6-astra",
+  "gpt-6-sol",
+  "gpt-6-luna",
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
   "gpt-5.5",
   "gpt-5.4",
   "gpt-5.3-codex",
@@ -798,7 +804,13 @@ const CODEX_DEFAULT_MODEL_CHOICES = Object.freeze([
   "gpt-5.1-codex",
 ]);
 const CODEX_REASONING_EFFORTS_BY_MODEL = Object.freeze({
+  "gpt-6.1-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
   "gpt-6-astra": ["low", "medium", "high", "xhigh", "max", "ultra"],
+  "gpt-6-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
+  "gpt-6-luna": ["low", "medium", "high", "xhigh", "max"],
+  "gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
+  "gpt-5.6-terra": ["low", "medium", "high", "xhigh", "max", "ultra"],
+  "gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
   "gpt-5.5": ["low", "medium", "high", "xhigh"],
   "gpt-5.4": ["low", "medium", "high", "xhigh"],
   "gpt-5.3-codex": ["low", "medium", "high", "xhigh"],
@@ -13201,8 +13213,9 @@ function getEffectiveModelChoices() {
     out.push(s);
   };
   add(CODEX_MODEL);
-  for (const m of nativeModelCatalog.length ? nativeModelCatalog.map(x => x.model) : CODEX_DEFAULT_MODEL_CHOICES) add(m);
+  // Explicit choices must not disappear behind a large or stale native catalog.
   for (const m of CODEX_MODEL_CHOICES) add(m);
+  for (const m of nativeModelCatalog.length ? nativeModelCatalog.map(x => x.model) : CODEX_DEFAULT_MODEL_CHOICES) add(m);
   return out.length > 0 ? out.slice(0, 12) : [];
 }
 

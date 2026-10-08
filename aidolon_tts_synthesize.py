@@ -16,12 +16,14 @@ import sys
 import time
 import unicodedata
 import wave
+from tts_runtime import create_tts
 
 
 ENV_KEYS = (
     "TTS_MODEL",
     "TTS_REFERENCE_AUDIO",
     "TTS_SAMPLE_RATE",
+    "TTS_GPU_CACHE_FRACTION",
 )
 
 # HuggingFace tokenizers can spawn threads; in practice this has caused rare, hard-to-debug
@@ -124,7 +126,7 @@ def _is_tokenizer_input_type_error(exc: Exception) -> bool:
 
 
 def _reload_tts_runtime(model: str, ref_path: Path, tts_factory):
-    tts = tts_factory(model)
+    tts = create_tts(tts_factory, model)
     ctx = tts.encode_audio(str(ref_path))
     return tts, ctx
 
@@ -225,6 +227,8 @@ def main() -> int:
 
     env_file = Path(args.env_file).expanduser().resolve() if args.env_file else None
     env_from_file = _parse_env_file(env_file) if env_file and env_file.is_file() else {}
+    if "TTS_GPU_CACHE_FRACTION" in env_from_file:
+        os.environ.setdefault("TTS_GPU_CACHE_FRACTION", env_from_file["TTS_GPU_CACHE_FRACTION"])
 
     model = (args.model or os.getenv("TTS_MODEL") or env_from_file.get("TTS_MODEL") or "").strip()
     ref = (
@@ -316,7 +320,7 @@ def main() -> int:
 
     print("TTS: loading MiraTTS...", file=sys.stderr)
     try:
-        tts = MiraTTS(model)
+        tts = create_tts(MiraTTS, model)
     except Exception as exc:
         print(f"TTS: init failed: {exc}", file=sys.stderr)
         return 6
