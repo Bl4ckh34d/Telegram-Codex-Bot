@@ -6077,6 +6077,9 @@ async function capturePrimaryScreenshot(filePath) {
   }
 
   const psScript = [
+    "$ErrorActionPreference = 'Stop'",
+    ". $env:TG_SCREENSHOT_DPI_SCRIPT",
+    "Ensure-PerMonitorDpi",
     "Add-Type -AssemblyName System.Windows.Forms",
     "Add-Type -AssemblyName System.Drawing",
     "$target = $env:TG_SCREENSHOT_PATH",
@@ -6098,7 +6101,7 @@ async function capturePrimaryScreenshot(filePath) {
 
   await runPowerShellScript(
     psScript,
-    { TG_SCREENSHOT_PATH: filePath },
+    { TG_SCREENSHOT_PATH: filePath, TG_SCREENSHOT_DPI_SCRIPT: path.join(ROOT, "tools", "windows_dpi.ps1") },
     { timeoutMs: SCREENSHOT_CAPTURE_TIMEOUT_MS, stdoutLimit: 1 },
   );
 
@@ -6128,6 +6131,9 @@ async function captureAllScreenshots(outputDir, prefix = "screenshot") {
 
   const safePrefix = String(prefix || "screenshot").trim() || "screenshot";
   const psScript = [
+    "$ErrorActionPreference = 'Stop'",
+    ". $env:TG_SCREENSHOT_DPI_SCRIPT",
+    "Ensure-PerMonitorDpi",
     "Add-Type -AssemblyName System.Windows.Forms",
     "Add-Type -AssemblyName System.Drawing",
     "$dir = $env:TG_SCREENSHOT_DIR",
@@ -6166,6 +6172,7 @@ async function captureAllScreenshots(outputDir, prefix = "screenshot") {
     {
       TG_SCREENSHOT_DIR: dir,
       TG_SCREENSHOT_PREFIX: safePrefix,
+      TG_SCREENSHOT_DPI_SCRIPT: path.join(ROOT, "tools", "windows_dpi.ps1"),
     },
     { timeoutMs: SCREENSHOT_CAPTURE_TIMEOUT_MS, stdoutLimit: 64_000 },
   );

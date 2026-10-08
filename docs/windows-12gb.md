@@ -99,6 +99,17 @@ needed. POSIX permission-bit and process-group assertions remain platform
 specific. Test speech workers directly before starting Telegram polling.
 Never start a second poller for the same token.
 
+Windows `/screenshot` uses physical monitor pixels, including at 125% or higher
+display scaling. Both primary and all-monitor captures share
+`tools/windows_dpi.ps1` with the UI automation tool; copy this helper alongside
+`ui_automation.ps1` when updating a standalone companion.
+
+For a local single-display regression check, set
+`$env:AIDOLON_TEST_SCREEN_CAPTURE='1'` and run
+`node --test tests/windows-screenshot.test.cjs`. This opt-in test captures the
+desktop only into temporary files, checks PNG dimensions against the video
+controller's physical resolution, then removes the images. It sends nothing.
+
 For remote computers, keep host registries and SSH keys private. See
 [Companion setup and testing](../companion/README.md). Use fixed DHCP leases
 if firewall rules and SSH key restrictions are bound to the controller IP.
