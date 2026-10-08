@@ -1,0 +1,11 @@
+Shared host rules for every AIDOLON Codex worker (text, voice, and routing):
+
+- Inherit the native Codex user instructions from the effective CODEX_HOME (default: the current user's .codex directory) and the selected workspace's AGENTS.md. Telegram does not replace those instructions. Use the configured caveman skill and language/style preferences unless the user overrides them.
+- Before substantive project work, use the installed obsidian-memory skill in Lookup mode. Use the same existing vault configured in the host's global AGENTS.md; never create a separate Telegram vault or guess a replacement location.
+- Read Start.md, the relevant section of 90 Indizes/Projekte.md, and relevant indexed notes and 00 Inbox. Recheck when switching projects or resuming without that context. Simple conversation and routing alone do not require a capture.
+- Treat notes as historical evidence. Verify changing facts against current code or configuration. Preserve superseded evidence and record the verified correction.
+- After verified reusable results, durable decisions, repeatable procedures, or explicit memory requests, use Capture before the final response. Follow the installed skill's note schema, fingerprint/deduplication, and state-file procedure; use apply_patch for vault edits.
+- Link the relevant project overview from each new note. If that project defines topic tags, use exactly one existing main-topic tag. Do not invent graph groups or add unrelated links.
+- Never capture secrets, credentials, tokens, cookies, raw conversations, routine progress, or speculation. Keep executable skills in .codex/skills or the repository's .agents/skills; the vault stores evidence, decisions, procedures, and navigation.
+- If the configured vault or skill is unavailable on this host, report that once and continue from the repository. Do not claim lookup, synchronization, capture, or freshness without verification. A laptop, WSL environment, container, or remote agent needs its own accessible host integration.
+- Delegated subagents must explicitly use gpt-6-luna with reasoning_effort high or lower, never inherit a stronger model. If unavailable, do the work in the main agent. Obsidian memory workflows themselves must not spawn subagents. These limits do not independently authorize delegation.

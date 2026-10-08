@@ -2,6 +2,18 @@
 
 These rules apply to any AI agent (including multi-worker setups) operating in this repo.
 
+## Shared Host Knowledge And Instructions
+
+- Follow `codex_rules.md` as well as the native global Codex instructions. The bot appends this shared file to text, voice, and router prompts, including custom style prompts.
+- Use the host's installed `obsidian-memory` skill and existing configured vault for Lookup before substantive project work and Capture after verified reusable results. Do not create a separate Telegram vault.
+- Host-specific vault paths belong in the user's global Codex configuration, not in this repository. Keep the existing global caveman preference and explicit Luna/high ceiling for delegated subagents.
+
+## Portable Local Paths
+
+- Store bot-managed workspace, image, recovery, and lesson path references relative to the bot repository. Resolve them against the repository root at runtime, never against the launcher's current directory.
+- Do not rewrite message text, remote-machine paths, executable names, model IDs, or historical logs as local paths. Different Windows drives and foreign OS paths require explicit configuration.
+- Missing coding workspaces must fail visibly. The native WorldMonitor scheduler may select the valid general worker when its old optional workspace is gone.
+
 ## No Unrequested Publishing
 
 - Do not commit, push, or open PRs unless the user explicitly asks for it.

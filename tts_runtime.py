@@ -23,5 +23,11 @@ def create_tts(factory, model):
     cache_fraction = float(os.getenv("TTS_GPU_CACHE_FRACTION", "0.2"))
     if not 0 < cache_fraction < 1:
         raise ValueError("TTS_GPU_CACHE_FRACTION must be greater than 0 and less than 1")
+    # TurboMind prefix reuse can stall on successive different prompts on Windows.
+    # Keep the model resident, but avoid that optimization by default on this host.
+    prefix_cache = os.getenv("TTS_PREFIX_CACHING", "0" if os.name == "nt" else "1").strip().lower()
+    if prefix_cache not in ("0", "1", "false", "true", "no", "yes", "off", "on"):
+        raise ValueError("TTS_PREFIX_CACHING must be a boolean (0 or 1)")
     prepare_cuda()
-    return factory(model, cache_max_entry_count=cache_fraction)
+    return factory(model, cache_max_entry_count=cache_fraction,
+                   enable_prefix_caching=prefix_cache in ("1", "true", "yes", "on"))

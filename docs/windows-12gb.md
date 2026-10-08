@@ -102,3 +102,6 @@ Never start a second poller for the same token.
 For remote computers, keep host registries and SSH keys private. See
 [Companion setup and testing](../companion/README.md). Use fixed DHCP leases
 if firewall rules and SSH key restrictions are bound to the controller IP.
+# Successive speech requests on Windows
+
+`TTS_PREFIX_CACHING=0` is the Windows default. With the installed TurboMind backend, prefix reuse stalled on successive different speech prompts; the persistent model remains loaded when prefix caching is disabled. `TTS_PREFIX_CACHING=1` explicitly re-enables the optimization for another validated backend. Both the persistent worker and single-shot recovery use the same setting.

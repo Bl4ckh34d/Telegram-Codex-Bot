@@ -33,7 +33,20 @@ class TtsRuntimeTests(unittest.TestCase):
             state = {"model": "model", "default_ref_path": Path("reference.wav"), "tts_factory": Runtime}
             server._reload_tts_runtime(state)
             single._reload_tts_runtime("model", Path("reference.wav"), Runtime)
-        self.assertEqual(loads, [("model", {"cache_max_entry_count": 0.15})] * 2)
+        self.assertEqual(loads, [("model", {"cache_max_entry_count": 0.15, "enable_prefix_caching": os.name != "nt"})] * 2)
+
+    def test_windows_disables_prefix_cache_but_allows_explicit_override(self):
+        with patch.dict(os.environ, {}, clear=True), patch("tts_runtime.prepare_cuda"), patch("tts_runtime.os.name", "nt"):
+            options = create_tts(lambda model, **kw: kw, "model")
+            self.assertFalse(options["enable_prefix_caching"])
+            with patch.dict(os.environ, {"TTS_PREFIX_CACHING": "1"}):
+                self.assertTrue(create_tts(lambda model, **kw: kw, "model")["enable_prefix_caching"])
+
+    def test_invalid_prefix_cache_setting_fails_before_model_allocation(self):
+        with patch.dict(os.environ, {"TTS_PREFIX_CACHING": "maybe"}), patch("tts_runtime.prepare_cuda") as prepare:
+            with self.assertRaises(ValueError):
+                create_tts(lambda *a, **kw: self.fail("must not load model"), "model")
+            prepare.assert_not_called()
 
 
 if __name__ == "__main__":

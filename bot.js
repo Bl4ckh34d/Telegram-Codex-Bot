@@ -18,6 +18,7 @@ const { spawnSync } = require("child_process");
 const { spawn, terminateChildTree, terminateAllChildren } = require("./lib/process_lifecycle");
 const { readAllowedFile } = require("./lib/file_access");
 const { createJobJournal } = require("./lib/job_journal");
+const { encodeLocalPath, decodeLocalPath, mapStatePaths, isForeignAbsolute } = require("./lib/portable_paths");
 const { createTelegramInbox } = require("./lib/telegram_inbox");
 const { withCodexRpc } = require("./lib/codex_rpc");
 const { createConversationState } = require("./lib/conversation_state");
@@ -774,7 +775,7 @@ const RESUME_SCAN_FILE_LIMIT = toInt(process.env.RESUME_SCAN_FILE_LIMIT, 240);
 const CODEX_BIN = String(process.env.CODEX_BIN || "codex").trim();
 const CODEX_USE_WSL = String(process.env.CODEX_USE_WSL || "auto").trim().toLowerCase();
 const CODEX_WSL_BIN = String(process.env.CODEX_WSL_BIN || "").trim();
-const CODEX_WORKDIR = String(process.env.CODEX_WORKDIR || ROOT).trim();
+const CODEX_WORKDIR = decodeLocalPath(process.env.CODEX_WORKDIR || ROOT, ROOT);
 function normalizeCodexModelName(value) {
   const model = String(value || "").trim();
   if (!model) return "";
@@ -1008,6 +1009,7 @@ if (ATTACH_ENABLED && !ensureDirSafe(ATTACH_ROOT, { label: "attachments", requir
 const CODEX_PROMPT_FILE = resolveMaybeRelativePath(
   process.env.CODEX_PROMPT_FILE || path.join(ROOT, "codex_prompt.txt"),
 );
+const CODEX_SHARED_RULES_FILE = resolveMaybeRelativePath(process.env.CODEX_SHARED_RULES_FILE || "codex_rules.md");
 const CODEX_VOICE_PROMPT_FILE = resolveMaybeRelativePath(
   process.env.CODEX_VOICE_PROMPT_FILE || path.join(ROOT, "codex_prompt_voice.txt"),
 );
@@ -1187,7 +1189,7 @@ const WORLDMONITOR_INTERVAL_HEADLINES_MIN_LEVEL = String(
 ).trim().toLowerCase() || "critical";
 const WORLDMONITOR_TOP_COUNTRIES = toInt(process.env.WORLDMONITOR_TOP_COUNTRIES, 5, 1, 12);
 const WORLDMONITOR_ALERT_CHAT_ID = String(process.env.WORLDMONITOR_ALERT_CHAT_ID || PRIMARY_CHAT_ID).trim() || PRIMARY_CHAT_ID;
-const WORLDMONITOR_WORKDIR = resolveMaybeRelativePath(process.env.WORLDMONITOR_WORKDIR || "");
+const WORLDMONITOR_WORKDIR = decodeLocalPath(process.env.WORLDMONITOR_WORKDIR || "", ROOT);
 const WORLDMONITOR_WORKER_TITLE = String(process.env.WORLDMONITOR_WORKER_TITLE || "WorldMonitor Intel").trim() || "WorldMonitor Intel";
 const WORLDMONITOR_SUMMARY_MODEL = String(process.env.WORLDMONITOR_SUMMARY_MODEL || "").trim();
 const WORLDMONITOR_SUMMARY_REASONING = String(process.env.WORLDMONITOR_SUMMARY_REASONING || "low").trim();
@@ -1376,7 +1378,7 @@ try {
   process.exit(1);
 }
 
-const state = readJson(STATE_PATH, {
+const state = mapStatePaths(readJson(STATE_PATH, {
   lastUpdateId: 0,
   chatSessions: {},
   lastImages: {},
@@ -1388,7 +1390,7 @@ const state = readJson(STATE_PATH, {
   weatherDaily: {},
   weatherLocationsByChat: {},
   orch: {},
-});
+}), value => decodeLocalPath(value, ROOT));
 const workflowCatalogState = readJson(WORKFLOW_CATALOG_PATH, {
   chatAutomationPrefs: {},
 });
@@ -1805,6 +1807,7 @@ let pendingStatePersistImmediate = false;
 const orchWorkerRuntime = createOrchWorkerRuntime({
   fs,
   path,
+  ROOT,
   orchWorkers,
   orchActiveWorkerByChat,
   orchSessionByChatWorker,
@@ -2056,7 +2059,7 @@ function normalizeOrchState(stateObj, { legacyChatSessions = {} } = {}) {
 }
 
 function buildStateSnapshot() {
-  return {
+  return mapStatePaths({
     lastUpdateId,
     lastImages,
     chatPrefs,
@@ -2077,7 +2080,7 @@ function buildStateSnapshot() {
       nextWorkerNum: orchNextWorkerNum,
       nextTaskNum: orchNextTaskNum,
     },
-  };
+  }, value => encodeLocalPath(value, ROOT));
 }
 
 function buildWorkflowCatalogSnapshot() {
@@ -2931,7 +2934,7 @@ function initOrchLanes() {
   orchLaneRegistryRuntime.initOrchLanes();
 }
 
-const jobJournal = createJobJournal(path.join(RUNTIME_DIR, "jobs.json"));
+const jobJournal = createJobJournal(path.join(RUNTIME_DIR, "jobs.json"), { baseDir: ROOT });
 
 const orchQueueRuntime = createOrchQueueRuntime({
   jobJournal,
@@ -2960,6 +2963,7 @@ const orchQueueRuntime = createOrchQueueRuntime({
 });
 
 const orchLaneRuntime = createOrchLaneRuntime({
+  TTS_SEND_TEXT,
   jobJournal,
   conversationState,
   path,
@@ -3553,7 +3557,8 @@ function getPromptPreamble(replyStyle) {
       : CODEX_PROMPT_FILE;
   const fallback = isRouter ? defaultRouterPromptPreamble() : isVoice ? defaultVoicePromptPreamble() : defaultPromptPreamble();
   const fromFile = readTextFileCached(filePath).trim();
-  return fromFile || fallback;
+  const sharedRules = readTextFileCached(CODEX_SHARED_RULES_FILE).trim();
+  return [fromFile || fallback, sharedRules].filter(Boolean).join("\n\n");
 }
 
 function formatCodexPrompt(userText, options = {}) {
@@ -11458,12 +11463,15 @@ function compactWorldMonitorCountryList(items, limit = 3) {
 
 function ensureWorldMonitorWorker() {
   const stored = String(worldMonitorMonitor.workerId || "").trim();
-  if (stored && getCodexWorker(stored)) return stored;
+  const usable = (workdir) => {
+    if (!workdir || isForeignAbsolute(workdir, path)) return false;
+    try { return fs.statSync(workdir).isDirectory(); } catch { return false; }
+  };
 
   let workerId = "";
 
   const configuredWorkdir = String(WORLDMONITOR_WORKDIR || "").trim();
-  if (configuredWorkdir && fs.existsSync(configuredWorkdir)) {
+  if (configuredWorkdir && usable(configuredWorkdir)) {
     workerId = findWorkerByWorkdir(configuredWorkdir);
     if (!workerId && listCodexWorkers().length < ORCH_MAX_CODEX_WORKERS) {
       try {
@@ -11474,12 +11482,14 @@ function ensureWorldMonitorWorker() {
     }
   }
 
+  if (!workerId && stored && usable(getCodexWorker(stored)?.workdir)) workerId = stored;
+
   if (!workerId) {
     const wantedTitle = String(WORLDMONITOR_WORKER_TITLE || "").trim().toLowerCase();
     if (wantedTitle) {
       for (const w of listCodexWorkers()) {
         const title = String(w.title || "").trim().toLowerCase();
-        if (title && title === wantedTitle) {
+        if (title && title === wantedTitle && usable(w.workdir)) {
           workerId = w.id;
           break;
         }
@@ -16861,10 +16871,45 @@ async function runTtsBatchJobPipelined(job, lane) {
   let fallbackCount = 0;
   const failedVoiceChunks = [];
   let firstFallbackError = "";
+  const flushFailedVoiceChunks = async () => {
+    if (failedVoiceChunks.length === 0) return true;
+      const failedText = failedVoiceChunks.join(" ").trim();
+      const suffix = firstFallbackError
+        ? `\n\n(Voice reply failed for ${failedVoiceChunks.length} chunk(s): ${firstFallbackError})`
+        : `\n\n(Voice reply failed for ${failedVoiceChunks.length} chunk(s).)`;
+      const mergedFallbackText = `${failedText}${suffix}`;
+      try {
+        await sendMessage(job.chatId, mergedFallbackText, {
+          replyToMessageId: job.replyToMessageId,
+          routeWorkerId: job.workerId,
+          routeTaskId: Number(job?.taskId || 0),
+          routeSessionId: String(job?.routeSessionId || getSessionForChatWorker(job.chatId, job.workerId) || "").trim(),
+        });
+        failedVoiceChunks.length = 0;
+        firstFallbackError = "";
+        return true;
+      } catch (err) {
+        log(`TTS merged fallback send failed: ${redactError(err?.message || err)}`);
+        return false;
+      }
+  };
   try {
     for (let idx = 0; idx < texts.length; idx += 1) {
       if (job.cancelRequested) {
         return { ok: false, text: "TTS canceled." };
+      }
+
+      // A background report must not monopolize the speech lane across all chunks.
+      if (job.backgroundVoice
+        && lane?.queue?.some(queued => queued.source === "voice-reply" && !queued.backgroundVoice)
+        && await flushFailedVoiceChunks()) {
+        const queued = await enqueueTtsBatch(job.chatId, texts.slice(idx), original.source, {
+          backgroundVoice: true, audioVersion: job.audioVersion, ttsPreset: original.ttsPreset,
+          workerId: job.workerId, replyToMessageId: job.replyToMessageId,
+          routeTaskId: job.taskId, routeSessionId: job.routeSessionId,
+          skipResultText: originalSkipResultText, afterText, attachments,
+        });
+        if (queued) return { ok: true, text: "", skipSendMessage: true };
       }
 
       const chunkText = String(texts[idx] || "").trim();
@@ -16935,23 +16980,7 @@ async function runTtsBatchJobPipelined(job, lane) {
     if (fallbackCount > 0) {
       log(`TTS batch completed with fallbacks: voice_sent=${sentCount}, text_fallbacks=${fallbackCount}, total=${texts.length}`);
     }
-    if (isVoiceReply && failedVoiceChunks.length > 0) {
-      const failedText = failedVoiceChunks.join(" ").trim();
-      const suffix = firstFallbackError
-        ? `\n\n(Voice reply failed for ${failedVoiceChunks.length} chunk(s): ${firstFallbackError})`
-        : `\n\n(Voice reply failed for ${failedVoiceChunks.length} chunk(s).)`;
-      const mergedFallbackText = `${failedText}${suffix}`;
-      try {
-        await sendMessage(job.chatId, mergedFallbackText, {
-          replyToMessageId: job.replyToMessageId,
-          routeWorkerId: job.workerId,
-          routeTaskId: Number(job?.taskId || 0),
-          routeSessionId: String(job?.routeSessionId || getSessionForChatWorker(job.chatId, job.workerId) || "").trim(),
-        });
-      } catch (err) {
-        log(`TTS merged fallback send failed: ${redactError(err?.message || err)}`);
-      }
-    }
+    if (isVoiceReply) await flushFailedVoiceChunks();
 
     if (originalSkipResultText) {
       return { ok: true, text: "", skipSendMessage: true, afterText, attachments };

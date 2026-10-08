@@ -24,6 +24,7 @@ ENV_KEYS = (
     "TTS_REFERENCE_AUDIO",
     "TTS_SAMPLE_RATE",
     "TTS_GPU_CACHE_FRACTION",
+    "TTS_PREFIX_CACHING",
 )
 
 # HuggingFace tokenizers can spawn threads; in practice this has caused rare, hard-to-debug
@@ -227,8 +228,9 @@ def main() -> int:
 
     env_file = Path(args.env_file).expanduser().resolve() if args.env_file else None
     env_from_file = _parse_env_file(env_file) if env_file and env_file.is_file() else {}
-    if "TTS_GPU_CACHE_FRACTION" in env_from_file:
-        os.environ.setdefault("TTS_GPU_CACHE_FRACTION", env_from_file["TTS_GPU_CACHE_FRACTION"])
+    for key in ("TTS_GPU_CACHE_FRACTION", "TTS_PREFIX_CACHING"):
+        if key in env_from_file:
+            os.environ.setdefault(key, env_from_file[key])
 
     model = (args.model or os.getenv("TTS_MODEL") or env_from_file.get("TTS_MODEL") or "").strip()
     ref = (
