@@ -3,6 +3,9 @@
 Keep `TTS_MODEL=models/MiraTTS` for English/Chinese. After downloading the gated
 German fine-tune, set `TTS_MODEL_DE=models/MiraToffel` and optionally
 `TTS_DEFAULT_LANGUAGE=de` in the private `.env`, then use `/restart`.
+Startup prewarming loads the model for that configured default language.
+`TTS_SEND_TEXT=0` keeps successful voice replies voice-only in the ordinary bot;
+app topics use `/app output auto` to follow text versus voice input.
 
 Both models use `TTS_REFERENCE_AUDIO` (including an English reference sample).
 No German reference is required by the bot. Speaker similarity across languages

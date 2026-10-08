@@ -6,6 +6,7 @@ const bridge=createAppChatBridge({filePath:path.join(dir,'state.json'),request:a
 return {bridge,calls,sent,spoken,menus,setItems:x=>items=x};}
 test('selection skips old history; new commentary is spoken once with its preset',async t=>{
 const f=fixture(t);const old={type:'agentMessage',id:'old',text:'old',phase:'final_answer',complete:true};f.setItems([old]);await f.bridge.command('a','list');await f.bridge.command('a','use 1');
+await f.bridge.command('a','output both');
 f.setItems([old,{...old,id:'new',text:'progress',phase:'commentary'}]);await f.bridge.poll('a',f.bridge.target('a'));await f.bridge.poll('a',f.bridge.target('a'));
 assert.deepEqual(f.spoken,[{text:'progress',preset:'starship-comms'}]);assert.equal(await f.bridge.route('a','followup'),true);assert.equal(f.calls.at(-1).action,'send');assert.equal(f.calls.at(-1).threadId,'thread');
 });
@@ -14,6 +15,7 @@ const f=fixture(t);await f.bridge.command('a','list');await f.bridge.command('a'
 });
 test('selected app voice also applies to final answers',async t=>{
  const f=fixture(t);await f.bridge.command('a','list');await f.bridge.command('a','use 1');
+ await f.bridge.command('a','output both');
  f.setItems(['commentary','final_answer'].map((phase,i)=>({type:'agentMessage',id:String(i),text:phase,phase,complete:true})));
  await f.bridge.poll('a',f.bridge.target('a'));
  assert.deepEqual(f.spoken.map(x=>x.preset),['starship-comms','starship-comms']);
@@ -40,10 +42,19 @@ test('repo grouping follows project order and use numbers match the grouped disp
 });
 test('voice menu has valid buttons; chosen voice is retained and applied to commentary',async t=>{
   const f=fixture(t);await f.bridge.command('a','list');await f.bridge.command('a','use 1');await f.bridge.command('a','voice');
-  const buttons=f.menus[0].replyMarkup.inline_keyboard.flat();assert.equal(buttons.length,6);for(const b of buttons)assert(Buffer.byteLength(b.callback_data)<=64);
+  const buttons=f.menus[0].replyMarkup.inline_keyboard.flat();assert.equal(buttons.length,7);for(const b of buttons)assert(Buffer.byteLength(b.callback_data)<=64);
   await f.bridge.command('a','voice off');assert.equal(f.bridge.target('a').preset,'off');
+  await f.bridge.route('a','Sprich bitte',f.bridge.target('a'),{inputMode:'voice'});
   f.setItems([{type:'agentMessage',id:'new',text:'hello',phase:'commentary',complete:true}]);await f.bridge.poll('a',f.bridge.target('a'));assert.equal(f.spoken[0].preset,'off');
   await f.bridge.command('a','voice mute');assert.equal(f.bridge.target('a').voice,false);
+});
+test('automatic app output follows text versus voice input without duplicating channels',async t=>{
+ const f=fixture(t);await f.bridge.command('a','list');await f.bridge.command('a','use 1');
+ const respond=async id=>{f.setItems([{type:'agentMessage',id,text:'Antwort '+id,phase:'final_answer',complete:true}]);const before=f.sent.length;await f.bridge.poll('a',f.bridge.target('a'));return f.sent.length-before;};
+ await f.bridge.route('a','Text');assert.equal(await respond('one'),1);assert.equal(f.spoken.length,0);
+ await f.bridge.route('a','Gesprochene Nachricht',f.bridge.target('a'),{inputMode:'voice'});assert.equal(await respond('two'),0);assert.equal(f.spoken.length,1);
+ await f.bridge.command('a','voice off');assert.equal(f.bridge.target('a').outputMode,'auto');
+ await f.bridge.route('a','Wieder Text');assert.equal(await respond('three'),1);assert.equal(f.spoken.length,1);
 });
 test('resumed chat reads newest owned rollout instead of first filename match',t=>{
   const {localMessages}=require('../companion/app-bridge');

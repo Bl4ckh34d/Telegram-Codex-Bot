@@ -64,7 +64,12 @@ context belongs to the local Codex host before selecting a pipe.
   degraded coverage rather than silently claiming every chat was synchronized.
 - Existing bindings poll with bounded concurrency. Active chats are checked
   frequently; unchanged idle chats are checked at least once per minute.
-- `/app output text|voice|both`, `/app voice`, and `/app screenshots on|off`
+- The default output mode is `auto`: text input receives text; voice input
+  receives speech after local transcription. Existing bindings migrate once to
+  this default. The latest Telegram input selects the channel for subsequent
+  commentary and final answers; new bindings start with text. Speech errors may
+  fall back to text so an answer remains accessible.
+- `/app output auto|text|voice|both`, `/app voice`, and `/app screenshots on|off`
   control that topic. Screenshots default off. `/app off` prevents automatic
   recreation for that chat; explicitly reconnect through `/app list` and
   `/app topic <number>` when wanted.

@@ -20,7 +20,7 @@ test('topics retain independent persisted bindings and settings; repeated sync d
  const opts={filePath:path.join(dir,'state.json'),request:async r=>{calls.push(r);return r.action==='list'?{threads:['a','b'].map(id=>({kind:'codex',id,title:id,hostId:'local',companionId:'win',cwd:'C:\\repo'}))}:{turns:[{id:'old',items:[{id:'old',type:'agentMessage'}]}]};},createTopic:async()=>{created++;return `-10042~${next++}`;},sendText:async()=>{},speak:async()=>{},interruptSpeech(){},validPreset:()=>true};
  const b=createAppChatBridge(opts);await b.command('-10042','topics');assert.equal(created,2);assert.equal(b.target('-10042'),null);
  await b.command('-10042~10','voice hologram-ai');await b.command('-10042~10','output text');
- assert.equal(b.target('-10042~11').preset,'starship-comms');assert.equal(b.target('-10042~11').outputMode,'both');
+ assert.equal(b.target('-10042~11').preset,'starship-comms');assert.equal(b.target('-10042~11').outputMode,'auto');
  await b.command('-10042~11','topics');assert.equal(created,2);
  const restored=createAppChatBridge(opts);assert.equal(restored.target('-10042~10').preset,'hologram-ai');
  await restored.route('-10042~11','hello');assert.equal(calls.at(-1).threadId,'b');assert.equal(calls.at(-1).companionId,'win');
@@ -35,12 +35,19 @@ test('inbox recovery cannot dismiss an interrupted message from a sibling topic'
 });
 test('migration silences private forwarding and transfers its voice settings to the topic',async t=>{
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'topic-migrate-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
- const filePath=path.join(dir,'state.json');fs.writeFileSync(filePath,JSON.stringify({'42':{threadId:'a',hostId:'local',preset:'alien-terminal',outputMode:'voice',voice:true,seen:[]}}));
+ const filePath=path.join(dir,'state.json');fs.writeFileSync(filePath,JSON.stringify({'42':{threadId:'a',hostId:'local',preset:'alien-terminal',outputMode:'voice',outputModeVersion:1,voice:true,seen:[]}}));
  let reads=0;
  const b=createAppChatBridge({filePath,migrateFromChat:'42',request:async r=>{if(r.action==='list')return {threads:[{kind:'codex',id:'a',hostId:'local',companionId:'win'}]};reads++;return {turns:[]};},createTopic:async()=>'-10042~20',sendText:async()=>{},speak:async()=>{},interruptSpeech(){},validPreset:()=>true});
  await b.poll('42',b.target('42'));assert.equal(reads,0);
  await b.command('-10042','topics');assert.equal(b.target('42'),null);assert.equal(b.target('-10042'),null);
  assert.equal(b.target('-10042~20').preset,'alien-terminal');assert.equal(b.target('-10042~20').outputMode,'voice');
+});
+test('old bindings migrate once to automatic replies; later explicit preferences survive restart',async t=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'topic-mode-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));const filePath=path.join(dir,'state.json');
+ fs.writeFileSync(filePath,JSON.stringify({'-10042~20':{threadId:'a',outputMode:'both',seen:[]}}));
+ const options={filePath,request:async()=>({turns:[]}),sendText:async()=>{},speak:async()=>{},interruptSpeech(){},validPreset:()=>true};
+ const b=createAppChatBridge(options);assert.equal(b.target('-10042~20').outputMode,'auto');await b.command('-10042~20','output voice');
+ assert.equal(createAppChatBridge(options).target('-10042~20').outputMode,'voice');
 });
 test('poll failures are debounced and recovery clears persisted error without notification spam',async t=>{
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'topic-error-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));const filePath=path.join(dir,'state.json');

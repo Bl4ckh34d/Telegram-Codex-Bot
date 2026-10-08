@@ -4,6 +4,11 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const { EventEmitter } = require('node:events');
 const { detectTtsLanguage, resolveTtsModel, createSerialTtsRequests } = require('../lib/tts_language');
+test('startup prewarms the configured default language model',async()=>{
+ const source=fs.readFileSync(require.resolve('../bot.js'),'utf8');const start=source.indexOf('async function prewarmAudioKeepalives('),end=source.indexOf('async function runWhisperJob(',start);let loaded;
+ const c=vm.createContext({WHISPER_ENABLED:false,TTS_ENABLED:true,TTS_PREWARM_ON_STARTUP:true,TTS_MODEL:'base',TTS_MODEL_DE:'german',TTS_DEFAULT_LANGUAGE:'de',TTS_REFERENCE_AUDIO:'voice.wav',AIDOLON_TTS_SERVER_SCRIPT_PATH:'worker.py',resolveTtsPythonBin:()=> 'python',fs:{existsSync:()=>true},resolveTtsModel,ensureTtsKeepaliveRunning:async(p,m)=>{loaded=m;},ttsKeepalive:{proc:{},ready:true},log(){},redactError:x=>x});
+ vm.runInContext(source.slice(start,end),c);await c.prewarmAudioKeepalives();assert.equal(loaded,'german');
+});
 
 test('routes German, English and Chinese without treating code or URLs as language', () => {
   for (const [text, expected] of [

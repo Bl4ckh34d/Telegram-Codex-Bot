@@ -18258,7 +18258,8 @@ async function prewarmAudioKeepalives() {
     } else {
       tasks.push((async () => {
         try {
-          await ensureTtsKeepaliveRunning(pyBin);
+          const model = resolveTtsModel("", { baseModel: TTS_MODEL, germanModel: TTS_MODEL_DE, defaultLanguage: TTS_DEFAULT_LANGUAGE });
+          await ensureTtsKeepaliveRunning(pyBin, model);
           if (ttsKeepalive.proc && ttsKeepalive.ready) {
             log("TTS keepalive prewarmed.");
           }
@@ -18348,7 +18349,7 @@ async function runWhisperJob(job) {
       excludeMessageIds: [userMessageId, ...replyThreadIds],
     });
 
-    if (job.appTarget && appChatBridge && await appChatBridge.route(chatId, transcript, job.appTarget)) {
+    if (job.appTarget && appChatBridge && await appChatBridge.route(chatId, transcript, job.appTarget, { inputMode: "voice" })) {
       return { ok: true, text: "", skipSendMessage: true };
     }
     const newsHandled = await maybeHandleNaturalNewsRequest(chatId, transcript, { replyToMessageId });
