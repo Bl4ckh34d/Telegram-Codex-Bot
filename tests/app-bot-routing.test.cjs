@@ -9,6 +9,7 @@ test('bound topic text and slash commands bypass bot command/router paths; attac
  assert.deepEqual(routed,['Hello','/model astra']);assert.equal(sent.length,0);assert.equal(files.length,1);
  let speechCommand;context.handleCommand=async(c,text)=>{speechCommand=text;return true;};
  await context.handleIncomingMessage({text:'/speech pause'});assert.equal(speechCommand,'/speech pause');assert.equal(routed.length,2);
+ await context.handleIncomingMessage({text:'/exit'});assert.equal(speechCommand,'/exit');assert.equal(routed.length,2);
  await context.handleIncomingMessage({forum_topic_closed:{},from:{is_bot:false}});await context.handleIncomingMessage({forum_topic_closed:{},from:{is_bot:true}});assert.deepEqual(lifecycle,['closed']);
  await context.handleIncomingMessage({forum_topic_edited:{name:'PC · New'},from:{is_bot:false}});await context.handleIncomingMessage({forum_topic_edited:{name:'echo'},from:{is_bot:true}});await context.handleIncomingMessage({forum_topic_edited:{icon_custom_emoji_id:'1'},from:{is_bot:false}});assert.deepEqual(renames,['PC · New']);
 });

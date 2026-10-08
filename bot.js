@@ -1836,6 +1836,7 @@ const orchLaneRegistryRuntime = createOrchLaneRegistryRuntime({
 initOrchLanes();
 let nextJobId = 1;
 let shuttingDown = false;
+let botExitRequested = false;
 const orchPendingSpawnByChat = new Map(); // chatId -> { desiredWorkdir, title, promptText, source, options, createdAt }
 const pendingCommandsById = new Map();
 const pendingCommandIdByChat = new Map();
@@ -5604,6 +5605,7 @@ function getTelegramCommandList() {
     { command: "app", description: "connect a Windows Codex app chat with Telegram" },
     { command: "recover", description: "inspect unfinished work and undelivered results" },
     { command: "restart", description: "restart only when all workers are idle" },
+    { command: "exit", description: "stop the bot completely without restarting" },
   ];
 }
 
@@ -6908,6 +6910,7 @@ async function sendHelp(chatId) {
     "- /voice [name|single|worker|list|default] - set TTS mode/preset (live, no restart)",
     "- /tts <text> - send a TTS voice message (requires TTS_ENABLED=1)",
     "- /speech pause|resume|status - release TTS VRAM or enable speech again",
+    "- /exit - stop the bot completely (including active bot jobs); start it manually to return",
     "- /abtest [text] - send one sample per voice preset for A/B listening",
     `- /sendfile <path> [caption] - send a file attachment (from ${ATTACH_ROOTS_HINT})`,
     "",
@@ -13871,6 +13874,8 @@ function getParsedCommandRouter() {
     cancelPendingRestartRequest,
     requestRestartWhenIdle,
 
+    requestBotExit,
+
     // Codex CLI + sessions
     sanitizeRawCodexArgs,
     setPendingCommandForChat,
@@ -18883,7 +18888,7 @@ async function handleIncomingMessage(msg) {
   if (appChatBridge?.creation && await appChatBridge.creation.text(chatId, String(msg.from?.id || ""), text, msg.reply_to_message?.message_id)) return;
 
   const replyToMessageId = Number(msg?.message_id || 0);
-  if (appChatBridge?.target(chatId) && !/^\/(?:app|help|restart|speech)(?:@\w+)?(?:\s|$)/i.test(text)) {
+  if (appChatBridge?.target(chatId) && !/^\/(?:app|help|restart|speech|exit)(?:@\w+)?(?:\s|$)/i.test(text)) {
     await appChatBridge.route(chatId, text);
     return;
   }
@@ -19021,7 +19026,7 @@ async function pollLoop() {
             const parsedControl = parseCommand(String(msg.text || ""));
             const naturalControl = parseNaturalSafeCommandIntent(String(msg.text || ""));
             const command = parsedControl?.cmd || (naturalControl.confidence >= NATURAL_SAFE_COMMAND_INTENT_THRESHOLD ? naturalControl.cmd : "");
-            if (["/cancel", "/stop", "/clear", "/status", "/queue", "/model", "/recover", "/restart", "/new", "/start"].includes(command)) {
+            if (["/cancel", "/stop", "/clear", "/status", "/queue", "/model", "/recover", "/restart", "/exit", "/new", "/start"].includes(command)) {
               await handleIncomingMessage(msg);
             } else if (isAllowedMessage(msg)) {
               if (msg.voice || msg.audio) msg.audioVersion = interruptVoiceReplies(conversationKey(msg));
@@ -19073,7 +19078,18 @@ async function pollLoop() {
   }
 }
 
+async function requestBotExit(chatId) {
+  botExitRequested = true;
+  cancelPendingRestartRequest();
+  try {
+    await sendMessage(chatId, "Bot wird beendet. Aktive Bot-Aufträge werden abgebrochen. Kein automatischer Neustart; zum Starten start.cmd oder start.sh ausführen.");
+  } catch (error) { log(`Exit acknowledgement failed: ${redactError(error.message)}`); }
+  // Let the Telegram update offset persist before exiting, avoiding replay.
+  setTimeout(() => shutdown(0, "telegram_exit"), 200);
+}
+
 async function shutdown(code = 0, reason = "") {
+  if (botExitRequested) { code = 0; reason = "telegram_exit"; }
   if (shuttingDown) return;
   shuttingDown = true;
   stopTtsControl?.();

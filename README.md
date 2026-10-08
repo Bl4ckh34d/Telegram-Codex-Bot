@@ -89,6 +89,7 @@ Current slash commands supported by the bot:
 
 Core:
 - `/start` or `/help` - show help
+- `/exit` - stop the bot, its active CLI/media jobs and polling without restarting; run `start.cmd` or `start.sh` manually to return. Works in linked app topics too. Existing native Codex app chats remain available.
 - `/status` - assistant and queue status
 - `/app new` - choose PC/laptop, local project or no repository, then create an app chat and topic
 - `/app list` - list existing app chats; topics synchronize with reachable devices
