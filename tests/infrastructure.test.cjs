@@ -13,6 +13,26 @@ const { readTextLimited } = require('../lib/network_limits');
 const { spawn, terminateChildTree } = require('../lib/process_lifecycle');
 function temp(t) { const p = fs.mkdtempSync(path.join(os.tmpdir(), 'aidolon-test-')); t.after(() => fs.rmSync(p, { recursive: true, force: true })); return p; }
 const tick = () => new Promise(resolve => setImmediate(resolve));
+test('atomic JSON writes retry transient Windows locks and preserve old data on permanent errors',t=>{
+ const {writeJsonAtomic}=require('../lib/core_utils');const root=temp(t),file=path.join(root,'state.json');fs.writeFileSync(file,'old');
+ const original=fs.renameSync;let attempts=0;
+ const mock=t.mock.method(fs,'renameSync',function(...args){if(++attempts===1)throw Object.assign(Error('sharing lock'),{code:'EPERM'});return original.apply(fs,args);});
+ writeJsonAtomic(file,{value:1});assert.equal(attempts,2);assert.deepEqual(JSON.parse(fs.readFileSync(file)),{value:1});
+ mock.mock.mockImplementation(()=>{throw Object.assign(Error('disk error'),{code:'EIO'});});
+ assert.throws(()=>writeJsonAtomic(file,{value:2}),/disk error/);
+ assert.deepEqual(JSON.parse(fs.readFileSync(file)),{value:1});assert.deepEqual(fs.readdirSync(root),['state.json']);
+});
+
+test('attachment identity check rejects a file replaced between handles', t => {
+  const root=temp(t),file=path.join(root,'file'),replacement=path.join(root,'replacement');
+  fs.writeFileSync(file,'safe');fs.writeFileSync(replacement,'changed');
+  const original=fs.openSync;let opens=0;
+  t.mock.method(fs,'openSync',function(target,...args){
+    if(String(target)===file&&++opens===2){fs.renameSync(file,file+'.old');fs.renameSync(replacement,file);}
+    return original.call(fs,target,...args);
+  });
+  assert.throws(()=>readAllowedFile(file,[root],50),/changed during validation/);
+});
 test('attachments reject outside targets, parent symlinks, directories and oversized files', t => {
   const root = temp(t), allowed = path.join(root, 'allowed'); fs.mkdirSync(allowed);
   fs.writeFileSync(path.join(root, 'private'), 'secret'); fs.writeFileSync(path.join(allowed, 'ok'), 'hello');

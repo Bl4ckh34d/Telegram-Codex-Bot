@@ -7,9 +7,10 @@ async function main() {
   let data = "";
   for await (const chunk of process.stdin) {
     data += chunk;
-    if (data.length > 1024 * 1024) throw new Error("Request too large");
+    if (data.length > 29 * 1024 * 1024) throw new Error("Request too large");
   }
   const message = JSON.parse(data);
+  if (data.length > 1024 * 1024 && !(message.method === 'app' && message.input?.action === 'send' && message.input?.attachments?.length === 1)) throw new Error('Request too large');
   if (message.method === "app") {
     const result = await require("./app-bridge").appRequest(message.input || {});
     process.stdout.write(JSON.stringify({ result }));

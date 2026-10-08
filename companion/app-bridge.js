@@ -85,25 +85,53 @@ function parseRolloutMessages(text) {
 }
 async function appRequest(input, config, {request=pipeRequest}={}) {
   config=config||JSON.parse(fs.readFileSync(path.resolve(__dirname,'../runtime/app-bridge.json'),'utf8'));
+  if(input.action==='capabilities')return {attachments:1,maxAttachmentBytes:require('./app-attachments').MAX_BYTES};
   const contextThreadId=config.contextThreadId||process.env.CODEX_THREAD_ID||require('./app-local-catalog').localThreadCatalog(config.stateDatabase)[0]?.id;
   if(!contextThreadId)throw new Error('Open a Codex app chat or configure contextThreadId in runtime/app-bridge.json');
-  const allowed={list:'list_threads',read:'read_thread',send:'send_message_to_thread'};
+  if(input.action==='projects'||input.action==='create') {
+    const pipe=config.pipePath||await discoverPipe(contextThreadId,request);
+    const call=async(tool,args)=>{
+      const result=await request(pipe,'tools/call',{callerSource:'codex',namespace:'codex_app',tool,arguments:args,threadId:contextThreadId,turnId:'aidolon-telegram',callId:crypto.randomUUID()});
+      const text=(result.contentItems||[]).filter(x=>x.type==='inputText').map(x=>x.text).join('\n');
+      if(!result.success)throw Error(text||'App request rejected');
+      return JSON.parse(text);
+    };
+    const lifecycle=require('./app-lifecycle');
+    if(input.action==='create')return lifecycle.createAppThread(input,config,call);
+    const catalog=await request(pipe,'tools/list',{threadStartKind:'all'});
+    if(!catalog.tools?.some(t=>t.namespace==='codex_app'&&t.name==='create_thread'))throw Error('This app version cannot create chats.');
+    return {projects:lifecycle.localProjects(await call('list_projects',{}))};
+  }
+  const allowed={list:'list_threads',read:'read_thread',send:'send_message_to_thread',archive:'set_thread_archived',rename:'set_thread_title'};
   const tool=allowed[input.action];if(!tool)throw new Error('Unknown app bridge action');
   const args=input.action==='list'?{limit:50}:{threadId:String(input.threadId||''),...(input.hostId?{hostId:String(input.hostId)}:{})};
   if(input.action!=='list'&&!args.threadId)throw new Error('threadId required');
+  if(input.action==='archive')Object.assign(args,{source:'codex',archived:true});
+  if(input.action==='rename'){
+    if(typeof input.title!=='string'||!input.title.trim()||Array.from(input.title).length>128)throw Error('Nonempty title up to 128 characters required.');
+    if(input.hostId&&input.hostId!=='local')throw Error('Native title setter cannot safely select a remote app host.');
+    delete args.hostId;Object.assign(args,{source:'codex',title:input.title.trim()});
+  }
   if(input.action==='read')Object.assign(args,{turnLimit:3,includeOutputs:false,maxOutputCharsPerItem:12000});
-  if(input.action==='send'){if(typeof input.text!=='string'||!input.text.trim()||input.text.length>30000)throw new Error('Nonempty text up to 30000 characters required');args.prompt=input.text;}
+  let attachmentDelivery;
+  if(input.action==='send'){
+    if(typeof input.text!=='string'||input.text.length>30000||(!input.text.trim()&&!input.attachments?.length))throw new Error('Nonempty text up to 30000 characters required');
+    if(input.attachments?.length)attachmentDelivery=require('./app-attachments').prepareAttachments(input,config.attachmentRoot||path.resolve(__dirname,'../runtime/app-attachments'));
+    args.prompt=attachmentDelivery?.prompt||input.text;
+  }
   const pipe=config.pipePath||await discoverPipe(contextThreadId,request);
   let result;
   try{result=await request(pipe,'tools/call',{callerSource:'codex',namespace:'codex_app',tool,arguments:args,threadId:contextThreadId,turnId:'aidolon-telegram',callId:crypto.randomUUID()});}
   catch(e){discoveredPipes.delete(contextThreadId);throw e;}
   const text=(result.contentItems||[]).filter(x=>x.type==='inputText').map(x=>x.text).join('\n');
   if(!result.success)throw new Error(text||'App request rejected');
+  attachmentDelivery?.confirm();
   let parsed;try{parsed=JSON.parse(text);}catch{return {text};}
   if(input.action==='list' && config.includeLocalCatalog!==false){
     try{
       const known=new Set([...(parsed.threads||[]),...(parsed.pinnedThreads||[])].filter(x=>x.kind==='codex'&&x.hostId==='local').map(x=>x.id));
       parsed.threads=[...(parsed.threads||[]),...require('./app-local-catalog').localThreadCatalog(config.stateDatabase).filter(x=>!known.has(x.id))];
+      parsed.localPresence=require('./app-lifecycle').localThreadPresence(config.stateDatabase,contextThreadId);
     }catch(e){parsed.errors=[...(parsed.errors||[]),`Vollständiger lokaler Chat-Katalog nicht verfügbar; nur die letzten 50 Chats: ${e.message}`];}
   }
   if(input.action==='read' && parsed.thread?.hostId==='local' && parsed.thread?.kind==='codex') {

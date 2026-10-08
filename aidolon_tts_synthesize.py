@@ -16,7 +16,7 @@ import sys
 import time
 import unicodedata
 import wave
-from tts_runtime import create_tts
+from tts_runtime import create_tts, normalize_chinese_tts
 
 
 ENV_KEYS = (
@@ -108,7 +108,7 @@ def _fallback_clean_tts_text(text: str) -> str:
 
 
 def _clean_tts_text(text: str) -> str:
-    return _fallback_clean_tts_text(text)
+    return normalize_chinese_tts(_fallback_clean_tts_text(text))
 
 
 def _is_tokenizer_input_type_error(exc: Exception) -> bool:

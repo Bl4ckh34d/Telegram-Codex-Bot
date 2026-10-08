@@ -1,8 +1,49 @@
 """Shared MiraTTS setup for Windows CUDA and bounded KV-cache usage."""
 import os
+import copy
+import re
 from pathlib import Path
 
 _dll_handles = []
+_chinese_converter = None
+
+
+def normalize_chinese_tts(text):
+    """Normalize speech input only; keep the visible response and vocabulary intact."""
+    global _chinese_converter
+    if os.getenv("TTS_CHINESE_SIMPLIFY", "1").lower() in ("0", "false", "no", "off") or not re.search(r"[\u3400-\u9fff]", text):
+        return text
+    if _chinese_converter is None:
+        from opencc import OpenCC
+        _chinese_converter = OpenCC("t2s")
+    return _chinese_converter.convert(text)
+
+
+def resident_mira_factory(mira_class, pipeline_factory, engine_config_factory):
+    """Keep independent language pipelines with one shared Mira audio codec.
+
+    MiraTTS has no codec-injection argument. Its installed constructor creates
+    only pipe, gen_config and codec; preserve those interfaces without editing
+    site-packages. The server serializes all synthesis using the shared codec.
+    """
+    codec = None
+    generation_config = None
+
+    def factory(model, **options):
+        nonlocal codec, generation_config
+        if codec is None:
+            instance = mira_class(model, **options)
+            codec = instance.codec
+            generation_config = copy.deepcopy(instance.gen_config)
+            return instance
+        instance = mira_class.__new__(mira_class)
+        instance.codec = codec
+        instance.gen_config = copy.deepcopy(generation_config)
+        config = engine_config_factory(tp=1, dtype="bfloat16", **options)
+        instance.pipe = pipeline_factory(model, backend_config=config)
+        return instance
+
+    return factory
 
 
 def prepare_cuda():

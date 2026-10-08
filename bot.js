@@ -9,6 +9,8 @@ const { createVoiceFxVariation } = require("./lib/voice_fx_variation");
 const { normalizeSpeechSymbols, speechPlaceholders } = require("./lib/tts_pronunciation");
 const { detectTtsLanguage, resolveTtsModel, createSerialTtsRequests } = require("./lib/tts_language");
 const serializeTtsRequest = createSerialTtsRequests();
+const { createTtsResourcePolicy } = require("./lib/tts_resource_policy");
+const { startTtsControl } = require("./lib/tts_control");
 const dns = require("dns");
 const os = require("os");
 const path = require("path");
@@ -27,6 +29,7 @@ const conversationState = createConversationState();
 const { createAppTransport } = require("./lib/companion_app_transport");
 const { createAppScreenshotSender } = require("./lib/companion_screenshot");
 const { createAppChatBridge } = require("./lib/app_chat_bridge");
+const { createAppAttachmentHandler } = require("./lib/app_attachment_input");
 let appChatBridge = null;
 const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
@@ -127,7 +130,6 @@ const {
 const { createStatePersister } = require("./lib/state_persistence");
 const { createOrchQueueRuntime } = require("./lib/orch_queue_runtime");
 const { createOrchLaneRuntime } = require("./lib/orch_lane_runtime");
-const { createOrchRouterRuntime } = require("./lib/orch_router_runtime");
 const { createOrchReplyContextRuntime } = require("./lib/orch_reply_context_runtime");
 const { createOrchTaskRuntime } = require("./lib/orch_task_runtime");
 const { createOrchWorkerRuntime } = require("./lib/orch_worker_runtime");
@@ -926,6 +928,8 @@ const KEEPALIVE_RESTART_MAX_DELAY_MS = toInt(process.env.KEEPALIVE_RESTART_MAX_D
 const TTS_VENV_PATH = resolveMaybeRelativePath(process.env.TTS_VENV_PATH || path.join(ROOT, ".tts-venv"));
 const TTS_MODEL = String(process.env.TTS_MODEL || "").trim();
 const TTS_MODEL_DE = String(process.env.TTS_MODEL_DE || "").trim();
+const TTS_KEEP_MODELS_LOADED = toBool(process.env.TTS_KEEP_MODELS_LOADED, true);
+const TTS_IDLE_UNLOAD_MS = toInt(process.env.TTS_IDLE_UNLOAD_MS, 60000, 0, 3600000);
 const TTS_DEFAULT_LANGUAGE = String(process.env.TTS_DEFAULT_LANGUAGE || "en").trim();
 const TTS_REFERENCE_AUDIO = resolveMaybeRelativePath(process.env.TTS_REFERENCE_AUDIO || "");
 const TTS_REFERENCE_AUDIO_ZH_TW = resolveMaybeRelativePath(process.env.TTS_REFERENCE_AUDIO_ZH_TW || "");
@@ -1029,27 +1033,14 @@ const PROGRESS_INCLUDE_STDERR = toBool(process.env.PROGRESS_INCLUDE_STDERR, fals
 const PROGRESS_FIRST_UPDATE_SEC = toInt(process.env.PROGRESS_FIRST_UPDATE_SEC, 0);
 const PROGRESS_UPDATE_INTERVAL_SEC = toInt(process.env.PROGRESS_UPDATE_INTERVAL_SEC, 30);
 
-// Orchestration: route messages across multiple Codex "workers" (per-repo workdirs) to avoid head-of-line blocking.
-// This is a local in-process scheduler (not MCP); each worker runs at most one Codex job at a time, but workers run in parallel.
+// Single CLI assistant plus operational media/scheduler queues. Legacy state remains readable.
 const ORCH_MAX_CODEX_WORKERS = toInt(process.env.ORCH_MAX_CODEX_WORKERS, 5, 1, 20);
-const ORCH_ROUTER_ENABLED = toBool(process.env.ORCH_ROUTER_ENABLED, true);
-const ORCH_ROUTER_MAX_CONCURRENCY = toInt(process.env.ORCH_ROUTER_MAX_CONCURRENCY, 2, 1, 10);
-const ORCH_ROUTER_TIMEOUT_MS = toTimeoutMs(process.env.ORCH_ROUTER_TIMEOUT_MS, 20_000, 0, MAX_TIMEOUT_MS) || 20_000;
-const ORCH_ROUTER_MODEL = String(process.env.ORCH_ROUTER_MODEL || "").trim();
-const ORCH_ROUTER_REASONING_EFFORT = String(process.env.ORCH_ROUTER_REASONING_EFFORT || "low").trim();
-const ORCH_SPLIT_ENABLED = toBool(process.env.ORCH_SPLIT_ENABLED, true);
-const ORCH_SPLIT_MAX_TASKS = toInt(process.env.ORCH_SPLIT_MAX_TASKS, 3, 2, 8);
-const ORCH_DELEGATION_ACK_ENABLED = toBool(process.env.ORCH_DELEGATION_ACK_ENABLED, false);
-const ORCH_DELEGATION_ACK_SILENT = toBool(process.env.ORCH_DELEGATION_ACK_SILENT, true);
 const ORCH_LESSONS_ENABLED = toBool(process.env.ORCH_LESSONS_ENABLED, true);
 const ORCH_LESSONS_MAX_ITEMS = toInt(process.env.ORCH_LESSONS_MAX_ITEMS, 240, 20, 2000);
 const ORCH_LESSONS_PER_PROMPT = toInt(process.env.ORCH_LESSONS_PER_PROMPT, 4, 0, 12);
 const ORCH_LESSONS_PROMPT_MAX_CHARS = toInt(process.env.ORCH_LESSONS_PROMPT_MAX_CHARS, 1200, 180, 6000);
 const ORCH_LESSON_MAX_TEXT_CHARS = toInt(process.env.ORCH_LESSON_MAX_TEXT_CHARS, 220, 80, 1000);
 const ORCH_LESSON_TTL_DAYS = toInt(process.env.ORCH_LESSON_TTL_DAYS, 45, 1, 365);
-const ORCH_ROUTER_PROMPT_FILE = resolveMaybeRelativePath(
-  process.env.ORCH_ROUTER_PROMPT_FILE || path.join(ROOT, "codex_prompt_router.txt"),
-);
 const REDDIT_DIGEST_ENABLED = toBool(process.env.REDDIT_DIGEST_ENABLED, true);
 const parsedRedditDigestSubs = parseList(process.env.REDDIT_DIGEST_SUBREDDITS || "singularity,worldnews")
   .map((s) => normalizeSubredditName(s))
@@ -1890,6 +1881,8 @@ let codexTopCommandsCache = {
 };
 const ttsKeepalive = {
   model: TTS_MODEL,
+  residentModels: [],
+  loadedModels: [],
   stopping: null,
   proc: null,
   startPromise: null,
@@ -1941,6 +1934,51 @@ const whisperKeepalive = {
   restartTimer: null,
   restartAttempts: 0,
 };
+
+const ttsPolicyPath = path.join(RUNTIME_DIR, "tts-policy.json");
+const ttsResourcePolicy = createTtsResourcePolicy({
+  idleMs: TTS_IDLE_UNLOAD_MS,
+  paused: (() => {
+    try { return JSON.parse(fs.readFileSync(ttsPolicyPath, "utf8")).paused === true; }
+    catch (error) { if (error.code === "ENOENT") return false; throw error; }
+  })(),
+  save: state => writeJsonAtomic(ttsPolicyPath, state),
+  unload: options => serializeTtsRequest(async () => {
+    if (!options.shouldUnload()) return;
+    if (options.stop) {
+      stopTtsKeepalive("TTS paused for GPU work", { allowAutoRestart: false });
+      if (ttsKeepalive.stopping) await ttsKeepalive.stopping;
+    } else if (ttsKeepalive.proc && ttsKeepalive.ready) {
+      try { await requestTtsKeepaliveSerial({ type: "unload" }, { timeoutMs: 15000 }); }
+      catch (error) {
+        stopTtsKeepalive("TTS idle unload failed", { allowAutoRestart: false });
+        if (ttsKeepalive.stopping) await ttsKeepalive.stopping;
+        throw error;
+      }
+      log("TTS models unloaded after idle timeout; Python imports remain ready.");
+    }
+  }),
+  preload: () => serializeTtsRequest(async () => {
+    const models = [...new Set(TTS_KEEP_MODELS_LOADED ? [TTS_MODEL_DE, TTS_MODEL] : [TTS_MODEL_DE || TTS_MODEL])].filter(Boolean);
+    for (const model of models) await requestTtsKeepaliveSerial({ type: "load", model }, { timeoutMs: 60000 });
+  }),
+});
+let stopTtsControl = null;
+let ttsIdleTimer = null;
+function ttsResourceStatus() {
+  return { ...ttsResourcePolicy.status(), workerReady: ttsKeepalive.ready,
+    loadedModels: ttsKeepalive.loadedModels, pid: ttsKeepalive.proc?.pid || null };
+}
+async function handleTtsControlCommand(chatId, action) {
+  try {
+    await ttsResourcePolicy.command(action);
+    const state = ttsResourceStatus();
+    await sendMessage(chatId, state.paused
+      ? "TTS pausiert, GPU-Speicher freigegeben. Sprachnachrichten beantworte ich als Text. /speech resume aktiviert TTS wieder."
+      : `TTS aktiv. Geladene Modelle: ${state.loadedModels.length}. Automatisches Entladen nach ${TTS_IDLE_UNLOAD_MS / 1000}s Ruhe. /speech pause gibt VRAM für GPU-Aufgaben frei.`);
+  } catch (error) { await sendMessage(chatId, `TTS-Steuerung fehlgeschlagen: ${error.message}`); }
+  return true;
+}
 
 function registerPrefButton(chatId, kind, value) {
   const id = `pref${prefButtonSequence++}`;
@@ -2740,10 +2778,7 @@ function buildOrchLessonPromptContext({ chatId = "", workerId = "", workdir = ""
 }
 
 function getActiveWorkerForChat(chatId) {
-  const key = String(chatId || "").trim();
-  if (!key) return ORCH_GENERAL_WORKER_ID;
-  const raw = String(orchActiveWorkerByChat[key] || "").trim();
-  return raw && orchWorkers[raw] ? raw : ORCH_GENERAL_WORKER_ID;
+  return ORCH_GENERAL_WORKER_ID;
 }
 
 function setActiveWorkerForChat(chatId, workerId) {
@@ -2981,6 +3016,7 @@ const orchLaneRuntime = createOrchLaneRuntime({
   PROGRESS_UPDATE_INTERVAL_SEC,
   TTS_REPLY_TO_VOICE,
   TTS_ENABLED,
+  ttsAvailable: () => ttsResourcePolicy.available(),
   WORLDMONITOR_ALERT_VOICE_ENABLED,
   WORLDMONITOR_CHECK_VOICE_ENABLED,
   takeNextJobId: () => nextJobId++,
@@ -3029,49 +3065,6 @@ const orchLaneRuntime = createOrchLaneRuntime({
   formatQueuedPromptBatchText,
 });
 
-const orchRouterRuntime = createOrchRouterRuntime({
-  fs,
-  path,
-  OUT_DIR,
-  ROOT,
-  CODEX_WORKDIR,
-  ORCH_GENERAL_WORKER_ID,
-  ORCH_MAX_CODEX_WORKERS,
-  ORCH_ROUTER_ENABLED,
-  ORCH_ROUTER_MAX_CONCURRENCY,
-  ORCH_ROUTER_TIMEOUT_MS,
-  ORCH_ROUTER_MODEL,
-  ORCH_ROUTER_REASONING_EFFORT,
-  ORCH_SPLIT_ENABLED,
-  ORCH_SPLIT_MAX_TASKS,
-  MAX_QUEUE_SIZE,
-  ORCH_DELEGATION_ACK_ENABLED,
-  ORCH_DELEGATION_ACK_SILENT,
-  orchPendingSpawnByChat,
-  listCodexWorkers,
-  getCodexWorker,
-  hasWorker: (workerId) => {
-    const wid = String(workerId || "").trim();
-    return Boolean(wid && orchWorkers[wid]);
-  },
-  getActiveWorkerForChat,
-  ensureWorkerLane,
-  getLane,
-  runCodexJob,
-  createRepoWorker,
-  resolveWorkdirInput,
-  findWorkerByWorkdir,
-  createOrchTask,
-  getSessionForChatWorker,
-  totalQueuedJobs,
-  enqueuePrompt,
-  sendMessage,
-  log,
-  redactError,
-  normalizeReplySnippet,
-  recordReplyRoute,
-  getWorkerCapabilitySummary,
-});
 
 function totalQueuedJobs() {
   return orchQueueRuntime.totalQueuedJobs();
@@ -3172,24 +3165,11 @@ const telegramRouteMetaRuntime = createTelegramRouteMetaRuntime({
   recordReplyRoute,
 });
 
-function dedupeRouteAssignments(items) {
-  return orchRouterRuntime.dedupeRouteAssignments(items);
-}
-
-function summarizeDelegationQueueState(assignments) {
-  return orchRouterRuntime.summarizeDelegationQueueState(assignments);
-}
-
-function buildDelegationAckText(assignments, stateSummary = null) {
-  return orchRouterRuntime.buildDelegationAckText(assignments, stateSummary);
-}
-
-async function decideRoutePlanForPrompt(chatId, userText, options = {}) {
-  return await orchRouterRuntime.decideRoutePlanForPrompt(chatId, userText, options);
-}
-
 async function routeAndEnqueuePrompt(chatId, userText, source, options = {}) {
-  return await orchRouterRuntime.routeAndEnqueuePrompt(chatId, userText, source, options);
+  const next = { ...options, workerId: ORCH_GENERAL_WORKER_ID };
+  // Do not resume a retired worker's CLI session from old reply metadata.
+  if (options.workerId && options.workerId !== ORCH_GENERAL_WORKER_ID) delete next.resumeSessionId;
+  return await enqueuePrompt(chatId, userText, source, next);
 }
 
 function getLastImageForChat(chatId) {
@@ -3529,37 +3509,11 @@ function defaultVoicePromptPreamble() {
   ].join("\n");
 }
 
-function defaultRouterPromptPreamble() {
-  return [
-    "You are the AIDOLON router.",
-    "Your job: decide worker routing for the user's message.",
-    "Do not run tools or do the work. Only route.",
-    "",
-    "You will be given: the user message, the active worker, and a list of existing workers (some pinned to repos).",
-    "Choose an existing worker when possible.",
-    "If a new repo worker is needed, only propose one if the user message includes an explicit local path.",
-    "If the message clearly contains multiple independent sub-tasks for different workers, you may use decision=split.",
-    "For split, output 2+ tasks and keep each prompt short and actionable.",
-    "If routing is ambiguous, ask one clarifying question.",
-    "",
-    "Output exactly one line in this format:",
-    "ROUTE: {\"decision\":\"use|spawn_repo|ask|split\",\"worker_id\":\"...\",\"workdir\":\"...\",\"title\":\"...\",\"question\":\"...\",\"tasks\":[{\"worker_id\":\"...\",\"workdir\":\"...\",\"title\":\"...\",\"prompt\":\"...\"}]}",
-  ].join("\n");
-}
-
 function getPromptPreamble(replyStyle) {
-  const style = String(replyStyle || "").trim().toLowerCase();
-  const isRouter = style === "router";
-  const isVoice = style === "voice" || style === "tts" || style === "spoken";
-  const filePath = isRouter
-    ? ORCH_ROUTER_PROMPT_FILE
-    : isVoice
-      ? CODEX_VOICE_PROMPT_FILE
-      : CODEX_PROMPT_FILE;
-  const fallback = isRouter ? defaultRouterPromptPreamble() : isVoice ? defaultVoicePromptPreamble() : defaultPromptPreamble();
-  const fromFile = readTextFileCached(filePath).trim();
+  const isVoice = ["voice", "tts", "spoken"].includes(String(replyStyle || "").trim().toLowerCase());
+  const fromFile = readTextFileCached(isVoice ? CODEX_VOICE_PROMPT_FILE : CODEX_PROMPT_FILE).trim();
   const sharedRules = readTextFileCached(CODEX_SHARED_RULES_FILE).trim();
-  return [fromFile || fallback, sharedRules].filter(Boolean).join("\n\n");
+  return [fromFile || (isVoice ? defaultVoicePromptPreamble() : defaultPromptPreamble()), sharedRules].filter(Boolean).join("\n\n");
 }
 
 function formatCodexPrompt(userText, options = {}) {
@@ -3585,6 +3539,7 @@ function formatCodexPrompt(userText, options = {}) {
   const workspaceLabel = worker ? `${workerLabel} (${worker.kind})` : workerId || "unknown";
 
   const lines = [getPromptPreamble(replyStyle)];
+  lines.push("This is the single AIDOLON CLI main chat. Do not delegate, spawn subagents, or start other Codex/agent processes to perform tasks. Work in this conversation. Project app chats follow their own native host rules.");
   if (String(replyStyle || "").trim().toLowerCase() !== "router") {
     lines.push("Language policy: reply only in English, German, or Chinese.");
     lines.push("If the user writes in another language, reply in English.");
@@ -4947,6 +4902,7 @@ function buildCodexExecSpec(job) {
   if (CODEX_DISABLE_MCP) execOptions.push("-c", "mcp_servers={}");
   if (!isResume && CODEX_PROFILE) execOptions.push("-p", CODEX_PROFILE);
   if (CODEX_EXTRA_ARGS.length > 0) execOptions.push(...CODEX_EXTRA_ARGS);
+  execOptions.push("-c", "features.multi_agent=false");
 
   if (rawImagePaths.length > 0) {
     for (const imgPath of rawImagePaths) {
@@ -5615,11 +5571,6 @@ function getTelegramCommandList() {
     { command: "start", description: "start / help" },
     { command: "help", description: "show help" },
     { command: "status", description: "show worker status" },
-    { command: "workers", description: "list workspaces/workers" },
-    { command: "capabilities", description: "show worker capability map" },
-    { command: "use", description: "switch active workspace" },
-    { command: "spawn", description: "create a repo workspace" },
-    { command: "retire", description: "remove a workspace" },
     { command: "queue", description: "show queued prompts" },
     { command: "weather", description: "show weather update (/weather [city])" },
     { command: "news", description: "show ranked worldmonitor headlines" },
@@ -5759,7 +5710,9 @@ async function sendMessage(chatId, text, options = {}) {
   if (workerLabel && !skipWorkerNamePrefix) {
     const escapedLabel = workerLabel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const labelPattern = new RegExp(`^(?:\\*\\*)?${escapedLabel}(?:\\*\\*)?\\s*:`, "i");
-    if (!labelPattern.test(normalizedText)) {
+    if (labelPattern.test(normalizedText)) {
+      normalizedText = normalizedText.replace(labelPattern, `${fmtBold(workerLabel)}:`);
+    } else {
       normalizedText = `${fmtBold(workerLabel)}: ${normalizedText}`;
     }
   }
@@ -6906,9 +6859,6 @@ async function sendHelp(chatId) {
     "",
     fmtBold("Core"),
     "- /status - worker + queue status",
-    "- /workers - list workspaces/workers",
-    "- /capabilities - show the worker capability map",
-    "- /use <worker_id, name, or title> - switch active workspace",
     "- /queue - show queued prompts",
     "- /weather [city] - today/tomorrow forecast (voice when TTS is enabled)",
     "- /news [force] [count] - severity-ranked WorldMonitor headlines (today first, then previous days)",
@@ -6926,8 +6876,6 @@ async function sendHelp(chatId) {
     "- /reject, /deny or /cancelcmd - cancel staged /cmd command",
     "",
     fmtBold("Workspaces"),
-    "- /spawn <path> [title] - create a new repo workspace",
-    "- /retire <worker_id, name, or title> - remove a workspace",
     "",
     fmtBold("Sessions"),
     "- /resume - list recent sessions (prefill buttons)",
@@ -6959,6 +6907,7 @@ async function sendHelp(chatId) {
     "- /imgclear - clear the last image context",
     "- /voice [name|single|worker|list|default] - set TTS mode/preset (live, no restart)",
     "- /tts <text> - send a TTS voice message (requires TTS_ENABLED=1)",
+    "- /speech pause|resume|status - release TTS VRAM or enable speech again",
     "- /abtest [text] - send one sample per voice preset for A/B listening",
     `- /sendfile <path> [caption] - send a file attachment (from ${ATTACH_ROOTS_HINT})`,
     "",
@@ -12929,8 +12878,6 @@ async function sendStatus(chatId) {
   const restartState = hasPendingRestartRequest()
     ? `queued (active=${restartCounts.active}, queued=${restartCounts.queued})`
     : "none";
-  const routerModel = String(ORCH_ROUTER_MODEL || CODEX_MODEL || "").trim() || "(default)";
-  const routerReasoning = String(ORCH_ROUTER_REASONING_EFFORT || "").trim() || "(default)";
   if (ORCH_LESSONS_ENABLED) pruneOrchLessons({ persist: false });
   const lessonsCount = Array.isArray(orchLessons) ? orchLessons.length : 0;
   const lessonsLastAt = lessonsCount > 0
@@ -13010,12 +12957,11 @@ async function sendStatus(chatId) {
     `- queue: ${queued}/${queueCap}`,
     `- exec_mode: ${codexMode.mode}`,
     `- chat_actions: ${TELEGRAM_CHAT_ACTION_ENABLED ? `enabled (default=${TELEGRAM_CHAT_ACTION_DEFAULT}, voice=${TELEGRAM_CHAT_ACTION_VOICE}, interval=${TELEGRAM_CHAT_ACTION_INTERVAL_SEC}s)` : "disabled"}`,
-    `- router: ${ORCH_ROUTER_ENABLED ? "enabled" : "disabled"} (model=${routerModel}, reasoning=${routerReasoning})`,
-    `- split_routing: ${ORCH_SPLIT_ENABLED ? "enabled" : "disabled"} (max_tasks=${ORCH_SPLIT_MAX_TASKS})`,
+    "- CLI: single main chat; no delegation",
     `- lesson_memory: ${ORCH_LESSONS_ENABLED ? "enabled" : "disabled"} (stored=${lessonsCount}, per_prompt=${ORCH_LESSONS_PER_PROMPT}, last=${lessonsLastAt ? formatRelativeAge(lessonsLastAt) : "never"})`,
     `- whisper: ${WHISPER_ENABLED ? "enabled" : "disabled"}`,
     `- whisper_keepalive: ${whisperKeepaliveState} (prewarm=${WHISPER_PREWARM_ON_STARTUP}, auto_restart=${WHISPER_KEEPALIVE_AUTO_RESTART})`,
-    `- tts_keepalive: ${ttsKeepaliveState} (prewarm=${TTS_PREWARM_ON_STARTUP}, auto_restart=${TTS_KEEPALIVE_AUTO_RESTART})`,
+    `- tts_keepalive: ${ttsKeepaliveState} (paused=${!ttsResourcePolicy.available()}, idle_unload_ms=${TTS_IDLE_UNLOAD_MS}, loaded_models=${ttsKeepalive.loadedModels.join(', ') || 'none'})`,
     `- tts_keepalive_diag: starts=${ttsKeepalive.startCount} ready=${ttsKeepalive.readyCount} closes=${ttsKeepalive.closeCount} stops=${ttsKeepalive.stopCount} errors=${ttsKeepalive.errorCount} restarts=${ttsKeepalive.restartScheduledCount}/${ttsKeepalive.restartFailureCount} req_fail=${ttsKeepalive.requestFailureCount}/${ttsKeepalive.requestCount} timeouts=${ttsKeepalive.timeoutCount} fallback(single=${ttsKeepalive.fallbackSingleCount},batch=${ttsKeepalive.fallbackBatchCount})`,
     `- tts_keepalive_last_close: ${ttsKeepaliveLastClose}`,
     `- tts_keepalive_last_stop: ${ttsKeepaliveLastStop}`,
@@ -13143,9 +13089,6 @@ async function sendWorkers(chatId) {
   lines.push(
     "",
     fmtBold("Commands"),
-    "/use <worker_id, name, or title> - switch active workspace",
-    "/spawn <local-path> [title] - create a new repo workspace",
-    "/retire <worker_id, name, or title> - remove a workspace",
     "/newsstatus - worldmonitor monitor state",
   );
 
@@ -13957,6 +13900,7 @@ function getParsedCommandRouter() {
     platform: process.platform,
     handleVoicePresetCommand,
     handleTtsAbTestCommand,
+    handleTtsControlCommand,
     TTS_ENABLED,
     parseTtsCommandInput,
     splitSpeakableTextIntoVoiceChunks,
@@ -15959,6 +15903,7 @@ function noteTtsKeepaliveFallback(mode, reason) {
 }
 
 function scheduleTtsKeepaliveRestart(reason = "") {
+  if (!ttsResourcePolicy.available() || TTS_IDLE_UNLOAD_MS > 0) return;
   if (!TTS_KEEPALIVE_AUTO_RESTART) return;
   if (shuttingDown) return;
   if (ttsKeepalive.proc || ttsKeepalive.startPromise) return;
@@ -15980,7 +15925,7 @@ function scheduleTtsKeepaliveRestart(reason = "") {
 
   ttsKeepalive.restartTimer = setTimeout(async () => {
     ttsKeepalive.restartTimer = null;
-    if (shuttingDown || !TTS_KEEPALIVE_AUTO_RESTART) return;
+    if (shuttingDown || !TTS_KEEPALIVE_AUTO_RESTART || !ttsResourcePolicy.available()) return;
     if (ttsKeepalive.proc || ttsKeepalive.startPromise) return;
     try {
       const pyBin = resolveTtsPythonBin();
@@ -16039,6 +15984,8 @@ function stopTtsKeepalive(reason = "", { allowAutoRestart = true, preserveStopRe
   }
   ttsKeepalive.proc = null;
   ttsKeepalive.ready = false;
+  ttsKeepalive.residentModels = [];
+  ttsKeepalive.loadedModels = [];
   ttsKeepalive.stdoutBuf = "";
   ttsKeepalive.stderrScanCarry = "";
   ttsKeepalive.stderrNoiseCarry = "";
@@ -16083,6 +16030,8 @@ function handleTtsKeepaliveLine(rawLine) {
   if (!msg || typeof msg !== "object") return;
   const type = String(msg.type || "").trim().toLowerCase();
   if (type === "ready") {
+    ttsKeepalive.residentModels = Array.isArray(msg.models) ? msg.models : [ttsKeepalive.model];
+    ttsKeepalive.loadedModels = msg.loaded_models || ttsKeepalive.residentModels;
     ttsKeepalive.ready = true;
     ttsKeepalive.readyCount = Math.max(0, Number(ttsKeepalive.readyCount || 0)) + 1;
     ttsKeepalive.lastReadyAt = Date.now();
@@ -16090,6 +16039,7 @@ function handleTtsKeepaliveLine(rawLine) {
     return;
   }
 
+  if (Array.isArray(msg.loaded_models)) ttsKeepalive.loadedModels = msg.loaded_models;
   if (type !== "result") return;
   const pending = ttsKeepalive.pending;
   if (!pending) return;
@@ -16118,8 +16068,13 @@ function handleTtsKeepaliveLine(rawLine) {
 }
 
 async function ensureTtsKeepaliveRunning(pyBin, model = ttsKeepalive.model || TTS_MODEL) {
+  if (!ttsResourcePolicy.available()) throw new Error("TTS paused for GPU work");
   if (ttsKeepalive.stopping) await ttsKeepalive.stopping;
   if (ttsKeepalive.startPromise) await ttsKeepalive.startPromise;
+  if (ttsKeepalive.proc && ttsKeepalive.ready && ttsKeepalive.residentModels?.includes(model)) {
+    ttsKeepalive.model = model;
+    return ttsKeepalive.proc;
+  }
   if (ttsKeepalive.model !== model) {
     if (ttsKeepalive.pending) throw new Error("TTS keepalive is busy.");
     const oldProc = ttsKeepalive.proc;
@@ -16166,6 +16121,10 @@ async function ensureTtsKeepaliveRunning(pyBin, model = ttsKeepalive.model || TT
       AIDOLON_TTS_SERVER_SCRIPT_PATH,
       "--model",
       model,
+      ...(TTS_IDLE_UNLOAD_MS > 0 ? ["--lazy-models"] : []),
+      ...[...new Set(TTS_KEEP_MODELS_LOADED ? [TTS_MODEL, TTS_MODEL_DE] : [])]
+        .filter(candidate => candidate && candidate !== model)
+        .flatMap(candidate => ["--resident-model", candidate]),
       "--reference-audio",
       TTS_REFERENCE_AUDIO,
       "--sample-rate",
@@ -16266,13 +16225,15 @@ async function ensureTtsKeepaliveRunning(pyBin, model = ttsKeepalive.model || TT
 }
 
 function requestTtsKeepalive(payload, options = {}) {
-  return serializeTtsRequest(() => requestTtsKeepaliveSerial(payload, options));
+  ttsResourcePolicy.begin();
+  return serializeTtsRequest(() => requestTtsKeepaliveSerial(payload, options))
+    .finally(() => ttsResourcePolicy.end());
 }
 
 async function requestTtsKeepaliveSerial(payload, { abortSignal, timeoutMs = 0, job } = {}) {
   abortSignal?.throwIfAborted();
   const pyBin = resolveTtsPythonBin();
-  const model = resolveTtsModel(job?.ttsLanguageText || payload.text || (payload.texts || []).join(" "), {
+  const model = (payload.type === "load" && payload.model) || resolveTtsModel(job?.ttsLanguageText || payload.text || (payload.texts || []).join(" "), {
     baseModel: TTS_MODEL, germanModel: TTS_MODEL_DE, defaultLanguage: TTS_DEFAULT_LANGUAGE,
   });
   const proc = await ensureTtsKeepaliveRunning(pyBin, model);
@@ -16284,7 +16245,7 @@ async function requestTtsKeepaliveSerial(payload, { abortSignal, timeoutMs = 0, 
   }
 
   const requestId = `tts-${ttsKeepalive.requestSeq++}-${Date.now()}`;
-  const body = { ...payload, id: requestId };
+  const body = { ...payload, model, id: requestId };
   const line = `${JSON.stringify(body)}\n`;
   if (job && typeof job === "object") {
     job.process = proc;
@@ -16389,6 +16350,7 @@ async function runTtsSynthKeepaliveBatch({
 }
 
 async function runTtsJob(job, lane) {
+  if (!ttsResourcePolicy.available()) return { ok: true, text: job.text || "", afterText: job.afterText, attachments: job.attachments };
   const isVoiceReply = String(job?.source || "").trim().toLowerCase() === "voice-reply";
   const afterText = String(job?.afterText || "").trim();
   const attachments = Array.isArray(job?.attachments) ? job.attachments : [];
@@ -17047,6 +17009,7 @@ function shouldUsePipelinedTtsBatch(job) {
 }
 
 async function runTtsBatchJob(job, lane) {
+  if (!ttsResourcePolicy.available()) return { ok: true, text: (job.texts || []).join(" "), afterText: job.afterText, attachments: job.attachments };
   job.ttsLanguageText = (Array.isArray(job?.texts) ? job.texts : []).join(" ");
   if (shouldUsePipelinedTtsBatch(job)) {
     return await runTtsBatchJobPipelined(job, lane);
@@ -18252,7 +18215,7 @@ async function prewarmAudioKeepalives() {
     }
   }
 
-  if (TTS_ENABLED && TTS_PREWARM_ON_STARTUP) {
+  if (TTS_ENABLED && TTS_PREWARM_ON_STARTUP && ttsResourcePolicy.available()) {
     const pyBin = resolveTtsPythonBin();
     if (!pyBin) {
       log("TTS prewarm skipped: python not found.");
@@ -18424,6 +18387,7 @@ function interruptVoiceReplies(chatId) {
 }
 
 async function handleVoiceMessage(msg, context = {}) {
+  ttsResourcePolicy.touch();
   const chatId = conversationKey(msg);
   if (!chatId) return;
   const user = senderLabel(msg);
@@ -18503,6 +18467,12 @@ async function handleVoiceMessage(msg, context = {}) {
   lane.queue.push(job);
   void processLane(lane.id).catch(err => log(redactError(err.message || err)));
 }
+
+const handleAppAttachment = createAppAttachmentHandler({
+  getBridge: () => appChatBridge, routeKey: conversationKey,
+  getFile: getTelegramFileMeta, download: downloadTelegramFile, sendText: sendMessage,
+  stagingRoot: path.join(RUNTIME_DIR, 'app-attachment-downloads'),
+});
 
 async function handlePhotoOrImageDocument(msg, context = {}) {
   const chatId = conversationKey(msg);
@@ -18705,6 +18675,13 @@ async function handleCallbackQuery(cb) {
     return;
   }
 
+  if (data.startsWith("app_new:")) {
+    await answerCallbackQuery(id, "Opening selection...");
+    try { await appChatBridge.creation.callback(chatId, String(cb.from?.id || ""), data); }
+    catch (err) { await sendMessage(chatId, String(err.message || err)); }
+    return;
+  }
+
   if (data.startsWith("app_voice:") || data.startsWith("app_output:")) {
     const [kind, bindingId, value] = data.split(":");
     if (!appChatBridge || appChatBridge.target(chatId)?.bindingId !== bindingId) {
@@ -18826,62 +18803,8 @@ async function handleCallbackQuery(cb) {
     return;
   }
 
-  if (data === "orch_retire_cancel") {
-    orchPendingSpawnByChat.delete(String(chatId || "").trim());
-    await answerCallbackQuery(id, "Canceled");
-    await sendMessage(chatId, "Canceled workspace creation.");
-    return;
-  }
-
-  if (data.startsWith("orch_retire:")) {
-    const retireId = data.slice("orch_retire:".length).trim();
-    const pending = orchPendingSpawnByChat.get(String(chatId || "").trim()) || null;
-    if (!pending || typeof pending !== "object") {
-      await answerCallbackQuery(id, "No pending request");
-      return;
-    }
-
-    const desiredWorkdir = String(pending.desiredWorkdir || "").trim();
-    const title = String(pending.title || "").trim();
-    const promptText = String(pending.promptText || "");
-    const source = String(pending.source || "plain").trim() || "plain";
-    const options = pending.options && typeof pending.options === "object" ? { ...pending.options } : {};
-    const replyToMessageId = Number(options.replyToMessageId || 0);
-
-    try {
-      retireWorker(retireId);
-    } catch (err) {
-      await answerCallbackQuery(id, "Failed");
-      await sendMessage(chatId, `Failed to retire worker: ${String(err?.message || err)}`, { replyToMessageId });
-      return;
-    }
-
-    let newWorkerId = "";
-    try {
-      newWorkerId = createRepoWorker(desiredWorkdir, title);
-    } catch (err) {
-      await answerCallbackQuery(id, "Failed");
-      await sendMessage(chatId, `Failed to create workspace: ${String(err?.message || err)}`, { replyToMessageId });
-      return;
-    } finally {
-      orchPendingSpawnByChat.delete(String(chatId || "").trim());
-    }
-
-    await answerCallbackQuery(id, "OK");
-    const worker = getCodexWorker(newWorkerId);
-    const name = String(worker?.name || worker?.title || newWorkerId).trim() || newWorkerId;
-    const titleInfo = String(worker?.title || title || "").trim();
-    const details = titleInfo && titleInfo !== name ? `${name} (${newWorkerId}, ${titleInfo})` : `${name} (${newWorkerId})`;
-    await sendMessage(chatId, `Using workspace ${details}`, {
-      replyToMessageId,
-      routeWorkerId: newWorkerId,
-    });
-
-    try {
-      await enqueuePrompt(chatId, promptText, source, { ...options, workerId: newWorkerId, replyToMessageId });
-    } catch (err) {
-      await sendMessage(chatId, `Failed to enqueue the request: ${String(err?.message || err)}`, { replyToMessageId });
-    }
+  if (data === "orch_retire_cancel" || data.startsWith("orch_retire:")) {
+    await answerCallbackQuery(id, "Worker routing retired. Use /app new.");
     return;
   }
 }
@@ -18896,6 +18819,18 @@ async function handleIncomingMessage(msg) {
   }
   recordIncomingTelegramMessageMeta(msg);
 
+  if (msg.forum_topic_edited) {
+    if (!msg.from?.is_bot && typeof msg.forum_topic_edited.name === 'string') {
+      await appChatBridge?.topicRenamed(chatId, msg.forum_topic_edited.name);
+    }
+    return;
+  }
+
+  if (msg.forum_topic_closed) {
+    if (!msg.from?.is_bot) await appChatBridge?.topicLifecycle(chatId, 'closed');
+    return;
+  }
+
   const incomingMessageId = Number(msg?.message_id || 0);
   const replyThreadContext = buildReplyThreadContextFromIncomingMessage(msg);
   const excludeMessageIds = [
@@ -18905,7 +18840,7 @@ async function handleIncomingMessage(msg) {
   const recentHistoryContext = buildRecentHistoryContext(chatId, { excludeMessageIds });
 
   if (appChatBridge?.target(chatId) && ((Array.isArray(msg.photo) && msg.photo.length) || msg.document)) {
-    await sendMessage(chatId, "Dieses App-Topic unterstützt derzeit Text und Sprachnachrichten. Anhänge bitte direkt in der Codex-App öffnen.");
+    await handleAppAttachment(msg);
     return;
   }
 
@@ -18940,8 +18875,15 @@ async function handleIncomingMessage(msg) {
   logChat("in", chatId, text, { source: text.startsWith("/") ? "command" : "plain", user });
   rememberChatAutomationPrefsFromText(chatId, text);
 
+  if (appChatBridge && /^\/app(?:@\w+)?\s+new\s*$/i.test(text)) {
+    try { await appChatBridge.creation.begin(chatId, String(msg.from?.id || "")); }
+    catch (err) { await sendMessage(chatId, String(err.message || err)); }
+    return;
+  }
+  if (appChatBridge?.creation && await appChatBridge.creation.text(chatId, String(msg.from?.id || ""), text, msg.reply_to_message?.message_id)) return;
+
   const replyToMessageId = Number(msg?.message_id || 0);
-  if (appChatBridge?.target(chatId) && !/^\/(?:app|help|restart)(?:@\w+)?(?:\s|$)/i.test(text)) {
+  if (appChatBridge?.target(chatId) && !/^\/(?:app|help|restart|speech)(?:@\w+)?(?:\s|$)/i.test(text)) {
     await appChatBridge.route(chatId, text);
     return;
   }
@@ -19134,6 +19076,8 @@ async function pollLoop() {
 async function shutdown(code = 0, reason = "") {
   if (shuttingDown) return;
   shuttingDown = true;
+  stopTtsControl?.();
+  clearInterval(ttsIdleTimer);
   const normalizedReason = String(reason || "").trim()
     || (Number(code) === RESTART_EXIT_CODE ? "restart_exit" : Number(code) === 0 ? "clean_exit" : "fatal_exit");
   logSystemEvent(`Shutdown begin (code=${code}, reason=${normalizedReason}).`, "shutdown");
@@ -19319,6 +19263,13 @@ process.on("unhandledRejection", (err) => {
     }
 
     await prewarmAudioKeepalives();
+    if (TTS_ENABLED) {
+      stopTtsControl = startTtsControl({ directory: path.join(RUNTIME_DIR, "tts-control"),
+        command: action => ttsResourcePolicy.command(action), status: ttsResourceStatus,
+        onError: error => log(`TTS control: ${redactError(error.message)}`) });
+      ttsIdleTimer = setInterval(() => { void ttsResourcePolicy.tick().catch(error => log(`TTS idle unload: ${redactError(error.message)}`)); }, 1000);
+      ttsIdleTimer.unref();
+    }
     await skipStaleUpdates();
     if (WORLDMONITOR_MONITOR_ENABLED && WORLDMONITOR_STARTUP_CATCHUP_ENABLED) {
       void runWorldMonitorStartupCatchup();
@@ -19333,12 +19284,18 @@ process.on("unhandledRejection", (err) => {
 
     const appConfig = String(process.env.APP_COMPANION_CONFIG || "").trim();
     if (appConfig) {
-      const appTransport = createAppTransport(resolveMaybeRelativePath(appConfig, ROOT));
+      const appTransport = createAppTransport(resolveMaybeRelativePath(appConfig, ROOT), {
+        localRequest: (input, config) => {
+          const request = require("./lib/tts_agent_instructions").withTtsInstructions(input, ROOT);
+          return require("./companion/app-bridge").appRequest(request, config);
+        },
+      });
       const topicGroup = String(process.env.APP_TOPIC_GROUP_ID || "").trim();
       let lastSyncErrorAt = 0;
       appChatBridge = createAppChatBridge({
         filePath: path.join(RUNTIME_DIR, "app-chat-bindings.json"),
         request: appTransport,
+        speechAvailable: () => ttsResourcePolicy.available(),
         autoTopicGroup: topicGroup && ALLOWED_CHAT_IDS.has(topicGroup) ? topicGroup : "",
         onSyncError: error => { if (Date.now() - lastSyncErrorAt > 300000) { lastSyncErrorAt = Date.now(); log(`App-Themenabgleich: ${redactError(error)}`); } },
         migrateFromChat: String(process.env.APP_TOPIC_MIGRATE_FROM_CHAT_ID || "").trim(),
@@ -19355,6 +19312,30 @@ process.on("unhandledRejection", (err) => {
           const { chatId, threadId } = splitRoute(route);
           try { await telegramApi("editForumTopic", { body: { chat_id: chatId, message_thread_id: Number(threadId), name } }); }
           catch (err) { if (!String(err.message).includes("TOPIC_NOT_MODIFIED")) throw err; }
+        },
+        checkTopic: async (route, name) => {
+          const { chatId, threadId } = splitRoute(route);
+          if (!threadId) return true;
+          // Bot API has no topic-deleted update or topic lookup. Reapplying the
+          // app-owned title validates existence without changing a normal topic.
+          try { await telegramApi("editForumTopic", { body: { chat_id: chatId, message_thread_id: Number(threadId), name } }); return true; }
+          catch (err) {
+            if (String(err.message).includes("TOPIC_NOT_MODIFIED")) return true;
+            if (/TOPIC_ID_INVALID|TOPIC_NOT_FOUND/.test(String(err.message))) return false;
+            throw err;
+          }
+        },
+        setTopicClosed: async (route, closed) => {
+          const { chatId, threadId } = splitRoute(route);
+          if (!threadId) throw new Error("Refusing to close or reopen a general chat.");
+          try { await telegramApi(closed ? "closeForumTopic" : "reopenForumTopic", { body: { chat_id: chatId, message_thread_id: Number(threadId) } }); }
+          catch (err) { if (!String(err.message).includes("TOPIC_NOT_MODIFIED")) throw err; }
+        },
+        deleteTopic: async (route) => {
+          const { chatId, threadId } = splitRoute(route);
+          if (!threadId) throw new Error("Refusing to delete a general chat.");
+          try { await telegramApi("deleteForumTopic", { body: { chat_id: chatId, message_thread_id: Number(threadId) } }); }
+          catch (err) { if (!/TOPIC_ID_INVALID|TOPIC_NOT_FOUND/.test(String(err.message))) throw err; }
         },
         sendScreenshot: createAppScreenshotSender({ request: appTransport, outDir: OUT_DIR, sendPhoto }),
         sendText: (chat, text, options) => sendMessage(chat, text, options),

@@ -7,7 +7,9 @@ const { detectTtsLanguage, resolveTtsModel, createSerialTtsRequests } = require(
 test('startup prewarms the configured default language model',async()=>{
  const source=fs.readFileSync(require.resolve('../bot.js'),'utf8');const start=source.indexOf('async function prewarmAudioKeepalives('),end=source.indexOf('async function runWhisperJob(',start);let loaded;
  const c=vm.createContext({WHISPER_ENABLED:false,TTS_ENABLED:true,TTS_PREWARM_ON_STARTUP:true,TTS_MODEL:'base',TTS_MODEL_DE:'german',TTS_DEFAULT_LANGUAGE:'de',TTS_REFERENCE_AUDIO:'voice.wav',AIDOLON_TTS_SERVER_SCRIPT_PATH:'worker.py',resolveTtsPythonBin:()=> 'python',fs:{existsSync:()=>true},resolveTtsModel,ensureTtsKeepaliveRunning:async(p,m)=>{loaded=m;},ttsKeepalive:{proc:{},ready:true},log(){},redactError:x=>x});
+ c.ttsResourcePolicy={available:()=>true};
  vm.runInContext(source.slice(start,end),c);await c.prewarmAudioKeepalives();assert.equal(loaded,'german');
+ loaded=null;c.ttsResourcePolicy.available=()=>false;await c.prewarmAudioKeepalives();assert.equal(loaded,null);
 });
 
 test('routes German, English and Chinese without treating code or URLs as language', () => {
@@ -39,7 +41,7 @@ test('serializes synthesis across model changes and recovers after failed reques
   assert.deepEqual(calls, ['de', 'en']);
 });
 
-test('model switch waits for old worker exit and preserves the configured reference', async () => {
+test('transition from a single model waits for exit and prewarms both models with the configured reference', async () => {
   const source = fs.readFileSync(require.resolve('../bot.js'), 'utf8');
   const start = source.indexOf('async function ensureTtsKeepaliveRunning(');
   const end = source.indexOf('function requestTtsKeepalive(', start);
@@ -48,8 +50,9 @@ test('model switch waits for old worker exit and preserves the configured refere
   let stopped = false;
   let args;
   const context = vm.createContext({
-    ttsKeepalive:state, TTS_MODEL:'base', TTS_REFERENCE_AUDIO:'english-sample.wav',
-    TTS_SAMPLE_RATE:48000, TTS_KEEPALIVE_STARTUP_TIMEOUT_MS:0,
+    ttsKeepalive:state, TTS_MODEL:'base', TTS_MODEL_DE:'german', TTS_KEEP_MODELS_LOADED:true, TTS_REFERENCE_AUDIO:'english-sample.wav',
+    TTS_SAMPLE_RATE:48000, TTS_KEEPALIVE_STARTUP_TIMEOUT_MS:0, TTS_IDLE_UNLOAD_MS:60000,
+    ttsResourcePolicy:{available:()=>true},
     AIDOLON_TTS_SERVER_SCRIPT_PATH:'worker.py', ROOT:'/tmp', process,
     fs:{existsSync:()=>true}, setTimeout, clearTimeout, log(){},
     clearTtsKeepaliveRestartTimer(){},
@@ -70,11 +73,44 @@ test('model switch waits for old worker exit and preserves the configured refere
   old.emit('close',0);
   const worker=await pending;
   assert.equal(args[args.indexOf('--model')+1],'german');
+  assert.equal(args[args.indexOf('--resident-model')+1],'base');
   assert.equal(args[args.indexOf('--reference-audio')+1],'english-sample.wav');
+  assert.ok(args.includes('--lazy-models'));
   // Late events from a replaced worker must not stop its successor.
   state.proc={};
   worker.emit('close',1);
   assert.notEqual(state.proc,null);
+});
+
+test('switches between ready resident language models without terminating the worker', async () => {
+  const source=fs.readFileSync(require.resolve('../bot.js'),'utf8');
+  const start=source.indexOf('async function ensureTtsKeepaliveRunning(');
+  const end=source.indexOf('function requestTtsKeepalive(',start);
+  const worker={};
+  const state={proc:worker,ready:true,model:'german',residentModels:['german','base']};
+  const context=vm.createContext({ttsKeepalive:state,TTS_MODEL:'base',TTS_MODEL_DE:'german',
+    ttsResourcePolicy:{available:()=>true},
+    TTS_KEEP_MODELS_LOADED:true,fs:{existsSync:()=>true},AIDOLON_TTS_SERVER_SCRIPT_PATH:'worker.py',
+    clearTtsKeepaliveRestartTimer(){},log(){},
+    stopTtsKeepalive(){assert.fail('resident switch must not stop synthesis worker');},
+  });
+  vm.runInContext(source.slice(start,end),context);
+  assert.equal(await context.ensureTtsKeepaliveRunning('python','base'),worker);
+  assert.equal(await context.ensureTtsKeepaliveRunning('python','german'),worker);
+});
+
+test('synthesis request tells the resident worker which language model to use', async () => {
+  const source=fs.readFileSync(require.resolve('../bot.js'),'utf8');
+  const start=source.indexOf('async function requestTtsKeepaliveSerial(');
+  const end=source.indexOf('\nasync function ',start+20);
+  const state={requestSeq:1};let wire;
+  const context=vm.createContext({ttsKeepalive:state,TTS_MODEL:'base',TTS_MODEL_DE:'german',TTS_DEFAULT_LANGUAGE:'de',
+    resolveTtsModel,resolveTtsPythonBin:()=> 'python',ensureTtsKeepaliveRunning:async()=>({}),
+    writeChildStdin(proc,line){wire=JSON.parse(line);state.pending.resolve({ok:true});return true;},
+  });
+  vm.runInContext(source.slice(start,end),context);
+  await context.requestTtsKeepaliveSerial({type:'synthesize',text:'The file is ready.'});
+  assert.equal(wire.model,'base');
 });
 
 test('cancellation waits for GPU release, but an already closed worker never blocks recovery', async () => {

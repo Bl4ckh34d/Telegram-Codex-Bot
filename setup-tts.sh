@@ -114,6 +114,13 @@ if [[ ! -x "$VENV_PY" ]]; then
 fi
 
 TTS_UPGRADE="${TTS_UPGRADE:-$(env_value TTS_UPGRADE || true)}"
+if ! "$VENV_PY" -c 'from importlib.metadata import version; from opencc import OpenCC; assert version("opencc-python-reimplemented") == "0.1.7"; OpenCC("t2s")' >/dev/null 2>&1; then
+  if [[ "$HAS_UV" == "1" ]]; then
+    uv pip install --python "$VENV_PY" opencc-python-reimplemented==0.1.7
+  else
+    "$VENV_PY" -m pip install opencc-python-reimplemented==0.1.7
+  fi
+fi
 if ! is_enabled "$TTS_UPGRADE" && "$VENV_PY" -c 'import numpy, onnxruntime; from mira.model import MiraTTS; assert int(numpy.__version__.split(".")[0]) < 2' >/dev/null 2>&1; then
   echo "MiraTTS is already installed; reusing the environment without package changes."
   echo "Set TTS_UPGRADE=1 for an explicit upgrade or repair."

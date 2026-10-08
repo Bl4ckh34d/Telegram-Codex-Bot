@@ -60,9 +60,26 @@ Keep backups and preserve unrelated local changes before pulling upstream.
 
 ## Memory and measured latency
 
+Earlier on 9 October 2026, resident German MiraToffel plus base MiraTTS were verified
+in one worker sharing the audio codec (`TTS_KEEP_MODELS_LOADED=1`). German,
+English, Chinese and German again used the same worker without reloading.
+After releasing unused Whisper CUDA allocator cache after each transcription,
+the RTX 4070 SUPER had 2345 MiB free after the short roundtrip probe (677 MiB
+before that cleanup). That initial policy kept weights resident; the later idle
+policy below supersedes it. Windows per-process counters
+showed about 5458 MiB for dual TTS and 3453 MiB for Whisper; shared desktop
+allocations mean those counters should not be summed as a device total.
+
+Warm synthesis in the final probe took 0.73–1.18 seconds. German and English
+transcripts matched; the Chinese roundtrip contained substantial differences,
+so this does not establish Mandarin pronunciation quality. No Telegram upload
+was involved. Memory and latency are workload-specific, not reserved capacity
+for a second GPU application. Language selection still uses the existing offline
+heuristic, not an additional language-model call.
+
 `TTS_GPU_CACHE_FRACTION` reserves a fraction of free GPU memory for LMDeploy's
 KV cache. Increasing it does not inherently improve single-request latency.
-With both workers resident, reducing it from `0.2` to `0.05` left about
+In the earlier single-TTS-model plus Whisper setup, reducing it from `0.2` to `0.05` left about
 1.8 GiB free after inference, compared with about 0.4 GiB at `0.2`.
 
 On 8 October 2026, the persistent-worker English roundtrip measured:
@@ -87,6 +104,20 @@ preserves the existing fallback without allocating another GPU model. This
 uncommon path is slower and downloads `small` on first use if not cached.
 
 ## Verification
+
+On 9 October 2026, full TTS process startup plus a short first WAV took
+14.3–15.4 seconds. Keeping imports warm but unloading all model pipelines and
+the shared codec reduced model-cold load plus synthesis to 5.8–7.8 seconds in
+three direct-worker samples. A first Chinese request through the bot took
+9.5 seconds. These are local WAV timings, excluding Codex generation, effects
+and Telegram upload. Models were genuinely absent from GPU memory before the
+model-cold measurements; Windows disk caching was not flushed.
+
+The default is now demand loading with a 60-second idle timeout. The worker
+remains alive without model weights; GPU usage after explicit model unload was
+4481–4577 MiB total, leaving 7421–7517 MiB free with Whisper and the desktop.
+`/speech pause` also stops the Python worker for GPU-heavy tasks and persists
+across bot restarts. `/speech resume` restores speech and the idle policy.
 
 ```powershell
 npm test

@@ -164,6 +164,12 @@ def main() -> int:
             _result(request_id, True, text=text)
         except Exception as exc:
             _result(request_id, False, error=f"Whisper transcription failed: {exc}")
+        finally:
+            if model.device.type == "cuda":
+                # Keep the model resident, but return unused decoding buffers
+                # to CUDA so both TTS language models have room between turns.
+                import torch
+                torch.cuda.empty_cache()
 
     return 0
 

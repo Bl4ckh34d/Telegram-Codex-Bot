@@ -89,11 +89,9 @@ Current slash commands supported by the bot:
 
 Core:
 - `/start` or `/help` - show help
-- `/status` - worker and queue status
-- `/workers` - list workspaces/workers
-- `/use <worker_id|name|title>` - switch active workspace
-- `/spawn <local-path> [title]` - create a repo workspace
-- `/retire <worker_id|name|title>` - remove a workspace
+- `/status` - assistant and queue status
+- `/app new` - choose PC/laptop, local project or no repository, then create an app chat and topic
+- `/app list` - list existing app chats; topics synchronize with reachable devices
 - `/queue` - show queued prompts
 - `/weather [city]` - weather update for today and tomorrow (text + voice when enabled)
 - `/cancel` or `/stop` - cancel active run
@@ -180,6 +178,10 @@ Voice notes:
 3. Transcript is routed like any text prompt.
 
 Voice replies:
+
+- TTS models load on demand and unload after 60 seconds without voice input or synthesis activity (`TTS_IDLE_UNLOAD_MS=60000`). Python imports stay ready for faster model loading.
+- `/speech pause` frees TTS GPU memory and answers voice inputs with text; `/speech resume` reloads speech models and restores the idle policy. `/speech status` reports the current mode. Pause survives restarts.
+- Local agents can announce and pause TTS before user-requested ComfyUI/GPU work with `node tools/tts-control.cjs pause`; `resume` and `status` are also available.
 - Enable `TTS_ENABLED=1`.
 - If you want automatic voice replies for incoming voice notes, set `TTS_REPLY_TO_VOICE=1`.
 - Use `/voice` to switch styles while running; no bot restart needed.
@@ -325,12 +327,8 @@ Codex execution:
 - `CODEX_TIMEOUT_MS`
 - `SCREENSHOT_CAPTURE_TIMEOUT_MS`, `SCREENSHOT_TOOL_TIMEOUT_MS`, `SCREENSHOT_UPLOAD_TIMEOUT_MS`
 
-Orchestration:
+Legacy queue/state compatibility and learning:
 - `ORCH_MAX_CODEX_WORKERS`
-- `ORCH_ROUTER_ENABLED`
-- `ORCH_ROUTER_MAX_CONCURRENCY`
-- `ORCH_ROUTER_MODEL`, `ORCH_ROUTER_REASONING_EFFORT`
-- `ORCH_ROUTER_PROMPT_FILE`
 - `ORCH_LESSONS_ENABLED`
 - `ORCH_LESSONS_MAX_ITEMS`
 - `ORCH_LESSONS_PER_PROMPT`
@@ -371,19 +369,17 @@ Daily weather:
 Prompts:
 - `CODEX_PROMPT_FILE`
 - `CODEX_VOICE_PROMPT_FILE`
-- `ORCH_ROUTER_PROMPT_FILE`
 
 ## Prompt files
 
 - `codex_prompt.txt` - default text mode behavior
 - `codex_prompt_voice.txt` - voice/TTS style responses
-- `codex_prompt_router.txt` - worker routing policy
 
 ## Native Codex integration
 
 - The bot launches Codex through `codex exec` and passes the configured sandbox and approval policy instead of forcing full bypass.
 - By default the bot adds `--json`, parses Codex JSONL events, and turns reasoning deltas, tool calls, MCP calls, hooks, web search, and turn completion into clean progress updates.
-- Normal Telegram replies use `schemas/aidolon-telegram-final.schema.json` with `--output-schema` when enabled; router calls stay plain text.
+- Normal Telegram replies use `schemas/aidolon-telegram-final.schema.json` with `--output-schema` when enabled. General CLI routing is single-assistant; no automatic delegation or task splitting.
 - MCP servers and plugin-provided MCP servers from Codex config remain available by default. Set `CODEX_DISABLE_MCP=1` only when you intentionally want an isolated run.
 - Native Codex web search can be enabled with `CODEX_SEARCH_ENABLED=1`; this is separate from shell/network access in the sandbox.
 - Reusable Telegram response behavior is also available as a repo skill under `.agents/skills/`.

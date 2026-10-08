@@ -49,13 +49,13 @@ test('old bindings migrate once to automatic replies; later explicit preferences
  const b=createAppChatBridge(options);assert.equal(b.target('-10042~20').outputMode,'auto');await b.command('-10042~20','output voice');
  assert.equal(createAppChatBridge(options).target('-10042~20').outputMode,'voice');
 });
-test('poll failures are debounced and recovery clears persisted error without notification spam',async t=>{
+test('poll failures stay silent and recovery clears persisted error without notification spam',async t=>{
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'topic-error-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));const filePath=path.join(dir,'state.json');
  fs.writeFileSync(filePath,JSON.stringify({'-10042~20':{threadId:'a',seen:[]}}));let fail=true;const sent=[];
  const b=createAppChatBridge({filePath,request:async()=>{if(fail)throw new Error('temporary');return {turns:[]};},sendText:async(c,x)=>sent.push(x),speak:async()=>{},interruptSpeech(){},validPreset:()=>true});
  const binding=b.target('-10042~20');
  for(let i=0;i<2;i++)await b.poll('-10042~20',binding);assert.equal(sent.length,0);
- await b.poll('-10042~20',binding);assert.equal(sent.length,1);
+ await b.poll('-10042~20',binding);assert.equal(sent.length,0);assert.equal(binding.readFailures,3);
  fail=false;await b.poll('-10042~20',binding);assert.equal(JSON.parse(fs.readFileSync(filePath))['-10042~20'].lastError,'');
- fail=true;for(let i=0;i<4;i++)await b.poll('-10042~20',binding);assert.equal(sent.length,1);
+ fail=true;for(let i=0;i<4;i++)await b.poll('-10042~20',binding);assert.equal(sent.length,0);assert.equal(binding.readFailures,4);
 });

@@ -3,7 +3,8 @@
 Keep `TTS_MODEL=models/MiraTTS` for English/Chinese. After downloading the gated
 German fine-tune, set `TTS_MODEL_DE=models/MiraToffel` and optionally
 `TTS_DEFAULT_LANGUAGE=de` in the private `.env`, then use `/restart`.
-Startup prewarming loads the model for that configured default language.
+Startup prewarming imports the Python synthesis libraries without loading GPU
+models. The first speech request loads the language model it needs.
 `TTS_SEND_TEXT=0` keeps successful voice replies voice-only in the ordinary bot;
 app topics use `/app output auto` to follow text versus voice input.
 
@@ -46,10 +47,39 @@ voltage, current, resistance, force and amount of substance. SI case matters:
 mW is milliwatts; MW is megawatts. Unknown units are not guessed. English uses
 English unit names and singular/plural forms; German uses German names.
 
-Only one synthesis request runs at a time. A model switch terminates the old
-worker and waits for it to exit before starting the replacement. Ordinary
-cancellation/recovery also waits for the retiring worker. A switch adds cold-load
-latency; subsequent requests in the same language reuse the warm worker.
+Only one synthesis request runs at a time. `TTS_IDLE_UNLOAD_MS=60000` is the
+default: models load on demand and unload after one minute without voice input
+or synthesis activity. Active and queued synthesis prevents idle unloading.
+Python imports remain ready; both language pipelines, reference tensors, the
+shared codec and unused CUDA allocator cache are released. A small CUDA context
+can remain until the worker exits. Whisper stays loaded to transcribe voice input.
+
+With `TTS_KEEP_MODELS_LOADED=1`, used language models share one codec and stay
+available together until the idle timeout. The second language loads only on
+first use. Set `TTS_IDLE_UNLOAD_MS=0` to restore always-resident startup prewarming.
+Worker readiness and the list of GPU-loaded models are reported separately.
+
+Set `TTS_KEEP_MODELS_LOADED=0` on a machine with insufficient VRAM to retain
+load-on-switch behavior. That mode stops the previous worker and waits for it
+to exit before loading the next language. Ordinary cancellation/recovery also
+waits for the retiring worker. Pipeline recovery releases the failed pipeline
+before allocating its replacement. `/speech status` or `node tools/tts-control.cjs
+status` reports the loaded model list.
+
+`/speech pause` persists a global speech pause, finishes the current synthesis
+request, stops the TTS worker, and replies to future voice inputs with text.
+`/speech resume` enables speech and preloads the configured models; the idle
+timeout then applies again. Local agents use `node tools/tts-control.cjs
+pause|resume|status` from this repository. Before user-requested GPU-heavy work,
+they announce the pause and verify the control command succeeded. They resume
+only on user request. No debugger or listening network port is required.
+
+Chinese speech input uses [OpenCC](https://github.com/yichen0831/opencc-python)
+`t2s` conversion before synthesis, preserving the original visible text and
+Taiwanese vocabulary. In local back-transcription checks, Traditional Chinese
+produced dropped/mispronounced words; equivalent Simplified input reduced those
+errors. This is not a guarantee of word-perfect audio or a listening evaluation.
+Set `TTS_CHINESE_SIMPLIFY=0` to disable this normalization.
 
 The keepalive worker explicitly uses UTF-8 for its JSON pipes. On Windows,
 redirected Python stdin otherwise defaults to the locale encoding, corrupting

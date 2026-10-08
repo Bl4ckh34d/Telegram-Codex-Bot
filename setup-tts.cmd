@@ -118,6 +118,16 @@ if not exist "%VENV_DIR%\\Scripts\\python.exe" (
 echo Installing MiraTTS dependencies into "%VENV_DIR%"...
 set "VENV_PY=%VENV_DIR%\\Scripts\\python.exe"
 
+"%VENV_PY%" -c "from importlib.metadata import version; from opencc import OpenCC; assert version('opencc-python-reimplemented') == '0.1.7'; OpenCC('t2s')" >nul 2>&1
+if errorlevel 1 (
+  if defined HAS_UV (
+    uv pip install --python "%VENV_PY%" opencc-python-reimplemented==0.1.7
+  ) else (
+    "%VENV_PY%" -m pip install opencc-python-reimplemented==0.1.7
+  )
+  if errorlevel 1 exit /b 1
+)
+
 if not "%TTS_UPGRADE%"=="1" (
   "%VENV_PY%" -c "import numpy, onnxruntime; from tts_runtime import prepare_cuda; prepare_cuda(); from mira.model import MiraTTS; import lmdeploy.turbomind; assert int(numpy.__version__.split('.')[0]) < 2" >nul 2>&1
   if not errorlevel 1 (

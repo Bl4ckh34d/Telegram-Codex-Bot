@@ -10,10 +10,11 @@ Protocol:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 from pathlib import Path
-from tts_runtime import create_tts
+from tts_runtime import create_tts, resident_mira_factory, normalize_chinese_tts
 import re
 import sys
 import unicodedata
@@ -44,6 +45,9 @@ def _result(request_id: str, ok: bool, *, data: dict | None = None, error: str =
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MiraTTS keepalive server")
     parser.add_argument("--model", required=True, help="MiraTTS model id/path")
+    parser.add_argument("--resident-model", action="append", default=[],
+                        help="Additional model to keep loaded with the shared audio codec")
+    parser.add_argument("--lazy-models", action="store_true", help="Load configured models only when requested")
     parser.add_argument("--reference-audio", required=True, help="Reference WAV path")
     parser.add_argument("--sample-rate", default="48000", help="Output WAV sample rate")
     return parser.parse_args()
@@ -101,7 +105,7 @@ def _fallback_clean_tts_text(text: str) -> str:
 
 
 def _clean_tts_text(text: str) -> str:
-    return _fallback_clean_tts_text(text)
+    return normalize_chinese_tts(_fallback_clean_tts_text(text))
 
 
 def _is_tokenizer_input_type_error(exc: Exception) -> bool:
@@ -126,10 +130,68 @@ def _reload_tts_runtime(state: dict) -> None:
         raise RuntimeError("Cannot reload TTS runtime: missing model")
     if not isinstance(ref_path, Path):
         raise RuntimeError("Cannot reload TTS runtime: missing reference audio path")
+    old = state.get("tts")
+    if old is not None:
+        # Release the failed language pipeline before allocating its replacement.
+        # A resident sibling retains the common audio codec.
+        old.pipe.close()
+        state["tts"] = None
+        del old
+        gc.collect()
     tts = create_tts(state.get("tts_factory"), model)
     state["tts"] = tts
     state["ctx_cache"] = {}
     _get_ctx_for_ref_path(state, ref_path)
+
+
+def _resident_factory(mira_class):
+    from lmdeploy import pipeline, TurbomindEngineConfig
+    return resident_mira_factory(mira_class, pipeline, TurbomindEngineConfig)
+
+
+def _release_cuda_cache():
+    gc.collect()
+    import torch
+    if torch.cuda.is_initialized():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
+class ModelPool:
+    """Release language pipelines AND the shared codec while keeping imports warm."""
+    def __init__(self, models, reference, factory_builder):
+        self.models = models
+        self.reference = reference
+        self.factory_builder = factory_builder
+        self.factory = None
+        self.states = {}
+
+    def get(self, model):
+        if model not in self.models:
+            raise ValueError("Requested TTS model is not loaded or configured")
+        if model not in self.states:
+            if self.factory is None:
+                self.factory = self.factory_builder()
+            state = {"model": model, "default_ref_path": self.reference,
+                     "tts_factory": self.factory, "tts": None, "ctx_cache": {}}
+            self.states[model] = state
+            try:
+                _reload_tts_runtime(state)
+            except Exception:
+                self.unload()
+                raise
+        return self.states[model]
+
+    def unload(self):
+        for state in self.states.values():
+            tts = state.pop("tts", None)
+            if tts is not None:
+                tts.pipe.close()
+            state.clear()
+            del tts
+        self.states.clear()
+        self.factory = None
+        _release_cuda_cache()
 
 
 def _resolve_request_ref_path(state: dict, payload: dict) -> Path:
@@ -327,19 +389,16 @@ def main() -> int:
         return 4
 
     try:
-        state = {
-            "model": str(args.model),
-            "default_ref_path": ref_path,
-            "tts_factory": MiraTTS,
-            "tts": None,
-            "ctx_cache": {},
-        }
-        _reload_tts_runtime(state)
+        models = list(dict.fromkeys([str(args.model), *args.resident_model]))
+        pool = ModelPool(models, ref_path, lambda: _resident_factory(MiraTTS) if len(models) > 1 else MiraTTS)
+        if not args.lazy_models:
+            for model in models:
+                pool.get(model)
     except Exception as exc:
         print(f"TTS server init failed: {exc}", file=sys.stderr)
         return 5
 
-    _emit({"type": "ready"})
+    _emit({"type": "ready", "models": models, "loaded_models": list(pool.states)})
 
     for raw in sys.stdin:
         line = (raw or "").strip()
@@ -354,6 +413,28 @@ def main() -> int:
         except Exception:
             if request_id:
                 _result(request_id, False, error="Invalid JSON payload")
+            continue
+
+        if request_type == "unload":
+            try:
+                pool.unload()
+                _result(request_id, True, data={"loaded_models": []})
+            except Exception as exc:
+                _result(request_id, False, error=f"TTS unload failed: {exc}")
+            continue
+        if request_type not in ("load", "synthesize", "synthesize_batch"):
+            _result(request_id, False, error=f"Unsupported request type: {request_type or '(empty)'}")
+            continue
+        model = str(payload.get("model") or args.model)
+        try:
+            state = pool.get(model)
+        except Exception as exc:
+            _result(request_id, False, error=str(exc))
+            continue
+
+        _emit({"type": "loaded", "loaded_models": list(pool.states)})
+        if request_type == "load":
+            _result(request_id, True, data={"loaded_models": list(pool.states)})
             continue
 
         if request_type == "synthesize":

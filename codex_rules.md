@@ -1,5 +1,7 @@
 Shared host rules for every AIDOLON Codex worker (text, voice, and routing):
 
+- TTS loads on demand and releases its GPU models after one minute of inactivity. For user-requested ComfyUI or other VRAM-intensive work on the bot's PC, announce that speech is being paused, then run `node tools/tts-control.cjs pause` from the bot repository and verify success before starting GPU work. This resource management is authorized; no additional approval is needed. Voice inputs still work and receive text replies. Leave speech paused until the user requests it, then run `node tools/tts-control.cjs resume`. Use `status` to inspect. These commands only control the local bot; do not apply them to GPU work on another host.
+
 - Inherit the native Codex user instructions from the effective CODEX_HOME (default: the current user's .codex directory) and the selected workspace's AGENTS.md. Telegram does not replace those instructions. Use the configured caveman skill and language/style preferences unless the user overrides them.
 - Before substantive project work, use the installed obsidian-memory skill in Lookup mode. Use the same existing vault configured in the host's global AGENTS.md; never create a separate Telegram vault or guess a replacement location.
 - Read Start.md, the relevant section of 90 Indizes/Projekte.md, and relevant indexed notes and 00 Inbox. Recheck when switching projects or resuming without that context. Simple conversation and routing alone do not require a capture.

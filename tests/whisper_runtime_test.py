@@ -17,6 +17,26 @@ import whisper_runtime
 
 
 class WhisperRuntimeTests(unittest.TestCase):
+    def test_cuda_worker_releases_temporary_cache_without_reloading_model(self):
+        calls=[]
+        # GPU allocations are external; model load and the server request loop
+        # stay real. Cache release must happen after decoding, without unload.
+        model=types.SimpleNamespace(device=types.SimpleNamespace(type="cuda"))
+        model.transcribe=lambda *a, **kw: calls.append("decode") or {"text":"Hallo", "language":"de"}
+        def load(*a, **kw):
+            calls.append("load")
+            return model
+        torch=types.SimpleNamespace(cuda=types.SimpleNamespace(empty_cache=lambda: calls.append("release")))
+        with tempfile.NamedTemporaryFile(suffix=".wav") as audio:
+            rows=[{"id":str(i), "type":"transcribe", "audio_path":audio.name, "language":"de"} for i in range(2)]
+            with patch.dict(sys.modules, {"whisper":types.SimpleNamespace(load_model=load), "torch":torch}), \
+                 patch.dict(os.environ, {"WHISPER_DEVICE":"cuda", "WHISPER_FP16":"auto"}), \
+                 patch.object(sys,"argv",["worker"]), \
+                 patch.object(sys,"stdin",io.StringIO("\n".join(json.dumps(row) for row in rows))), \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(whisper_transcribe_server.main(),0)
+        self.assertEqual(calls,["load","decode","release","decode","release"])
+
     def run_worker(self, server, device, fp16="auto", language="auto"):
         calls, loads = [], []
         model = types.SimpleNamespace(device=types.SimpleNamespace(type=device))
@@ -38,7 +58,8 @@ class WhisperRuntimeTests(unittest.TestCase):
             request = {"id": "probe", "type": "transcribe", "audio_path": audio.name,
                        "language": language}
             output = io.StringIO()
-            with patch.dict(sys.modules, {"whisper": types.SimpleNamespace(load_model=load)}), \
+            with patch.dict(sys.modules, {"whisper": types.SimpleNamespace(load_model=load),
+                                         "torch": types.SimpleNamespace(cuda=types.SimpleNamespace(empty_cache=lambda: None))}), \
                  patch.dict(os.environ, {"WHISPER_DEVICE": device, "WHISPER_FP16": fp16}), \
                  patch.object(sys, "argv", args), patch.object(sys, "stdin", io.StringIO(json.dumps(request))), \
                  contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
