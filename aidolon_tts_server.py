@@ -301,6 +301,12 @@ def _handle_synthesize_batch(request_id: str, payload: dict, *, state: dict, sam
 
 
 def main() -> int:
+    # Node writes UTF-8 JSON. Redirected Windows pipes otherwise use the locale
+    # encoding, corrupting umlauts and CJK text before synthesis sees it.
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8")
     args = _parse_args()
 
     try:

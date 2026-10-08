@@ -1,4 +1,6 @@
 import os
+import json
+import subprocess
 from pathlib import Path
 import sys
 import unittest
@@ -9,6 +11,29 @@ from tts_runtime import create_tts
 
 
 class TtsRuntimeTests(unittest.TestCase):
+    def test_json_pipe_preserves_unicode_under_windows_legacy_encoding(self):
+        script = r'''
+import sys, types
+import aidolon_tts_server as server
+sys.modules['mira'] = types.ModuleType('mira')
+model = types.ModuleType('mira.model')
+model.MiraTTS = object
+sys.modules['mira.model'] = model
+server._reload_tts_runtime = lambda state: None
+server._handle_synthesize = lambda rid, payload, **kw: server._emit({'text': payload['text'], 'codepoints': [ord(c) for c in payload['text']]})
+sys.argv = ['worker', '--model', 'unused', '--reference-audio', server.__file__]
+server.main()
+'''
+        text = "Grüße, Äpfel, Öl, süß — 中文"
+        result = subprocess.run([sys.executable, "-c", script],
+            input=(json.dumps({"id": "test", "type": "synthesize", "text": text}, ensure_ascii=False) + "\n").encode("utf-8"),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+            env={**os.environ, "PYTHONIOENCODING": "cp1252", "PYTHONUTF8": "0"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        reply = json.loads(result.stdout.decode("utf-8").splitlines()[-1])
+        self.assertEqual(reply["codepoints"], [ord(c) for c in text])
+        self.assertEqual(reply["text"], text)
+
     def test_invalid_cache_fraction_fails_before_allocating_gpu_memory(self):
         for value in ("0", "1", "-0.1", "nan", "inf", "invalid"):
             with self.subTest(value=value), patch.dict(os.environ, {"TTS_GPU_CACHE_FRACTION": value}), \

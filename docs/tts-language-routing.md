@@ -51,6 +51,12 @@ worker and waits for it to exit before starting the replacement. Ordinary
 cancellation/recovery also waits for the retiring worker. A switch adds cold-load
 latency; subsequent requests in the same language reuse the warm worker.
 
+The keepalive worker explicitly uses UTF-8 for its JSON pipes. On Windows,
+redirected Python stdin otherwise defaults to the locale encoding, corrupting
+umlauts and Chinese characters before they reach the model. The regression test
+forces a legacy cp1252 environment and checks both decoded input and UTF-8 output
+without allocating a GPU model.
+
 Fine-tune: `SebastianBodza/MiraToffel_miraTTS_german`, pinned revision
 `85ad2e06949d5537b54e3542bc95f54d1b9083ec`. Accept access conditions on Hugging Face,
 then authenticate locally with `.tts-venv/bin/hf auth login`. Never put tokens in
