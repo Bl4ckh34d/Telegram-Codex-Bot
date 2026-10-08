@@ -3,7 +3,6 @@ const fs = require('node:fs');
 const path = require('node:path');
 const net = require('node:net');
 const crypto = require('node:crypto');
-const { execFileSync } = require('node:child_process');
 function pipeRequest(pipePath, method, params, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(pipePath); let data = Buffer.alloc(0); let done=false;
@@ -16,13 +15,34 @@ function pipeRequest(pipePath, method, params, timeoutMs = 30000) {
     });
   });
 }
-function discoverPipe() {
-  if(process.env.CODEX_APP_TOOLS_PIPE_PATH)return process.env.CODEX_APP_TOOLS_PIPE_PATH;
-  if(process.platform!=='win32')throw new Error('Configure the running Codex app Unix socket as pipePath in runtime/app-bridge.json (or CODEX_APP_TOOLS_PIPE_PATH). Desktop and terminal tools work independently of the app bridge.');
-  const output=execFileSync('powershell.exe',['-NoProfile','-Command',"Get-CimInstance Win32_Process | Where-Object {$_.Name -eq 'codex.exe' -and $_.CommandLine -match 'CODEX_APP_TOOLS_PIPE_PATH'} | Select-Object -ExpandProperty CommandLine"],{encoding:'utf8',timeout:10000,windowsHide:true});
-  const names=[...new Set(output.match(/codex-browser-use-[0-9a-f-]{36}/g)||[])];
-  if(names.length!==1)throw new Error('Cannot uniquely identify running Codex app. Configure pipePath in runtime/app-bridge.json.');
-  return `\\\\.\\pipe\\${names[0]}`;
+const discoveredPipes=new Map();
+async function discoverPipe(contextThreadId,request=pipeRequest,candidates) {
+  if(!candidates){
+    const configured=process.env.CODEX_APP_TOOLS_PIPE_PATH;
+    if(process.platform!=='win32'){
+      if(configured)return configured;
+      throw new Error('Configure the running Codex app Unix socket as pipePath in runtime/app-bridge.json.');
+    }
+    // stat/existsSync opens a named pipe and intermittently fails when busy.
+    // Directory enumeration does not consume a connection slot.
+    candidates=[...new Set(fs.readdirSync('\\\\.\\pipe\\'))].filter(name=>/^codex-browser-use-[0-9a-f-]{36}$/i.test(name)).map(name=>`\\\\.\\pipe\\${name}`);
+    if(configured&&candidates.includes(configured))return configured;
+  }
+  const cached=discoveredPipes.get(contextThreadId);
+  if(cached&&candidates.includes(cached))return cached;
+  if(candidates.length===1)return candidates[0];
+  const deadline=Date.now()+10000;
+  for(const pipe of candidates){
+    if(Date.now()>=deadline)throw new Error('Codex app discovery exceeded 10 seconds. Configure pipePath in runtime/app-bridge.json.');
+    try{
+      const result=await request(pipe,'tools/call',{callerSource:'codex',namespace:'codex_app',tool:'read_thread',arguments:{threadId:contextThreadId,hostId:'local',turnLimit:1,maxOutputCharsPerItem:1},threadId:contextThreadId,turnId:'aidolon-discovery',callId:crypto.randomUUID()},2000);
+      if(!result.success)continue;
+      const text=(result.contentItems||[]).filter(x=>x.type==='inputText').map(x=>x.text).join('\n');
+      const thread=JSON.parse(text).thread;
+      if(thread?.id===contextThreadId&&thread.kind==='codex'&&thread.hostId==='local'){discoveredPipes.set(contextThreadId,pipe);return pipe;}
+    }catch{/* Only read-only discovery is retried. Never retry a send. */}
+  }
+  throw new Error('Running Codex app context not found. Open Codex or configure contextThreadId/pipePath in runtime/app-bridge.json.');
 }
 // Read-only fallback: this app build omits some newly completed messages from
 // read_thread. Completed response_item messages are persisted by the same app.
@@ -63,19 +83,29 @@ function parseRolloutMessages(text) {
   }
   return items.slice(-200);
 }
-async function appRequest(input) {
-  const config=JSON.parse(fs.readFileSync(path.resolve(__dirname,'../runtime/app-bridge.json'),'utf8'));
-  if(!config.contextThreadId)throw new Error('Missing contextThreadId in runtime/app-bridge.json');
+async function appRequest(input, config, {request=pipeRequest}={}) {
+  config=config||JSON.parse(fs.readFileSync(path.resolve(__dirname,'../runtime/app-bridge.json'),'utf8'));
+  const contextThreadId=config.contextThreadId||process.env.CODEX_THREAD_ID||require('./app-local-catalog').localThreadCatalog(config.stateDatabase)[0]?.id;
+  if(!contextThreadId)throw new Error('Open a Codex app chat or configure contextThreadId in runtime/app-bridge.json');
   const allowed={list:'list_threads',read:'read_thread',send:'send_message_to_thread'};
   const tool=allowed[input.action];if(!tool)throw new Error('Unknown app bridge action');
-  const args=input.action==='list'?{limit:15}:{threadId:String(input.threadId||''),...(input.hostId?{hostId:String(input.hostId)}:{})};
+  const args=input.action==='list'?{limit:50}:{threadId:String(input.threadId||''),...(input.hostId?{hostId:String(input.hostId)}:{})};
   if(input.action!=='list'&&!args.threadId)throw new Error('threadId required');
   if(input.action==='read')Object.assign(args,{turnLimit:3,includeOutputs:false,maxOutputCharsPerItem:12000});
   if(input.action==='send'){if(typeof input.text!=='string'||!input.text.trim()||input.text.length>30000)throw new Error('Nonempty text up to 30000 characters required');args.prompt=input.text;}
-  const result=await pipeRequest(config.pipePath||discoverPipe(),'tools/call',{namespace:'codex_app',tool,arguments:args,threadId:config.contextThreadId,turnId:'aidolon-telegram',callId:crypto.randomUUID()});
+  const pipe=config.pipePath||await discoverPipe(contextThreadId,request);
+  let result;
+  try{result=await request(pipe,'tools/call',{callerSource:'codex',namespace:'codex_app',tool,arguments:args,threadId:contextThreadId,turnId:'aidolon-telegram',callId:crypto.randomUUID()});}
+  catch(e){discoveredPipes.delete(contextThreadId);throw e;}
   const text=(result.contentItems||[]).filter(x=>x.type==='inputText').map(x=>x.text).join('\n');
   if(!result.success)throw new Error(text||'App request rejected');
   let parsed;try{parsed=JSON.parse(text);}catch{return {text};}
+  if(input.action==='list' && config.includeLocalCatalog!==false){
+    try{
+      const known=new Set([...(parsed.threads||[]),...(parsed.pinnedThreads||[])].filter(x=>x.kind==='codex'&&x.hostId==='local').map(x=>x.id));
+      parsed.threads=[...(parsed.threads||[]),...require('./app-local-catalog').localThreadCatalog(config.stateDatabase).filter(x=>!known.has(x.id))];
+    }catch(e){parsed.errors=[...(parsed.errors||[]),`Vollständiger lokaler Chat-Katalog nicht verfügbar; nur die letzten 50 Chats: ${e.message}`];}
+  }
   if(input.action==='read' && parsed.thread?.hostId==='local' && parsed.thread?.kind==='codex') {
     const items=localMessages(input.threadId);
     if(items) return {thread:parsed.thread,turns:[{id:`rollout:${input.threadId}`,items}]};
@@ -83,4 +113,4 @@ async function appRequest(input) {
   if(input.action==='read') return {thread:parsed.thread,turns:(parsed.turns||[]).map(t=>({id:t.id,status:t.status,items:(t.items||[]).flatMap((i,n)=>i.type==='agentMessage'?[{type:i.type,id:i.id,text:i.text,phase:i.phase,complete:n<t.items.length-1||t.status!=='inProgress'}]:[])}))};
   return parsed;
 }
-module.exports={appRequest,pipeRequest,parseRolloutMessages,findLatestRollout,localMessages};
+module.exports={appRequest,pipeRequest,discoverPipe,parseRolloutMessages,findLatestRollout,localMessages};

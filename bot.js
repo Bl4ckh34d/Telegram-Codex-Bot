@@ -3,6 +3,7 @@
 
 const fs = require("fs");
 const { splitRoute, conversationKey, routeBody, routeMultipart } = require("./lib/telegram_topics");
+const { retryTelegramRateLimit } = require("./lib/telegram_rate_limit");
 const { addVoiceAtmosphere } = require("./lib/voice_atmosphere");
 const { createVoiceFxVariation } = require("./lib/voice_fx_variation");
 const { normalizeSpeechSymbols, speechPlaceholders } = require("./lib/tts_pronunciation");
@@ -4990,6 +4991,10 @@ function isOwnAbortTimeout(controller, signal) {
 }
 
 async function telegramApi(method, { query = "", body = null, timeoutMs = TELEGRAM_API_TIMEOUT_MS, signal } = {}) {
+  return retryTelegramRateLimit(() => telegramApiOnce(method, { query, body, timeoutMs, signal }), { signal });
+}
+
+async function telegramApiOnce(method, { query = "", body = null, timeoutMs = TELEGRAM_API_TIMEOUT_MS, signal } = {}) {
   body = routeBody(method, body);
   const url = `https://api.telegram.org/bot${TOKEN}/${method}${query ? `?${query}` : ""}`;
 
@@ -5010,7 +5015,10 @@ async function telegramApi(method, { query = "", body = null, timeoutMs = TELEGR
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.ok) {
       const desc = data.description || JSON.stringify(data);
-      throw new Error(`Telegram ${method} failed: ${res.status} ${desc}`);
+      const error = new Error(`Telegram ${method} failed: ${res.status} ${desc}`);
+      error.deliveryRejected = res.status >= 400 && res.status < 500 && data.ok === false;
+      error.retryAfter = res.status === 429 ? Number(data.parameters?.retry_after) || 0 : 0;
+      throw error;
     }
     return data.result;
   } catch (err) {
@@ -5027,6 +5035,10 @@ async function telegramApi(method, { query = "", body = null, timeoutMs = TELEGR
 }
 
 async function telegramApiMultipart(method, formData, timeoutMs = TELEGRAM_UPLOAD_TIMEOUT_MS, { signal } = {}) {
+  return retryTelegramRateLimit(() => telegramApiMultipartOnce(method, formData, timeoutMs, { signal }), { signal });
+}
+
+async function telegramApiMultipartOnce(method, formData, timeoutMs = TELEGRAM_UPLOAD_TIMEOUT_MS, { signal } = {}) {
   routeMultipart(method, formData);
   const url = `https://api.telegram.org/bot${TOKEN}/${method}`;
   const controller = new AbortController();
@@ -5045,7 +5057,10 @@ async function telegramApiMultipart(method, formData, timeoutMs = TELEGRAM_UPLOA
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.ok) {
       const desc = data.description || JSON.stringify(data);
-      throw new Error(`Telegram ${method} failed: ${res.status} ${desc}`);
+      const error = new Error(`Telegram ${method} failed: ${res.status} ${desc}`);
+      error.deliveryRejected = res.status >= 400 && res.status < 500 && data.ok === false;
+      error.retryAfter = res.status === 429 ? Number(data.parameters?.retry_after) || 0 : 0;
+      throw error;
     }
     return data.result;
   } catch (err) {
@@ -18881,6 +18896,11 @@ async function handleIncomingMessage(msg) {
   ];
   const recentHistoryContext = buildRecentHistoryContext(chatId, { excludeMessageIds });
 
+  if (appChatBridge?.target(chatId) && ((Array.isArray(msg.photo) && msg.photo.length) || msg.document)) {
+    await sendMessage(chatId, "Dieses App-Topic unterstützt derzeit Text und Sprachnachrichten. Anhänge bitte direkt in der Codex-App öffnen.");
+    return;
+  }
+
   if (msg.voice || msg.audio) {
     logChat("in", chatId, "[voice-message]", { source: "voice", user });
     await handleVoiceMessage(msg, { replyContext, replyThreadContext, recentHistoryContext });
@@ -18913,6 +18933,10 @@ async function handleIncomingMessage(msg) {
   rememberChatAutomationPrefsFromText(chatId, text);
 
   const replyToMessageId = Number(msg?.message_id || 0);
+  if (appChatBridge?.target(chatId) && !/^\/(?:app|help|restart)(?:@\w+)?(?:\s|$)/i.test(text)) {
+    await appChatBridge.route(chatId, text);
+    return;
+  }
   if (text.startsWith("/")) {
     const handled = await handleCommand(chatId, text);
     if (handled) return;
@@ -19302,16 +19326,27 @@ process.on("unhandledRejection", (err) => {
     const appConfig = String(process.env.APP_COMPANION_CONFIG || "").trim();
     if (appConfig) {
       const appTransport = createAppTransport(resolveMaybeRelativePath(appConfig, ROOT));
+      const topicGroup = String(process.env.APP_TOPIC_GROUP_ID || "").trim();
+      let lastSyncErrorAt = 0;
       appChatBridge = createAppChatBridge({
         filePath: path.join(RUNTIME_DIR, "app-chat-bindings.json"),
         request: appTransport,
+        autoTopicGroup: topicGroup && ALLOWED_CHAT_IDS.has(topicGroup) ? topicGroup : "",
+        onSyncError: error => { if (Date.now() - lastSyncErrorAt > 300000) { lastSyncErrorAt = Date.now(); log(`App-Themenabgleich: ${redactError(error)}`); } },
         migrateFromChat: String(process.env.APP_TOPIC_MIGRATE_FROM_CHAT_ID || "").trim(),
-        createTopic: async (route, name) => {
+        createTopic: async (route, name, options = {}) => {
           const { chatId } = splitRoute(route);
-          const chat = await telegramApi("getChat", { body: { chat_id: chatId } });
-          if (!chat.is_forum) throw new Error("Bitte in einer Gruppe mit aktivierten Themen verwenden.");
-          const topic = await telegramApi("createForumTopic", { body: { chat_id: chatId, name: name.slice(0, 128) } });
+          let chat;
+          try { chat = await telegramApi("getChat", { body: { chat_id: chatId } }); }
+          catch (error) { error.deliveryRejected = true; throw error; }
+          if (!chat.is_forum) { const error = new Error("Bitte in einer Gruppe mit aktivierten Themen verwenden."); error.deliveryRejected = true; throw error; }
+          const topic = await telegramApi("createForumTopic", { body: { chat_id: chatId, name, ...(options.iconColor ? { icon_color: options.iconColor } : {}) } });
           return `${chatId}~${topic.message_thread_id}`;
+        },
+        editTopic: async (route, name) => {
+          const { chatId, threadId } = splitRoute(route);
+          try { await telegramApi("editForumTopic", { body: { chat_id: chatId, message_thread_id: Number(threadId), name } }); }
+          catch (err) { if (!String(err.message).includes("TOPIC_NOT_MODIFIED")) throw err; }
         },
         sendScreenshot: createAppScreenshotSender({ request: appTransport, outDir: OUT_DIR, sendPhoto }),
         sendText: (chat, text, options) => sendMessage(chat, text, options),
@@ -19324,11 +19359,6 @@ process.on("unhandledRejection", (err) => {
           description: ({ off: "Ohne Stimmverfremdung", "hologram-ai": "Weich, hell und ätherisch mit kurzem Oktavschimmer", "starship-comms": "Funkstimme mit kurzen Signaltönen", "cyber-oracle": "Dunkel und bedrohlich mit dezenter tiefer Doppelstimme", "alien-terminal": "Cyberpunk-Klang mit dosierten Alien-Pitchsprüngen", anonymous: "Stark abgesenkte, verfremdete Stimme", custom: "Eigenes konfiguriertes Effektprofil" })[id] || id,
         })),
       });
-      const topicGroup = String(process.env.APP_TOPIC_GROUP_ID || "").trim();
-      if (topicGroup && ALLOWED_CHAT_IDS.has(topicGroup)) {
-        try { await appChatBridge.command(topicGroup, "topics"); }
-        catch (err) { await sendMessage(topicGroup, `Themen-Einrichtung: ${redactError(err.message || err)}\nMit /app topics erneut versuchen, nachdem die Ursache behoben ist.`).catch(() => {}); }
-      }
       appChatBridge.start();
     }
     await pollLoop();

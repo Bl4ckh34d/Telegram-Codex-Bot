@@ -18,9 +18,11 @@ function section(start, end) {
 }
 test('production Telegram transport supports GET, JSON, multipart and file download over HTTP', async t => {
   const received = [];
+  const rateAttempts=new Map();
   const server = http.createServer(async (req, res) => {
     const chunks = []; for await (const chunk of req) chunks.push(chunk);
     received.push({method:req.method, body:Buffer.concat(chunks).toString(), type:req.headers['content-type']});
+    if(req.url.includes('/rate')){const count=rateAttempts.get(req.url)||0;rateAttempts.set(req.url,count+1);if(!count){res.writeHead(429,{'content-type':'application/json'});res.end(JSON.stringify({ok:false,parameters:{retry_after:0.01},description:'Too Many Requests'}));return;}}
     if(req.url.includes('/file/')) { res.end('voice-bytes'); return; }
     res.setHeader('content-type','application/json'); res.end(JSON.stringify({ok:true,result:{id:123}}));
   });
@@ -31,6 +33,7 @@ test('production Telegram transport supports GET, JSON, multipart and file downl
     TOKEN:'test', TELEGRAM_API_TIMEOUT_MS:2000, TELEGRAM_UPLOAD_TIMEOUT_MS:2000,
     combineAbortSignals, fs, Readable, pipeline, byteLimit,
     ...require("../lib/telegram_topics"),
+    ...require("../lib/telegram_rate_limit"),
     isRetryableTelegramNetworkError:()=>false});
   // Use the actual import and dispatcher factory so a version mismatch regresses this test.
   vm.runInContext(source.match(/^const \{[^\n]+\} = require\("undici"\);$/m)[0]+'\n'+section('function createTelegramFetchDispatcher(', 'loadEnv(ENV_PATH);')+'\nconst TELEGRAM_FETCH_DISPATCHER = createTelegramFetchDispatcher("ipv4first");', c);
@@ -53,5 +56,9 @@ test('production Telegram transport supports GET, JSON, multipart and file downl
   await c.telegramApiMultipart('sendVoice',topicForm);
   assert.match(received.at(-1).body,/name="message_thread_id"\r\n\r\n21/);
   assert.doesNotMatch(received.at(-1).body,/-10042~21/);
+  await c.telegramApi('rateJson',{body:{text:'once'}});
+  await c.telegramApiMultipart('rateVoice',topicForm);
+  assert.deepEqual([...rateAttempts.values()],[2,2]);
+  assert.match(received.at(-1).body,/audio/);
 
 });

@@ -8,6 +8,12 @@ const {loadCompanionHosts}=require('../lib/companion_hosts');
 const {createAppTransport}=require('../lib/companion_app_transport');
 const {createAppChatBridge,groupAppThreads}=require('../lib/app_chat_bridge');
 function fixture(t){const dir=fs.mkdtempSync(path.join(os.tmpdir(),'hosts-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));const file=path.join(dir,'hosts.json');fs.writeFileSync(file,JSON.stringify({hosts:{win:{destination:'win',remote_command:'request'},linux:{destination:'linux',remote_command:'request'}}}));return {dir,file};}
+test('local app transport uses the running app without spawning SSH or Codex CLI',async t=>{
+ const {file}=fixture(t);fs.writeFileSync(file,JSON.stringify({hosts:{desktop:{transport:'local',label:'PC',icon:'🖥️'}}}));let calls=[];
+ const request=createAppTransport(file,{localRequest:async r=>{calls.push(r);return {threads:[{id:'t',kind:'codex'}]};},spawnProcess:()=>{throw new Error('must not spawn');}});
+ const result=await request({action:'list'});assert.equal(result.threads[0].companionId,'desktop');assert.equal(result.threads[0].companionIcon,'🖥️');
+ await request({action:'send',companionId:'desktop',threadId:'t',text:'hello'});assert.equal(calls.at(-1).text,'hello');
+});
 test('multiple hosts require an explicit target and do not expose SSH configuration',t=>{
  const {file}=fixture(t),hosts=loadCompanionHosts(file);
  assert.throws(()=>hosts.get(),/explicitly/);assert.throws(()=>hosts.get('missing'),/Unknown/);

@@ -14,6 +14,7 @@ test('each new intermediate message captures once; final answers and disabled sc
   sendScreenshot:async(chat,binding,current)=>{assert.ok(current());shots.push(binding.companionId);},
  });
  await bridge.command('chat','list');await bridge.command('chat','use 1');
+ assert.equal(bridge.target('chat').screenshots,false);await bridge.command('chat','screenshots on');
  const message=(id,phase)=>({id,type:'agentMessage',text:'Update',phase,complete:true});
  items=[message('a','commentary'),message('b','final_answer')];
  await bridge.poll('chat',bridge.target('chat'));await bridge.poll('chat',bridge.target('chat'));
@@ -28,7 +29,7 @@ test('a screenshot failure does not replay the already delivered text',async t=>
   sendText:async(_,text)=>sent.push(text),speak:async()=>true,interruptSpeech(){},validPreset:()=>true,
   sendScreenshot:async()=>{throw Error('offline');},
  });
- await bridge.command('c','list');await bridge.command('c','use 1');sent.length=0;
+ await bridge.command('c','list');await bridge.command('c','use 1');await bridge.command('c','screenshots on');sent.length=0;
  items=[{id:'msg',type:'agentMessage',text:'Unique update',phase:'commentary',complete:true}];
  await bridge.poll('c',bridge.target('c'));await bridge.poll('c',bridge.target('c'));
  assert.equal(sent.filter(s=>s.includes('Unique update')).length,1);
@@ -55,7 +56,7 @@ test('caption carries the update without a repeated host/title header or duplica
   sendText:async(_,text)=>texts.push(text),speak:async()=>true,interruptSpeech(){},validPreset:()=>true,
   sendScreenshot:async(_,binding,current,options)=>{captions.push(options.text);return {sent:true};},
  });
- await bridge.command('c','list');await bridge.command('c','use 1');texts.length=0;
+ await bridge.command('c','list');await bridge.command('c','use 1');await bridge.command('c','screenshots on');texts.length=0;
  items=[{id:'a',type:'agentMessage',text:'Build complete.',phase:'commentary',complete:true}];
  await bridge.poll('c',bridge.target('c'));
  assert.deepEqual(captions,['Build complete.']);assert.deepEqual(texts,[]);

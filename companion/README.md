@@ -5,6 +5,9 @@ and the existing OS desktop tools, but no Telegram credentials, speech models,
 or npm dependencies. Main AIDOLON handles Telegram and speech. Codex uses the
 companion through a native stdio MCP adapter; no second Telegram poller runs.
 
+For automatic Telegram forum topics and direct messages to existing desktop
+and laptop Codex app chats, see [App topic synchronization](../docs/app-topic-sync.md).
+
 ## Start
 
 Run `companion/start.cmd` on Windows or `bash companion/start.sh` on Linux from
